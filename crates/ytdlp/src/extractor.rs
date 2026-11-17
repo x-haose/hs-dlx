@@ -107,7 +107,7 @@ pub enum ExtractError {
     Cancelled,
 }
 
-/// 一个解析进程。释放即连同它起的子进程（yt-dlp 解 JavaScript 挑战时起的 deno）一起杀掉。
+/// 一个解析进程。释放即连同它起的子进程（yt-dlp 解 JavaScript 挑战时起的 QuickJS-NG）一起杀掉。
 struct Worker {
     /// 停下（[`Worker::stop`]）或释放时取走
     child: Option<Child>,
@@ -360,7 +360,7 @@ impl Extractor {
             .arg(&installed.driver)
             .arg(mode)
             .arg(&installed.site)
-            .arg(&installed.deno)
+            .arg(&installed.quickjs)
             .arg(&self.cache)
             .env("YTDLP_NO_PLUGINS", "1")
             .stdin(Stdio::piped())

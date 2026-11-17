@@ -215,7 +215,7 @@ impl SettingsView {
         };
         row(
             "组件",
-            Some("Python、deno 与 yt-dlp，约 90 MB"),
+            Some("要下载 yt-dlp，约 11 MB；Python 与 QuickJS-NG 随应用带"),
             div()
                 .flex()
                 .flex_col()

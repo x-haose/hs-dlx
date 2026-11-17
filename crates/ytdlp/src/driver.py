@@ -7,14 +7,14 @@
 - `pick`：标准输入为 `{包名: [{"filename": 文件名, ...}]}`（PyPI 上这个版本的各个文件），标准输出为每个包本机能装
   的、最合适的那个 wheel 的文件名：`{包名: 文件名}`；有包没有能装的时退出码非 0。
 - `selftest <site>`：导入 site 目录里的 yt-dlp 与 yt-dlp-ejs，标准输出打出 `{"yt_dlp": 规范化的版本}`。
-- `serve <site> <deno> <cache>`：常驻解析。标准输入每行一个请求，标准输出每行一个回应，一次只处理一个：
+- `serve <site> <quickjs> <cache>`：常驻解析。标准输入每行一个请求，标准输出每行一个回应，一次只处理一个：
   - 请求 `{"id": 整数, "url": 网址, "proxy": 代理地址（空串为直连）, "cookies": Netscape 格式的 Cookie 或 null,
     "generic": 只有通用解析器认得时也解析}`；`generic` 为假时只认得通用解析器的网址不发请求，直接回 `unsupported`；
     视频没有格式时照网站说的原因（要登录、人机验证、限流、地区限制、不可用）回错误
   - 回应 `{"id": 同请求, "ok": 结果}` 或 `{"id": 同请求, "error": {"kind": 种类, "message": 说明}}`，种类见
     `classify`。yt-dlp 自己的输出都转到标准错误，标准输出只有回应（纯 ASCII 的 JSON）。
   - 结果见 `trimmed`。
-- `download <site> <deno> <cache>`：用 yt-dlp 自己的下载器下一个格式（要模拟浏览器 TLS 指纹的、DASH 分片等应用的引擎
+- `download <site> <quickjs> <cache>`：用 yt-dlp 自己的下载器下一个格式（要模拟浏览器 TLS 指纹的、DASH 分片等应用的引擎
   下不了的）。标准输入的第一行为请求 `{"url": 网页地址, "format": 要的格式（`key_of` 的各项）,
   "dir": 输出所在的目录, "name": 输出的文件名, "proxy", "cookies"}`；标准输出先是若干行进度
   `{"progress": {"bytes": 已下字节, "total": 总字节或估算，不知道时为 null}}`，最后一行为 `{"ok": {}}` 或
@@ -293,12 +293,12 @@ def said(message: str) -> str:
     return "unavailable"
 
 
-def params(request: Mapping[str, object], deno: str, cache: str, logger: Logger) -> Info:
+def params(request: Mapping[str, object], quickjs: str, cache: str, logger: Logger) -> Info:
     """一次解析或下载给 YoutubeDL 的参数，代理（空串为直连）与 Cookie 取自 `request`。
 
     只解析不下载；播放列表只列条目（至多 `PLAYLIST_LIMIT` 条），带视频的播放列表网址取视频；格式全要（应用自己从
     `formats` 里选）；视频没有格式时照网站说的原因抛出（yt-dlp 的默认，`classify` 按原因归类）；代理只照应用给的；
-    Cookie 只在内存里；deno 解 YouTube 的 JavaScript 挑战；缓存放在应用的目录；不查自己是不是太旧。
+    Cookie 只在内存里；QuickJS-NG 解 YouTube 的 JavaScript 挑战；缓存放在应用的目录；不查自己是不是太旧。
     """
     cookies = text(request.get("cookies"))
     return {
@@ -311,7 +311,7 @@ def params(request: Mapping[str, object], deno: str, cache: str, logger: Logger)
         "proxy": text(request.get("proxy")) or "",
         "socket_timeout": SOCKET_TIMEOUT,
         "cookiefile": io.StringIO(cookies) if cookies is not None else None,
-        "js_runtimes": {"deno": {"path": deno}},
+        "js_runtimes": {"quickjs": {"path": quickjs}},
         "cachedir": cache,
         "warn_when_outdated": False,
     }
@@ -326,13 +326,13 @@ def matched(url: str) -> str:
     return "Generic"
 
 
-def extract(yt_dlp: ModuleType, request: Mapping[str, object], deno: str, cache: str) -> Info:
+def extract(yt_dlp: ModuleType, request: Mapping[str, object], quickjs: str, cache: str) -> Info:
     """解析请求里的网址，返回回应（结果或归了类的失败）。"""
     url = text(request.get("url")) or ""
     if request.get("generic") is not True and matched(url) == "Generic":
         return {"error": {"kind": "unsupported", "message": "没有专门认这个网址的解析器"}}
     logger = Logger()
-    options = params(request, deno, cache, logger)
+    options = params(request, quickjs, cache, logger)
     with yt_dlp.YoutubeDL(options) as ydl:
         try:
             info = ydl.extract_info(url, download=False)
@@ -343,7 +343,7 @@ def extract(yt_dlp: ModuleType, request: Mapping[str, object], deno: str, cache:
         return {"ok": trimmed(sanitized, ydl.cookiejar, logger.warnings)}
 
 
-def serve(site: str, deno: str, cache: str, requests: TextIO, replies: TextIO) -> None:
+def serve(site: str, quickjs: str, cache: str, requests: TextIO, replies: TextIO) -> None:
     """逐行读 `requests` 里的请求、解析，回应逐行写进 `replies`，读到结尾即返回。
 
     解析器抛出 yt-dlp 没包住的异常（网站改版后常见的 TypeError、AttributeError 等）时回 `other`，带异常与调用栈的
@@ -356,7 +356,7 @@ def serve(site: str, deno: str, cache: str, requests: TextIO, replies: TextIO) -
             continue
         request = json.loads(line)
         try:
-            reply = extract(yt_dlp, request, deno, cache)
+            reply = extract(yt_dlp, request, quickjs, cache)
         except Exception as error:
             stack = traceback.format_exc()[-TRACEBACK_TAIL:]
             reply = {"error": {"kind": "other", "message": clean(f"{type(error).__name__}：{error}\n{stack}")}}
@@ -429,7 +429,7 @@ def same_format(fmt: Mapping[str, object], wanted: Mapping[str, object]) -> bool
     return all(wanted.get(key) == value for key, value in key_of(fmt).items())
 
 
-def download(yt_dlp: ModuleType, request: Mapping[str, object], deno: str, cache: str, replies: TextIO) -> Info:
+def download(yt_dlp: ModuleType, request: Mapping[str, object], quickjs: str, cache: str, replies: TextIO) -> Info:
     """用 yt-dlp 自己的下载器把请求里要的那个格式下到当前目录下的 `name`，进度逐行写进 `replies`，返回最后的回应。
 
     照 yt-dlp 自己的流程解析、选格式、下载，选格式时只选按格式编号与属性认出的那个（不用格式选择式：`mp4`、`b` 之类的
@@ -457,7 +457,7 @@ def download(yt_dlp: ModuleType, request: Mapping[str, object], deno: str, cache
         replies.write(json.dumps(line, ensure_ascii=True, allow_nan=False) + "\n")
         replies.flush()
 
-    options = params(request, deno, cache, logger)
+    options = params(request, quickjs, cache, logger)
     options.update(
         {
             "extract_flat": False,
@@ -542,7 +542,7 @@ def main() -> None:
             json.dump(pick(mapping(json.load(sys.stdin)) or {}), sys.stdout)
         case ["selftest", site]:
             selftest(site)
-        case ["download", site, deno, cache]:
+        case ["download", site, quickjs, cache]:
             replies = sys.stdout
             sys.stdout = sys.stderr
             sys.path.insert(0, site)
@@ -551,20 +551,20 @@ def main() -> None:
             watch_stdin()
             os.chdir(text(request.get("dir")) or ".")
             try:
-                reply = download(importlib.import_module("yt_dlp"), request, deno, cache, replies)
+                reply = download(importlib.import_module("yt_dlp"), request, quickjs, cache, replies)
             except Exception as error:
                 stack = traceback.format_exc()[-TRACEBACK_TAIL:]
                 reply = {"error": {"kind": "other", "message": clean(f"{type(error).__name__}：{error}\n{stack}")}}
             replies.write(json.dumps(reply, ensure_ascii=True, allow_nan=False) + "\n")
             replies.flush()
-        case ["serve", site, deno, cache]:
+        case ["serve", site, quickjs, cache]:
             # 回应独占标准输出：yt-dlp 与依赖往标准输出写的都转到标准错误
             replies = sys.stdout
             sys.stdout = sys.stderr
-            serve(site, deno, cache, sys.stdin, replies)
+            serve(site, quickjs, cache, sys.stdin, replies)
         case _:
             sys.exit(
-                "用法：driver.py requirements | pick | selftest <site> | serve|download <site> <deno> <cache>，"
+                "用法：driver.py requirements | pick | selftest <site> | serve|download <site> <quickjs> <cache>，"
                 f"收到 {sys.argv[1:]}"
             )
 

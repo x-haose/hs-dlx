@@ -3672,8 +3672,8 @@ name = "hs-dlx-ytdlp"
 version = "0.4.0"
 dependencies = [
  "axum",
- "flate2",
  "hs-m3u8-core",
+ "ruzstd",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -7091,6 +7091,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruzstd"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8473,6 +8482,12 @@ checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 dependencies = [
  "core_maths",
 ]
+
+[[package]]
+name = "twox-hash"
+version = "2.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
 name = "typed-path"
@@ -10531,7 +10546,6 @@ checksum = "953a376f4930ed5af88e1e65948385f76866b45e7f75b21ac275327d0eeb9b46"
 dependencies = [
  "constant_time_eq",
  "crc32fast",
- "flate2",
  "getrandom 0.4.3",
  "indexmap",
  "libc",

@@ -1,0 +1,23 @@
+name: runtime
+description: 恢复缓存的随应用带的 Python 与 QuickJS-NG，没有时用 scripts/runtime.py 下载、核对、裁剪、压缩到 third_party/runtime/dist。要先装好 uv
+
+inputs:
+  cache-key:
+    description: 缓存键里区分构建环境的部分（运行机）；为空时不用缓存，从核对过 SHA-256 的发布包现备
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: 缓存随应用带的运行时
+      id: cache
+      if: inputs.cache-key != ''
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: third_party/runtime/dist
+        key: runtime-${{ inputs.cache-key }}-${{ hashFiles('scripts/runtime.py') }}
+
+    - name: 备随应用带的运行时
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: uv sync --locked && uv run --no-sync python -I scripts/runtime.py

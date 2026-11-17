@@ -224,7 +224,7 @@ impl NewTask {
     ) -> Div {
         let mut body: Vec<AnyElement> = vec![
             ui::note(
-                "解析网页里的视频（YouTube、B 站等）要先装网页视频的组件：Python、deno 与 yt-dlp，共约 90 MB，只装一次"
+                "解析网页里的视频（YouTube、B 站等）要先装网页视频的组件：下载 yt-dlp，约 11 MB，只装一次"
                     .to_owned(),
                 false,
             )

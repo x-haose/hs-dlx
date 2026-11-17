@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hs_dlx_app::web::Container;
-use hs_dlx_app::ytdlp::{Archive, ExtractError, FormatKey, Pinned, Pins, Sources, Track};
+use hs_dlx_app::ytdlp::{Bundle, Bundled, ExtractError, FormatKey, Sources, Track};
 use hs_dlx_app::{
     Draft, DraftKind, Error, Event, FailureKind, Service, Status, Store, TaskId, TorrentNetwork,
     WebConfig, WebState,
@@ -28,17 +28,16 @@ fn test_dir(name: &str) -> PathBuf {
     dir
 }
 
-fn pins() -> Pins {
-    let pinned = |executable: &str| Pinned {
-        version: "test".to_owned(),
-        url: "https://example.invalid/package".to_owned(),
-        sha256: "0".repeat(64),
-        archive: Archive::TarGz,
+/// 随应用带的运行时（内容用不到：组件已摆好，见 [`lay_out`]）。
+fn bundle() -> Bundle {
+    let bundled = |executable: &str| Bundled {
+        id: "test".to_owned(),
+        bytes: Vec::new().into(),
         executable: executable.to_owned(),
     };
-    Pins {
-        python: pinned("python/bin/python3"),
-        deno: pinned("deno"),
+    Bundle {
+        python: bundled("python/bin/python3"),
+        quickjs: bundled("qjs"),
     }
 }
 
@@ -62,8 +61,8 @@ fn lay_out(root: &Path) {
         .join("site-packages");
     std::fs::create_dir_all(root.join("python-test/python/bin")).unwrap();
     std::os::unix::fs::symlink(python, root.join("python-test/python/bin/python3")).unwrap();
-    std::fs::create_dir_all(root.join("deno-test")).unwrap();
-    std::fs::write(root.join("deno-test/deno"), "").unwrap();
+    std::fs::create_dir_all(root.join("quickjs-test")).unwrap();
+    std::fs::write(root.join("quickjs-test/qjs"), "").unwrap();
     std::os::unix::fs::symlink(site, root.join("yt-dlp-dev")).unwrap();
     std::fs::write(
         root.join("state.json"),
@@ -86,7 +85,7 @@ fn with_events(dir: &Path, root: PathBuf) -> (Service, mpsc::UnboundedReceiver<E
         hs_dlx_app::pikpak::Endpoints::official(),
         WebConfig {
             root,
-            pins: Some(pins()),
+            bundle: Some(bundle()),
             sources: Sources::official(),
         },
     )

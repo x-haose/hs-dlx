@@ -48,7 +48,7 @@ def serve(requests: list[Mapping[str, object]], tmp_path: Path) -> list[dict[str
     """把 `requests` 逐行交给驱动脚本的常驻解析，返回逐行的回应。"""
     replies = io.StringIO()
     lines = "".join(json.dumps(request) + "\n" for request in requests)
-    driver.serve(SITE, "deno", str(tmp_path / "cache"), io.StringIO(lines), replies)
+    driver.serve(SITE, "qjs", str(tmp_path / "cache"), io.StringIO(lines), replies)
     return [json.loads(line) for line in replies.getvalue().splitlines()]
 
 
@@ -123,12 +123,12 @@ def test_an_unexpected_error_is_answered_and_the_next_request_still_runs(
     real = driver.extract
     calls: list[str] = []
 
-    def flaky(yt_dlp: ModuleType, request: Mapping[str, object], deno: str, cache: str) -> dict[str, object]:
+    def flaky(yt_dlp: ModuleType, request: Mapping[str, object], quickjs: str, cache: str) -> dict[str, object]:
         calls.append(str(request["url"]))
         if len(calls) == 1:
             message = "网站改版"
             raise TypeError(message)
-        return real(yt_dlp, request, deno, cache)
+        return real(yt_dlp, request, quickjs, cache)
 
     monkeypatch.setattr(driver, "extract", flaky)
     replies = serve(
@@ -168,7 +168,7 @@ def test_yt_dlp_downloads_a_format_itself_with_progress(
     replies = io.StringIO()
     wanted = driver.key_of(fmt)
     request = {"url": f"{site}/video.html", "format": wanted, "name": "video.mp4", "proxy": "", "cookies": None}
-    final = driver.download(importlib.import_module("yt_dlp"), request, "deno", str(tmp_path / "cache"), replies)
+    final = driver.download(importlib.import_module("yt_dlp"), request, "qjs", str(tmp_path / "cache"), replies)
     assert final == {"ok": {}}
     assert (folder / "video.mp4").read_bytes() == (tmp_path / "clip.mp4").read_bytes()
     lines = [json.loads(line) for line in replies.getvalue().splitlines()]
@@ -182,13 +182,13 @@ def test_a_format_not_found_or_not_the_same_is_changed(
     yt_dlp = importlib.import_module("yt_dlp")
     cache = str(tmp_path / "cache")
     request: dict[str, object] = {"url": f"{site}/video.html", "format": {"format_id": "no-such"}, "name": "x.mp4"}
-    final = driver.download(yt_dlp, request, "deno", cache, io.StringIO())
+    final = driver.download(yt_dlp, request, "qjs", cache, io.StringIO())
     assert (driver.mapping(final["error"]) or {})["kind"] == "changed"
     [reply] = serve([{"id": 1, "url": f"{site}/video.html", "proxy": "", "cookies": None, "generic": True}], tmp_path)
     [fmt] = [driver.mapping(item) or {} for item in driver.items((driver.mapping(reply["ok"]) or {})["formats"])]
     # 编号对得上、扩展名对不上：不是要的那个
     request["format"] = {**driver.key_of(fmt), "ext": "webm"}
-    final = driver.download(yt_dlp, request, "deno", cache, io.StringIO())
+    final = driver.download(yt_dlp, request, "qjs", cache, io.StringIO())
     assert (driver.mapping(final["error"]) or {})["kind"] == "changed"
     assert not (tmp_path / "x.mp4").exists()
 
@@ -196,7 +196,7 @@ def test_a_format_not_found_or_not_the_same_is_changed(
 def test_an_output_name_with_dollar_or_separator_is_refused(tmp_path: Path) -> None:
     for name in ("$HOME.mp4", "~x.mp4", "a/b.mp4", ".."):
         request = {"url": "http://127.0.0.1:9/", "format": {"format_id": "0"}, "name": name}
-        final = driver.download(importlib.import_module("yt_dlp"), request, "deno", str(tmp_path), io.StringIO())
+        final = driver.download(importlib.import_module("yt_dlp"), request, "qjs", str(tmp_path), io.StringIO())
         assert "error" in final, name
 
 

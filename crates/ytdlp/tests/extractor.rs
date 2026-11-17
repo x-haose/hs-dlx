@@ -50,7 +50,7 @@ fn installed(name: &str) -> (Installed, PathBuf) {
         Installed {
             python,
             // 通用解析器不用 JavaScript 运行时
-            deno: PathBuf::from("deno"),
+            quickjs: PathBuf::from("qjs"),
             site,
             version: "dev".to_owned(),
             previous: None,

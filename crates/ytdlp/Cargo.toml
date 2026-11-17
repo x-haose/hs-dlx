@@ -1,7 +1,7 @@
 [package]
 name = "hs-dlx-ytdlp"
 version.workspace = true
-description = "yt-dlp for hs-dlx: installs Python, deno and yt-dlp on demand and extracts web pages in a resident process, without tasks, storage or UI"
+description = "yt-dlp for hs-dlx: unpacks the bundled Python and QuickJS-NG, installs yt-dlp on demand and extracts web pages in a resident process, without tasks, storage or UI"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -9,23 +9,23 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-# 解开 Python 的 .tar.gz；与依赖树里已有的一样用纯 Rust 的后端
-flate2 = { version = "1.1.11", default-features = false, features = ["rust_backend"] }
 # 组件经核心下载，与任务共用代理、证书、重试与续传；PyPI 的接口经核心的 call 请求
 hs-m3u8-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-# 核对下载的组件包
+# 解开随应用带的 Python（tar 经 zstd 压缩）：纯 Rust 的解码器，不用编译 C 的 zstd
+ruzstd = "0.9.1"
+# 核对下载的 wheel
 sha2 = "0.11.1"
 # 不要扩展属性（xattr 特性）：组件包里没有
 tar = { version = "0.4.46", default-features = false }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "process", "rt", "sync", "time"] }
-# 解开 deno 的 .zip：只读 deflate
-zip = { version = "9.6.1", default-features = false, features = ["deflate-flate2"] }
 
 [dev-dependencies]
 axum.workspace = true
+# 测试里造 wheel（zip，不压缩）
+zip = { version = "9.6.1", default-features = false }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 
 [lints]

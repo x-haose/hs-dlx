@@ -54,6 +54,11 @@ jobs:
         with:
           cache-key: ${{ runner.os }}-${{ runner.arch }}
 
+      - name: 随应用带的 Python 与 QuickJS-NG
+        uses: ./.github/actions/runtime
+        with:
+          cache-key: ${{ runner.os }}-${{ runner.arch }}
+
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # 检查项定义在 Makefile 里。依赖图、许可证、覆盖率与 Python 脚本的检查与平台无关，只在 Linux 上查；格式、clippy、

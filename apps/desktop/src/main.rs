@@ -55,6 +55,38 @@ const FONTS: [&[u8]; 3] = [
     include_bytes!("../assets/fonts/SpaceGrotesk-Bold.ttf"),
 ];
 
+/// 随应用带的 Python 与 QuickJS-NG（make runtime 备好、build.rs 交来，见 scripts/runtime.py）：第一次用网页视频时解进
+/// 组件目录。
+#[cfg(bundled_runtime)]
+fn bundle() -> Option<hs_dlx_app::ytdlp::Bundle> {
+    use std::borrow::Cow;
+    Some(hs_dlx_app::ytdlp::Bundle {
+        python: hs_dlx_app::ytdlp::Bundled {
+            id: env!("HS_DLX_RUNTIME_PYTHON_ID").to_owned(),
+            bytes: Cow::Borrowed(include_bytes!(concat!(
+                env!("HS_DLX_RUNTIME_DIR"),
+                "/python.tar.zst"
+            ))),
+            executable: env!("HS_DLX_RUNTIME_PYTHON_EXECUTABLE").to_owned(),
+        },
+        quickjs: hs_dlx_app::ytdlp::Bundled {
+            id: env!("HS_DLX_RUNTIME_QUICKJS_ID").to_owned(),
+            bytes: Cow::Borrowed(include_bytes!(concat!(
+                env!("HS_DLX_RUNTIME_DIR"),
+                "/",
+                env!("HS_DLX_RUNTIME_QUICKJS_FILE")
+            ))),
+            executable: env!("HS_DLX_RUNTIME_QUICKJS_FILE").to_owned(),
+        },
+    })
+}
+
+/// 应用不发布的平台没有随带的运行时：网页视频用不了。
+#[cfg(not(bundled_runtime))]
+fn bundle() -> Option<hs_dlx_app::ytdlp::Bundle> {
+    None
+}
+
 /// 任务存储的位置：系统给应用放数据的目录（macOS 为 ~/Library/Application Support）下的 hs-dlx/tasks.sqlite。
 fn store_path() -> Option<PathBuf> {
     dirs::data_dir().map(|dir| dir.join("hs-dlx").join("tasks.sqlite"))
@@ -148,7 +180,7 @@ fn main() {
                         // 网页视频的组件放在任务存储旁的 components 下
                         hs_dlx_app::WebConfig {
                             root: path.with_file_name("components"),
-                            pins: hs_dlx_app::ytdlp::Pins::official(),
+                            bundle: bundle(),
                             sources: hs_dlx_app::ytdlp::Sources::official(),
                         },
                     )

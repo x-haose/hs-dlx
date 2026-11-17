@@ -94,10 +94,8 @@ pub fn web_install(progress: &InstallProgress) -> String {
     let (doing, downloading) = match progress.stage {
         Stage::Preparing => ("准备", false),
         Stage::Waiting => ("等在解析的解析完", false),
-        Stage::Python => ("下载 Python", true),
-        Stage::PythonUnpacking => ("核对、解开 Python", false),
-        Stage::Deno => ("下载 deno", true),
-        Stage::DenoUnpacking => ("核对、解开 deno", false),
+        Stage::Python => ("解出 Python", false),
+        Stage::QuickJs => ("解出 QuickJS-NG", false),
         Stage::Resolving => ("查 yt-dlp 的版本与依赖", false),
         Stage::YtDlp => ("下载 yt-dlp 与依赖", true),
         Stage::Setup => ("安装 yt-dlp", false),
@@ -118,27 +116,32 @@ pub fn web_install(progress: &InstallProgress) -> String {
     format!("{doing}{amount}")
 }
 
-/// 网页视频组件安装的几步（Python、deno、yt-dlp、检查）各到了哪里：这一步之前的做完了、之后的还没做。
+/// 网页视频组件安装的几步（解出随应用带的、下载 yt-dlp、安装、检查）各到了哪里：这一步之前的做完了、之后的还没做。
 pub fn web_install_steps(progress: &InstallProgress) -> Vec<(gpui_kit::SharedString, Step)> {
     let at = match progress.stage {
         Stage::Preparing | Stage::Waiting => None,
-        Stage::Python | Stage::PythonUnpacking => Some(0),
-        Stage::Deno | Stage::DenoUnpacking => Some(1),
-        Stage::Resolving | Stage::YtDlp | Stage::Setup => Some(2),
+        Stage::Python | Stage::QuickJs => Some(0),
+        Stage::Resolving | Stage::YtDlp => Some(1),
+        Stage::Setup => Some(2),
         Stage::Checking => Some(3),
     };
-    ["Python", "deno", "yt-dlp", "检查"]
-        .into_iter()
-        .enumerate()
-        .map(|(index, label)| {
-            let step = match at {
-                Some(at) if index < at => Step::Done,
-                Some(at) if index == at => Step::Now,
-                Some(_) | None => Step::Waiting,
-            };
-            (label.into(), step)
-        })
-        .collect()
+    [
+        "解出 Python 与 QuickJS-NG",
+        "下载 yt-dlp",
+        "安装 yt-dlp",
+        "检查",
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, label)| {
+        let step = match at {
+            Some(at) if index < at => Step::Done,
+            Some(at) if index == at => Step::Now,
+            Some(_) | None => Step::Waiting,
+        };
+        (label.into(), step)
+    })
+    .collect()
 }
 
 /// 一类失败的简写与说明：简写（状态码或种类）是表盘圆盘里的大字；说明写这类失败多半是怎么回事，任务页写在检查面板，
@@ -250,13 +253,14 @@ mod tests {
             total,
         };
         assert_eq!(
-            web_install(&at(Stage::Python, 0, None)),
-            "下载 Python · 正在连接…"
+            web_install(&at(Stage::YtDlp, 0, None)),
+            "下载 yt-dlp 与依赖 · 正在连接…"
         );
+        assert_eq!(web_install(&at(Stage::Python, 0, None)), "解出 Python…");
         assert_eq!(
-            web_install(&at(Stage::Python, 3 << 20, Some(12 << 20))),
+            web_install(&at(Stage::YtDlp, 3 << 20, Some(12 << 20))),
             format!(
-                "下载 Python · {} / {}（25%）",
+                "下载 yt-dlp 与依赖 · {} / {}（25%）",
                 bytes(3 << 20),
                 bytes(12 << 20)
             )
@@ -266,7 +270,7 @@ mod tests {
             .into_iter()
             .map(|(_, step)| step)
             .collect();
-        assert!(marks == [Step::Done, Step::Done, Step::Now, Step::Waiting]);
+        assert!(marks == [Step::Done, Step::Now, Step::Waiting, Step::Waiting]);
     }
 
     use super::*;

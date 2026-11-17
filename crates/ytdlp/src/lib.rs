@@ -1,18 +1,19 @@
-//! yt-dlp 的组件与解析：第一次用到时下载 Python（python-build-standalone）、deno 与 yt-dlp，装进应用的组件目录（见
-//! [`Components`]）；在常驻的 Python 进程里解析网页地址（见 [`Extractor`]）。不知道任务、存储与界面。
+//! yt-dlp 的组件与解析：第一次用到时把随应用带的 Python（python-build-standalone）与 QuickJS-NG 解出来、从 PyPI 下载
+//! yt-dlp，装进应用的组件目录（见 [`Components`]）；在常驻的 Python 进程里解析网页地址（见 [`Extractor`]）。不知道
+//! 任务、存储与界面。
 
 mod archive;
+mod bundle;
 mod components;
 mod extractor;
 mod info;
-mod pins;
 
 use std::path::Path;
 
+pub use crate::bundle::{Bundle, Bundled};
 pub use crate::components::{Channel, Components, InstallProgress, Installed, Sources, Stage};
 pub use crate::extractor::{Cookie, ExtractError, Extractor, Request, WORKERS};
 pub use crate::info::{Entry, Format, FormatKey, Info, Live, Protocol, Size, Track};
-pub use crate::pins::{Archive, Pinned, Pins};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -38,7 +39,7 @@ pub enum Error {
     /// yt-dlp 这个版本有依赖没有本平台能装的预编译包：换个版本（等下一版）
     #[error("这个版本在本机装不了：{0}")]
     Unsupported(String),
-    /// 装上的 yt-dlp 或 deno 运行不了
+    /// 装上的 yt-dlp 或 QuickJS-NG 运行不了
     #[error("组件自检没过：{0}")]
     SelfTest(String),
     /// PyPI 回的认不出，或给的地址不对

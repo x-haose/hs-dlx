@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hs_dlx_ytdlp::{
-    Channel, Components, ExtractError, Extractor, Info, InstallProgress, Pins, Request, Sources,
+    Bundle, Channel, Components, ExtractError, Extractor, Info, InstallProgress, Request, Sources,
     Stage,
 };
 use hs_m3u8_core::{CancellationToken, Engine, Url};
@@ -26,8 +26,8 @@ const EXTRACT_TIMEOUT: Duration = Duration::from_secs(120);
 pub struct WebConfig {
     /// 组件目录（不存在时安装时建）；yt-dlp 的缓存放在它下面的 `cache`
     pub root: PathBuf,
-    /// 本平台锁定的 Python 与 deno；应用不发布的平台为 None，网页视频用不了
-    pub pins: Option<Pins>,
+    /// 随应用带的 Python 与 QuickJS-NG；应用不发布的平台为 None，网页视频用不了
+    pub bundle: Option<Bundle>,
     pub sources: Sources,
 }
 
@@ -76,8 +76,8 @@ impl Web {
     pub(super) fn new(config: WebConfig, engine: Engine) -> Web {
         let cache = config.root.join("cache");
         let components = config
-            .pins
-            .map(|pins| Components::new(config.root, pins, config.sources, engine));
+            .bundle
+            .map(|bundle| Components::new(config.root, bundle, config.sources, engine));
         // 上次换组件时在两次改名之间中断的，先挪回去再看装没装好
         if let Some(components) = &components {
             components.recover();

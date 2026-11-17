@@ -53,22 +53,22 @@ PACKAGE_FORMATS := app,dmg
 else
 PACKAGE_FORMATS := deb
 endif
-package: ffmpeg_present libtorrent_present
+package: ffmpeg_present libtorrent_present runtime_present
 	@cargo packager --version >/dev/null 2>&1 || { echo "缺少 cargo-packager，版本见 .github/workflows/desktop.yml"; exit 1; }
 	cd apps/desktop && cargo packager --release --formats $(PACKAGE_FORMATS)
 
-rs_clippy: ffmpeg_present libtorrent_present
+rs_clippy: ffmpeg_present libtorrent_present runtime_present
 	cargo clippy --workspace --all-targets -- -D warnings
 
 # 文档注释里的链接须都能解析（含私有项）：改名、删除后留下的断链在这里失败
-rs_doc: ffmpeg_present libtorrent_present
+rs_doc: ffmpeg_present libtorrent_present runtime_present
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
 
-rs_test: ffmpeg_present libtorrent_present
+rs_test: ffmpeg_present libtorrent_present runtime_present
 	cargo test --workspace
 
 # 任务存储与生命周期（app）、网盘的登录与接口（cloud）、yt-dlp 组件的核对安装与解析（ytdlp）的行覆盖各不低于 80%
-rs_cov: ffmpeg_present libtorrent_present
+rs_cov: ffmpeg_present libtorrent_present runtime_present
 	@cargo llvm-cov --version >/dev/null 2>&1 || { echo "缺少 cargo-llvm-cov，版本见 .github/workflows/check.yml"; exit 1; }
 	# 源码改动后旧的插桩产物会混进统计，先清掉
 	cargo llvm-cov clean --workspace
@@ -102,6 +102,19 @@ libtorrent_present:
 
 libtorrent:
 	bash $(LIBTORRENT_SCRIPT)
+
+# 随应用带的 Python 与 QuickJS-NG（网页视频用），由 scripts/runtime.py 下载、核对、裁剪、压缩，桌面应用编进程序；备好
+# 的须是当前那份脚本备的（标记文件是脚本的副本）：换了版本或裁剪而本地没重新备时在这里失败
+RUNTIME_DIST := third_party/runtime/dist
+RUNTIME_SCRIPT := scripts/runtime.py
+
+runtime_present:
+	@test -f $(RUNTIME_DIST)/bundle.env || { echo "缺少 $(RUNTIME_DIST)，先运行 make runtime"; exit 1; }
+	@cmp -s $(RUNTIME_DIST)/.hs-dlx-runtime $(RUNTIME_SCRIPT) || \
+		{ echo "$(RUNTIME_DIST) 不是当前的 $(RUNTIME_SCRIPT) 备的，先运行 make runtime"; exit 1; }
+
+runtime: py_env
+	uv run --no-sync python -I $(RUNTIME_SCRIPT)
 
 py_env:
 	uv sync --locked

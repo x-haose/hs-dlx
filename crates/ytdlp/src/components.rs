@@ -1,14 +1,15 @@
-//! 组件目录：按需下载、核对并解开 Python 与 deno（版本随应用锁定，见 [`Pins`]）；yt-dlp 与它锁定版本的依赖（yt-dlp
-//! 每个版本发布的 `pin` 与 `pin-curl-cffi` 两组，不要 mutagen）的 wheel 也由核心下载、按 PyPI 给的 SHA-256 核对，
-//! 再交给这个 Python 的 pip 离线装进 yt-dlp 的版本目录：下载与组件包一样经应用的代理（含 SOCKS）、能续传、有字节
-//! 进度，pip 不联网。每个版本自检过了才记成当前的，没装成的不影响在用的。
+//! 组件目录：随应用带的 Python 与 QuickJS-NG（见 [`Bundle`]）第一次用时解出来，不联网；yt-dlp 与它锁定版本的依赖
+//! （yt-dlp 每个版本发布的 `pin` 与 `pin-curl-cffi` 两组，不要 mutagen）的 wheel 由核心下载（经应用的代理，含
+//! SOCKS；能续传、有字节进度）、按 PyPI 给的 SHA-256 核对，再交给这个 Python 的 pip 离线装进 yt-dlp 的版本目录。每个
+//! 版本自检过了才记成当前的，没装成的不影响在用的。
 //!
 //! 目录布局（`root` 下）：
-//! - `python-<版本>/`、`deno-<版本>/`：解开的组件包；不是锁定版本的在应用启动时删掉
+//! - `python-<id>/`、`quickjs-<id>/`：解出来的随应用带的运行时（id 见 [`Bundled::id`]）；不是这一版应用带的在应用
+//!   启动时删掉
 //! - `yt-dlp-<版本>/`：pip 的 `--target` 目录；保留当前的与上一个，更早的在应用启动时（[`Components::sweep`]）删掉：
 //!   安装、更新、重装时不删，换版本前起的解析进程可能还在用
 //! - `state.json`：当前与上一个 yt-dlp 版本、装它时的 Python 版本；先写临时文件、落盘再改名
-//! - `downloads/`：下载中与下好了的组件包、wheel 与核心的任务目录（续传用），用过即删
+//! - `downloads/wheels/`：下载中与下好了的 wheel 与核心的任务目录（续传用），用过即删
 //! - `staging/`：解包与 pip 安装的临时目录，每次安装前清空
 //! - `trash-<名>-<纳秒>/`：换下来的组件目录（见 [`Components::replace_dir`]），应用启动时删掉
 //! - `driver-<摘要>.py`：解析进程的驱动脚本，按内容命名，内容变了另写一个
@@ -24,13 +25,13 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::Error;
 use crate::archive;
-use crate::pins::{Pinned, Pins};
+use crate::bundle::{Bundle, Bundled};
 
 /// 解析进程的驱动脚本：列依赖、挑 wheel、自检、解析。
 pub(crate) const DRIVER: &str = include_str!("driver.py");
 /// pip 离线安装、驱动脚本列依赖与挑 wheel 最多多久：不联网，只解包。
 const PIP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-/// 自检最多多久：只导入模块、运行 deno 报版本。
+/// 自检最多多久：只导入模块、让 QuickJS-NG 算一个式子。
 const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// 换下来的组件目录挪到的名字的前缀（见 [`Components::replace_dir`]）。
 const TRASH: &str = "trash-";
@@ -69,7 +70,8 @@ pub enum Channel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Installed {
     pub python: PathBuf,
-    pub deno: PathBuf,
+    /// QuickJS-NG：yt-dlp 解 YouTube 的 JavaScript 挑战用
+    pub quickjs: PathBuf,
     /// yt-dlp 与依赖所在的目录（pip 的 `--target`），由驱动脚本加进 `sys.path`
     pub site: PathBuf,
     /// yt-dlp 的版本，PEP 440 规范化的写法（与 PyPI 上的一致）
@@ -79,11 +81,11 @@ pub struct Installed {
     pub driver: PathBuf,
 }
 
-/// 解开即用的组件包。
+/// 随应用带的运行时。
 #[derive(Clone, Copy)]
 enum Package {
     Python,
-    Deno,
+    QuickJs,
 }
 
 /// 安装进行到哪一步。
@@ -93,14 +95,10 @@ pub enum Stage {
     Preparing,
     /// 等在解析的解析完（重装前：在用的组件换不下）
     Waiting,
-    /// 下载 Python 的包
+    /// 把随应用带的 Python 解出来
     Python,
-    /// 核对、解开 Python 的包
-    PythonUnpacking,
-    /// 下载 deno 的包
-    Deno,
-    /// 核对、解开 deno 的包
-    DenoUnpacking,
+    /// 把随应用带的 QuickJS-NG 解出来
+    QuickJs,
     /// 查 PyPI 上 yt-dlp 的版本与它锁定的依赖、挑合本机的包
     Resolving,
     /// 下载 yt-dlp 与依赖的 wheel
@@ -126,7 +124,7 @@ struct State {
     yt_dlp: String,
     /// 上一个版本；没有时为 None
     previous: Option<String>,
-    /// 装 yt-dlp 时用的 Python（[`Pinned::version`]）：依赖里有按解释器版本编译的扩展模块，换了 Python 要重装
+    /// 装 yt-dlp 时用的 Python（[`Bundled::id`]）：依赖里有按解释器版本编译的扩展模块，换了 Python 要重装
     python: String,
 }
 
@@ -164,7 +162,7 @@ struct Requirement {
 
 pub struct Components {
     root: PathBuf,
-    pins: Pins,
+    bundle: Bundle,
     sources: Sources,
     engine: Engine,
     /// 安装与更新一次只做一个
@@ -173,10 +171,10 @@ pub struct Components {
 
 impl Components {
     /// 组件放在 `root` 下（不存在时第一次安装时建）；`engine` 下载组件、请求 PyPI 的接口。
-    pub fn new(root: PathBuf, pins: Pins, sources: Sources, engine: Engine) -> Components {
+    pub fn new(root: PathBuf, bundle: Bundle, sources: Sources, engine: Engine) -> Components {
         Components {
             root,
-            pins,
+            bundle,
             sources,
             engine,
             busy: tokio::sync::Mutex::new(()),
@@ -189,11 +187,11 @@ impl Components {
         let Some(state) = self.state()? else {
             return Ok(None);
         };
-        if state.python != self.pins.python.version {
+        if state.python != self.bundle.python.id {
             return Ok(None);
         }
         let installed = self.installed_as(&state.yt_dlp, state.previous.clone());
-        let present = [&installed.python, &installed.deno, &installed.site]
+        let present = [&installed.python, &installed.quickjs, &installed.site]
             .iter()
             .all(|path| path.exists());
         if !present {
@@ -205,7 +203,7 @@ impl Components {
         Ok(Some(installed))
     }
 
-    /// 装上缺的：Python、deno（各经 `proxy` 下载、核对 SHA-256、解开）与 yt-dlp（状态文件记着的版本，没有或坏了时为
+    /// 装上缺的：随应用带的 Python 与 QuickJS-NG（解出来，不联网）与 yt-dlp（经 `proxy`；状态文件记着的版本，没有或坏了时为
     /// `channel` 上最新的）；已装全时直接返回。状态文件坏了时照没有处理、装好后重写。`cancel` 取消时报
     /// [`Error::Cancelled`]，已下了的留着下次续传。
     pub async fn install(
@@ -222,9 +220,10 @@ impl Components {
         self.install_missing(proxy, channel, progress, cancel).await
     }
 
-    /// 重装：Python、deno 与 yt-dlp（状态文件记着的版本，没有或坏了时为 `channel` 上最新的）都重新下载、解开或安装、
-    /// 自检，再换下在用的（文件被杀毒软件隔离或坏了、进程起不来）。每一样都是新的就位了才删旧的：下载失败（离线、代理
-    /// 坏了）时在用的不动。用着它们的解析进程要先停下（Windows 上删不掉在运行的程序）；上一个 yt-dlp 版本照旧记着。
+    /// 重装：随应用带的 Python 与 QuickJS-NG 重新解出来（不联网），yt-dlp（状态文件记着的版本，没有或坏了时为 `channel`
+    /// 上最新的）重新下载、安装、自检，再换下在用的（文件被杀毒软件隔离或坏了、进程起不来）。每一样都是新的就位了才删
+    /// 旧的：yt-dlp 下载失败（离线、代理坏了）时在用的 yt-dlp 不动。用着它们的解析进程要先停下（Windows 上挪不动在运行
+    /// 的程序）；上一个 yt-dlp 版本照旧记着。
     pub async fn repair(
         &self,
         proxy: &Proxy,
@@ -234,8 +233,8 @@ impl Components {
     ) -> Result<Installed, Error> {
         let _busy = self.busy.lock().await;
         self.prepare().await?;
-        for package in [Package::Python, Package::Deno] {
-            self.ensure(package, true, proxy, progress, cancel).await?;
+        for package in [Package::Python, Package::QuickJs] {
+            self.ensure(package, true, progress).await?;
         }
         let version = match self.state() {
             Ok(Some(state)) => state.yt_dlp,
@@ -266,7 +265,14 @@ impl Components {
         if !back.site.is_dir() {
             return Err(Error::NoPrevious);
         }
-        let found = self_test(&back.python, &back.driver, &back.site, &back.deno, cancel).await?;
+        let found = self_test(
+            &back.python,
+            &back.driver,
+            &back.site,
+            &back.quickjs,
+            cancel,
+        )
+        .await?;
         if found != previous {
             return Err(Error::SelfTest(format!(
                 "要换回的是 {previous}，那个目录里装的是 {found}"
@@ -276,9 +282,9 @@ impl Components {
         Ok(back)
     }
 
-    /// 删掉不再用的：锁定版本以外的 Python 与 deno、当前与上一个以外的 yt-dlp、旧的驱动脚本、换下来挪开的组件目录（原名
-    /// 不在时最近挪开的那个留着，等 [`Components::recover`] 挪回）；删不掉的留着，下次再删。
-    /// 换版本之后用旧版本的解析进程可能还在跑（换版本前开始的任务），在没有任务运行时（应用启动时）调用。
+    /// 删掉不再用的：不是这一版应用带的 Python 与 QuickJS-NG（与以前版本用的 deno）、当前与上一个以外的 yt-dlp、旧的
+    /// 驱动脚本、换下来挪开的组件目录（原名不在时最近挪开的那个留着，等 [`Components::recover`] 挪回）；删不掉的留着，
+    /// 下次再删。换版本之后用旧版本的解析进程可能还在跑（换版本前开始的任务），在没有任务运行时（应用启动时）调用。
     pub async fn sweep(&self) {
         let _busy = self.busy.lock().await;
         let Ok(mut entries) = tokio::fs::read_dir(&self.root).await else {
@@ -293,8 +299,8 @@ impl Components {
         // 状态文件读不出时只删挪开的，别的不知道哪个在用
         let keep = match self.state() {
             Ok(Some(state)) => Some([
-                format!("python-{}", self.pins.python.version),
-                format!("deno-{}", self.pins.deno.version),
+                format!("python-{}", self.bundle.python.id),
+                format!("quickjs-{}", self.bundle.quickjs.id),
                 format!("yt-dlp-{}", state.yt_dlp),
                 state
                     .previous
@@ -307,7 +313,7 @@ impl Components {
             let path = self.root.join(name);
             let trash = name.starts_with(TRASH) && !pending.contains(name);
             let stale_dir = keep.as_ref().is_some_and(|keep| {
-                ["python-", "deno-", "yt-dlp-"]
+                ["python-", "quickjs-", "deno-", "yt-dlp-"]
                     .iter()
                     .any(|prefix| name.starts_with(prefix))
                     && !keep.contains(name)
@@ -369,8 +375,8 @@ impl Components {
         cancel: &CancellationToken,
     ) -> Result<Installed, Error> {
         self.prepare().await?;
-        for package in [Package::Python, Package::Deno] {
-            self.ensure(package, false, proxy, progress, cancel).await?;
+        for package in [Package::Python, Package::QuickJs] {
+            self.ensure(package, false, progress).await?;
         }
         // 坏了的状态文件不挡着修：照没有处理
         let wanted = match self.state() {
@@ -393,8 +399,8 @@ impl Components {
 
     /// 装上 yt-dlp 的 `version`（PyPI 上的写法，经 `proxy`）、自检，过了才换成当前的，上一个留着；已是当前的直接返回，
     /// 是上一个（目录还在）时照 [`Components::rollback`] 换回、不重装（运行中的任务可能还在用它的目录），换回的自检
-    /// 不过（它坏了）时才重装。Python 与 deno
-    /// 要已装好（见 [`Components::install`]），没装时报 [`Error::NotInstalled`]。
+    /// 不过（它坏了）时才重装。Python 与 QuickJS-NG 要已解出来（见 [`Components::install`]），没装时报
+    /// [`Error::NotInstalled`]。
     pub async fn update(
         &self,
         proxy: &Proxy,
@@ -439,8 +445,8 @@ impl Components {
 
     fn installed_as(&self, version: &str, previous: Option<String>) -> Installed {
         Installed {
-            python: executable(&self.root, "python", &self.pins.python),
-            deno: executable(&self.root, "deno", &self.pins.deno),
+            python: executable(&self.root, "python", &self.bundle.python),
+            quickjs: executable(&self.root, "quickjs", &self.bundle.quickjs),
             site: self.root.join(format!("yt-dlp-{version}")),
             version: version.to_owned(),
             previous,
@@ -484,7 +490,7 @@ impl Components {
         let state = State {
             yt_dlp: yt_dlp.to_owned(),
             previous,
-            python: self.pins.python.version.clone(),
+            python: self.bundle.python.id.clone(),
         };
         write_atomically(
             &self.root.join("state.json"),
@@ -535,16 +541,12 @@ impl Components {
         }
     }
 
-    /// 建好目录、清空上次没装完留下的临时目录、删掉 `downloads/` 里不是这次锁定版本的组件包（与续传目录：应用升级换了
-    /// 锁定版本，旧的不再用得上）、写出驱动脚本。
+    /// 建好目录、清空上次没装完留下的临时目录、删掉 `downloads/` 里 wheel 以外的（以前版本下载的组件包与续传目录）、
+    /// 写出驱动脚本。
     async fn prepare(&self) -> Result<(), Error> {
         let staging = self.root.join("staging");
         remove_dir(&staging).await?;
         let downloads = self.root.join("downloads");
-        let current: Vec<String> = [("python", &self.pins.python), ("deno", &self.pins.deno)]
-            .iter()
-            .map(|(name, pinned)| format!("{name}-{}", pinned.version))
-            .collect();
         let listed = match tokio::fs::read_dir(&downloads).await {
             Ok(entries) => Some(entries),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -556,18 +558,14 @@ impl Components {
                 .await
                 .map_err(|error| Error::disk(&downloads, &error))?
             {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let kept = name == "wheels"
-                    || current
-                        .iter()
-                        .any(|package| name == *package || name == format!("{package}.hsdl"));
-                if !kept {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        remove_dir(&path).await?;
-                    } else {
-                        remove(&path).await?;
-                    }
+                if entry.file_name() == "wheels" {
+                    continue;
+                }
+                let path = entry.path();
+                if path.is_dir() {
+                    remove_dir(&path).await?;
+                } else {
+                    remove(&path).await?;
                 }
             }
         }
@@ -647,55 +645,23 @@ impl Components {
         Ok(())
     }
 
-    /// 锁定的组件包 `package` 在 `<name>-<版本>/` 下就位：没有、或里面缺了可执行文件（被杀毒软件隔离、被删）时，或
-    /// `again`（重装）时，下载、核对、解开，新的就位了才删旧的。
+    /// 随应用带的 `package` 在 `<名>-<id>/` 下就位：没有、或里面缺了可执行文件（被杀毒软件隔离、被删）时，或 `again`
+    /// （重装）时，从应用里解出来（不联网），新的就位了才删旧的。
     async fn ensure(
         &self,
         package: Package,
         again: bool,
-        proxy: &Proxy,
         progress: &(dyn Fn(InstallProgress) + Sync),
-        cancel: &CancellationToken,
     ) -> Result<(), Error> {
-        let (pinned, name, stage, unpacking) = match package {
-            Package::Python => (
-                &self.pins.python,
-                "python",
-                Stage::Python,
-                Stage::PythonUnpacking,
-            ),
-            Package::Deno => (&self.pins.deno, "deno", Stage::Deno, Stage::DenoUnpacking),
+        let (bundled, name, stage) = match package {
+            Package::Python => (&self.bundle.python, "python", Stage::Python),
+            Package::QuickJs => (&self.bundle.quickjs, "quickjs", Stage::QuickJs),
         };
-        let target = self.root.join(format!("{name}-{}", pinned.version));
-        if !again && executable(&self.root, name, pinned).is_file() {
+        if !again && executable(&self.root, name, bundled).is_file() {
             return Ok(());
         }
-        let package = self
-            .root
-            .join("downloads")
-            .join(format!("{name}-{}", pinned.version));
         progress(InstallProgress {
             stage,
-            bytes: 0,
-            total: None,
-        });
-        self.fetch(
-            &pinned.url,
-            &pinned.sha256,
-            &package,
-            proxy,
-            &|bytes, total| {
-                progress(InstallProgress {
-                    stage,
-                    bytes,
-                    total,
-                })
-            },
-            cancel,
-        )
-        .await?;
-        progress(InstallProgress {
-            stage: unpacking,
             bytes: 0,
             total: None,
         });
@@ -703,18 +669,25 @@ impl Components {
         tokio::fs::create_dir_all(&staging)
             .await
             .map_err(|error| Error::disk(&staging, &error))?;
-        let (unpacked, kind, into) = (package.clone(), pinned.archive, staging.clone());
-        tokio::task::spawn_blocking(move || archive::unpack(&unpacked, kind, &into))
-            .await
-            .expect("解包不会 panic，运行时关闭时本任务也一起丢弃")?;
-        if !staging.join(&pinned.executable).is_file() {
+        let (bytes, into, file) = (
+            bundled.bytes.clone(),
+            staging.clone(),
+            relative(&staging, &bundled.executable),
+        );
+        tokio::task::spawn_blocking(move || match package {
+            Package::Python => archive::unpack_tar_zst(&bytes, &into),
+            Package::QuickJs => write_executable(&file, &bytes),
+        })
+        .await
+        .expect("解包不会 panic，运行时关闭时本任务也一起丢弃")?;
+        if !relative(&staging, &bundled.executable).is_file() {
             return Err(Error::Archive(format!(
-                "{name} 的包里没有 {}",
-                pinned.executable
+                "随应用带的 {name} 里没有 {}",
+                bundled.executable
             )));
         }
-        self.replace_dir(&staging, &target).await?;
-        remove(&package).await
+        let target = self.root.join(format!("{name}-{}", bundled.id));
+        self.replace_dir(&staging, &target).await
     }
 
     /// 下载 yt-dlp `version` 与它锁定的依赖的 wheel（各按 PyPI 给的 SHA-256 核对），用装好的 Python 的 pip 离线装进
@@ -748,7 +721,7 @@ impl Components {
             });
         };
         at(Stage::Resolving);
-        let python = executable(&self.root, "python", &self.pins.python);
+        let python = executable(&self.root, "python", &self.bundle.python);
         let driver = self.driver_path();
         // yt-dlp 这个版本与它锁定的依赖，各自在 PyPI 上的文件
         let release = self.release(proxy, PROJECT, version).await?;
@@ -823,8 +796,8 @@ impl Components {
             bytes: 0,
             total: None,
         });
-        let deno = executable(&self.root, "deno", &self.pins.deno);
-        let found = self_test(&python, &driver, &staging, &deno, cancel).await?;
+        let quickjs = executable(&self.root, "quickjs", &self.bundle.quickjs);
+        let found = self_test(&python, &driver, &staging, &quickjs, cancel).await?;
         if found != version {
             return Err(Error::SelfTest(format!(
                 "要装的是 {version}，装上的是 {found}"
@@ -834,7 +807,7 @@ impl Components {
         self.replace_dir(&staging, &target).await?;
         // 重装同一版本时上一个照旧；换了 Python 时上一个是用旧 Python 装的（带按解释器版本编译的扩展模块），不再算
         let previous = match self.state() {
-            Ok(Some(state)) if state.python != self.pins.python.version => None,
+            Ok(Some(state)) if state.python != self.bundle.python.id => None,
             Ok(Some(state)) if state.yt_dlp == version => state.previous,
             Ok(Some(state)) => Some(state.yt_dlp),
             Ok(None) | Err(_) => None,
@@ -854,12 +827,30 @@ impl Components {
     }
 }
 
-/// 组件 `pinned` 解开后的可执行文件。
-fn executable(root: &Path, name: &str, pinned: &Pinned) -> PathBuf {
-    pinned.executable.split('/').fold(
-        root.join(format!("{name}-{}", pinned.version)),
-        |path, part| path.join(part),
+/// 随应用带的 `bundled` 解出来后的可执行文件。
+fn executable(root: &Path, name: &str, bundled: &Bundled) -> PathBuf {
+    relative(
+        &root.join(format!("{name}-{}", bundled.id)),
+        &bundled.executable,
     )
+}
+
+/// `dir` 下以 `/` 分隔的相对路径 `path`。
+fn relative(dir: &Path, path: &str) -> PathBuf {
+    path.split('/')
+        .fold(dir.to_path_buf(), |dir, part| dir.join(part))
+}
+
+/// 把 `bytes` 写成可执行文件 `path`（Unix 上权限 0o755）。阻塞，调用方放在阻塞线程上。
+fn write_executable(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    std::fs::write(path, bytes).map_err(|error| Error::disk(path, &error))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|error| Error::disk(path, &error))?;
+    }
+    Ok(())
 }
 
 /// `path` 的内容与 `sha256` 对得上为 Ok；对不上为实际的哈希。
@@ -960,12 +951,13 @@ async fn run_driver(
     run_with(script, Some(input), PIP_TIMEOUT, cancel).await
 }
 
-/// 自检：驱动脚本导入 `site` 里的 yt-dlp 与解 JavaScript 挑战的 yt-dlp-ejs，`deno` 报出版本；返回 yt-dlp 规范化的版本。
+/// 自检：驱动脚本导入 `site` 里的 yt-dlp 与解 JavaScript 挑战的 yt-dlp-ejs，`quickjs` 算出一个式子；返回 yt-dlp 规范化的
+/// 版本。
 async fn self_test(
     python: &Path,
     driver: &Path,
     site: &Path,
-    deno: &Path,
+    quickjs: &Path,
     cancel: &CancellationToken,
 ) -> Result<String, Error> {
     let mut selftest = command(python);
@@ -988,16 +980,16 @@ async fn self_test(
     }
     let report: Report = serde_json::from_slice(&out)
         .map_err(|error| Error::SelfTest(format!("驱动脚本的输出认不出：{error}")))?;
-    let mut version = command(deno);
-    version.arg("--version");
-    let out = run(version, SELF_TEST_TIMEOUT, cancel)
+    let mut sum = command(quickjs);
+    sum.args(["-e", "print(6 * 7)"]);
+    let out = run(sum, SELF_TEST_TIMEOUT, cancel)
         .await
         .map_err(|error| match error {
-            Error::Exited(reason) => Error::SelfTest(format!("deno 运行不了：{reason}")),
+            Error::Exited(reason) => Error::SelfTest(format!("QuickJS-NG 运行不了：{reason}")),
             error => error,
         })?;
-    if !String::from_utf8_lossy(&out).starts_with("deno ") {
-        return Err(Error::SelfTest("deno 报的版本认不出".to_owned()));
+    if String::from_utf8_lossy(&out).trim() != "42" {
+        return Err(Error::SelfTest("QuickJS-NG 算错了式子".to_owned()));
     }
     Ok(report.yt_dlp)
 }

@@ -1,6 +1,6 @@
-//! 组件的安装与更新，对着本地起的服务器：Python 与 deno 的包、PyPI 的 JSON 接口与 wheel 都由它给。「Python」是转调
-//! 仓库开发环境（.venv）里真 Python 的脚本，驱动脚本列依赖、挑 wheel、pip 离线安装与自检都照真的跑；deno 是报版本的
-//! 脚本。脚本靠 shebang 运行，只在类 Unix 系统上测（Windows 上的安装与这里同一套代码，只有可执行文件的路径不同）。
+//! 组件的安装与更新：随应用带的「Python」与「QuickJS-NG」直接给内容，PyPI 的 JSON 接口与 wheel 由本地起的服务器给。
+//! 「Python」是转调仓库开发环境（.venv）里真 Python 的脚本，驱动脚本列依赖、挑 wheel、pip 离线安装与自检都照真的跑；
+//! 「QuickJS-NG」是打出 42 的//! 脚本。脚本靠 shebang 运行，只在类 Unix 系统上测（Windows 上的安装与这里同一套代码，只有可执行文件的路径不同）。
 #![cfg(unix)]
 
 use std::collections::HashMap;
@@ -13,7 +13,7 @@ use axum::extract::{Path as UrlPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use hs_dlx_ytdlp::{Archive, Channel, Components, Error, Installed, Pinned, Pins, Sources, Stage};
+use hs_dlx_ytdlp::{Bundle, Bundled, Channel, Components, Error, Installed, Sources, Stage};
 use hs_m3u8_core::{CancellationToken, Engine, Proxy, Url};
 use sha2::{Digest as _, Sha256};
 
@@ -63,31 +63,33 @@ fn dev_python() -> PathBuf {
     python.canonicalize().unwrap()
 }
 
-/// 「Python」的包：`python/bin/python3` 转调开发环境里的 Python。
+/// 随应用带的「Python」：tar 经 zstd 压缩，`python/bin/python3` 转调开发环境里的 Python。
 fn python_package() -> Vec<u8> {
     let script = format!("#!/bin/sh\nexec '{}' \"$@\"\n", dev_python().display());
-    let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
-        Vec::new(),
-        flate2::Compression::fast(),
-    ));
+    let mut tar = tar::Builder::new(Vec::new());
     let mut header = tar::Header::new_gnu();
     header.set_size(script.len() as u64);
     header.set_mode(0o755);
     tar.append_data(&mut header, "python/bin/python3", script.as_bytes())
         .unwrap();
-    tar.into_inner().unwrap().finish().unwrap()
+    let tar = tar.into_inner().unwrap();
+    ruzstd::encoding::compress_to_vec(tar.as_slice(), ruzstd::encoding::CompressionLevel::Fastest)
 }
 
-/// 「deno」的包：报版本的脚本。
-fn deno_package() -> Vec<u8> {
-    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored)
-        .unix_permissions(0o755);
-    zip.start_file("deno", options).unwrap();
-    zip.write_all(b"#!/bin/sh\necho 'deno 2.9.8 (stable, release, aarch64-apple-darwin)'\n")
-        .unwrap();
-    zip.finish().unwrap().into_inner()
+/// 随应用带的 Python 与「QuickJS-NG」（自检让它算 6 * 7）。
+fn bundle() -> Bundle {
+    Bundle {
+        python: Bundled {
+            id: "3.13.18-test".to_owned(),
+            bytes: python_package().into(),
+            executable: "python/bin/python3".to_owned(),
+        },
+        quickjs: Bundled {
+            id: "0.18.0-test".to_owned(),
+            bytes: b"#!/bin/sh\necho 42\n".to_vec().into(),
+            executable: "qjs".to_owned(),
+        },
+    }
 }
 
 /// 名为 `dist`（wheel 里的写法）、版本 `version`、内含 `files` 的纯 Python wheel 的文件名与内容。
@@ -221,7 +223,7 @@ async fn serve_file(State(server): State<Server>, UrlPath(path): UrlPath<String>
 }
 
 /// 起服务器，放上组件包与 yt-dlp 的 `versions`（第一个为稳定版、第二个为每日构建，没有时同第一个）。
-async fn start(versions: &[&str]) -> (Server, Url, Vec<u8>, Vec<u8>) {
+async fn start(versions: &[&str]) -> (Server, Url) {
     let server = Server::default();
     let app = axum::Router::new()
         .route("/{*path}", get(serve_file))
@@ -229,9 +231,6 @@ async fn start(versions: &[&str]) -> (Server, Url, Vec<u8>, Vec<u8>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let (python, deno) = (python_package(), deno_package());
-    server.put("python.tar.gz", python.clone());
-    server.put("deno.zip", deno.clone());
     for version in versions {
         publish(&server, &base, version);
     }
@@ -239,32 +238,13 @@ async fn start(versions: &[&str]) -> (Server, Url, Vec<u8>, Vec<u8>) {
         let nightly = versions.get(1).unwrap_or(stable);
         server.put("pypi/yt-dlp/json", project_json(stable, nightly));
     }
-    (server, base, python, deno)
+    (server, base)
 }
 
-fn pins(base: &Url, python: &[u8], deno: &[u8]) -> Pins {
-    Pins {
-        python: Pinned {
-            version: "3.13.18-20261110".to_owned(),
-            url: base.join("python.tar.gz").unwrap().to_string(),
-            sha256: sha256(python),
-            archive: Archive::TarGz,
-            executable: "python/bin/python3".to_owned(),
-        },
-        deno: Pinned {
-            version: "2.9.8".to_owned(),
-            url: base.join("deno.zip").unwrap().to_string(),
-            sha256: sha256(deno),
-            archive: Archive::Zip,
-            executable: "deno".to_owned(),
-        },
-    }
-}
-
-fn components(root: &Path, pins: Pins, base: &Url) -> Components {
+fn components(root: &Path, bundle: Bundle, base: &Url) -> Components {
     Components::new(
         root.to_path_buf(),
-        pins,
+        bundle,
         Sources {
             api: base.join("pypi/").unwrap(),
         },
@@ -278,13 +258,13 @@ async fn install(components: &Components, channel: Channel) -> Result<Installed,
         .await
 }
 
-/// 从无到有装全：下载、核对、解开 Python 与 deno，下载 yt-dlp 与锁定的依赖（不要 mutagen、不要别的平台的包）、pip
-/// 离线装上并自检；再装一次什么也不做；驱动脚本不在了（应用升级后换了内容）时读已装的即写出。
+/// 从无到有装全：解出随应用带的 Python 与 QuickJS-NG，下载 yt-dlp 与锁定的依赖（不要 mutagen、不要别的平台的包）、
+/// pip 离线装上并自检；再装一次什么也不做；驱动脚本不在了（应用升级后换了内容）时读已装的即写出。
 #[tokio::test(flavor = "multi_thread")]
 async fn components_install_from_nothing() {
     let root = test_dir("fresh");
-    let (server, base, python, deno) = start(&["2026.10.26"]).await;
-    let components = components(&root, pins(&base, &python, &deno), &base);
+    let (server, base) = start(&["2026.10.26"]).await;
+    let components = components(&root, bundle(), &base);
     assert_eq!(components.installed().unwrap(), None);
     let seen = Mutex::new(Vec::new());
     let installed = components
@@ -300,9 +280,9 @@ async fn components_install_from_nothing() {
     assert!(
         installed
             .python
-            .ends_with("python-3.13.18-20261110/python/bin/python3")
+            .ends_with("python-3.13.18-test/python/bin/python3")
     );
-    assert!(installed.deno.ends_with("deno-2.9.8/deno"));
+    assert!(installed.quickjs.ends_with("quickjs-0.18.0-test/qjs"));
     for module in ["yt_dlp", "certifi", "yt_dlp_ejs"] {
         assert!(installed.site.join(module).is_dir(), "缺 {module}");
     }
@@ -313,7 +293,14 @@ async fn components_install_from_nothing() {
         0
     );
     let seen = seen.into_inner().unwrap();
-    for stage in [Stage::Python, Stage::Deno, Stage::YtDlp, Stage::Checking] {
+    for stage in [
+        Stage::Python,
+        Stage::QuickJs,
+        Stage::Resolving,
+        Stage::YtDlp,
+        Stage::Setup,
+        Stage::Checking,
+    ] {
         assert!(seen.iter().any(|p| p.stage == stage), "没报 {stage:?}");
     }
     // 下 yt-dlp 时按字节报进度，最后到总数
@@ -322,8 +309,7 @@ async fn components_install_from_nothing() {
         last.total.is_some() && Some(last.bytes) == last.total,
         "{last:?}"
     );
-    // 下载的包与 wheel 用过即删
-    assert!(!root.join("downloads/python-3.13.18-20261110").exists());
+    // 下载的 wheel 用过即删
     assert_eq!(
         std::fs::read_dir(root.join("downloads/wheels"))
             .unwrap()
@@ -342,52 +328,54 @@ async fn components_install_from_nothing() {
     assert!(installed.driver.exists());
 }
 
-/// 下到的包与锁定的哈希不符：报出（可重试）、删掉，不解开。
+/// 下到的 wheel 与 PyPI 给的哈希不符：报出（可重试）、删掉，不装。
 #[tokio::test(flavor = "multi_thread")]
-async fn a_package_that_does_not_match_its_pin_is_refused() {
+async fn a_wheel_that_does_not_match_its_digest_is_refused() {
     let root = test_dir("mismatch");
-    let (_server, base, python, deno) = start(&["2026.10.26"]).await;
-    let mut pins = pins(&base, &python, &deno);
-    pins.deno.sha256 = "0".repeat(64);
-    let components = components(&root, pins, &base);
+    let (server, base) = start(&["2026.10.26"]).await;
+    server.put(
+        "files/certifi-2026.10.23-py3-none-any.whl",
+        b"tampered".to_vec(),
+    );
+    let components = components(&root, bundle(), &base);
     let error = install(&components, Channel::Stable).await.unwrap_err();
     assert!(matches!(error, Error::Mismatch { .. }), "{error}");
     assert!(error.retryable());
-    assert!(!root.join("deno-2.9.8").exists());
-    assert!(!root.join("downloads/deno-2.9.8").exists());
+    assert!(
+        !root
+            .join("downloads/wheels/certifi-2026.10.23-py3-none-any.whl")
+            .exists()
+    );
     assert_eq!(components.installed().unwrap(), None);
 }
 
-/// 上次下好了没用完的包：内容对得上直接用（不再请求），对不上删掉重下；解开了一半、缺了可执行文件的目录重装；
-/// 不是这次锁定版本的包与续传目录（应用升级前留下的）删掉。
+/// 解了一半、缺了可执行文件的目录重新解出来；以前版本下载的组件包与续传目录删掉。
 #[tokio::test(flavor = "multi_thread")]
 async fn leftovers_from_an_interrupted_install_are_checked_not_trusted() {
     let root = test_dir("leftovers");
-    let (server, base, python, deno) = start(&["2026.10.26"]).await;
+    let (_server, base) = start(&["2026.10.26"]).await;
     std::fs::create_dir_all(root.join("downloads")).unwrap();
-    std::fs::write(root.join("downloads/python-3.13.18-20261110"), &python).unwrap();
-    std::fs::write(root.join("downloads/deno-2.9.8"), b"half").unwrap();
-    std::fs::create_dir_all(root.join("deno-2.9.8")).unwrap();
-    std::fs::write(root.join("downloads/python-3.13.17-20261001"), b"old").unwrap();
+    std::fs::create_dir_all(root.join("quickjs-0.18.0-test")).unwrap();
+    std::fs::write(root.join("downloads/deno-2.9.8"), b"old").unwrap();
     std::fs::create_dir_all(root.join("downloads/python-3.13.hsdl")).unwrap();
-    let components = components(&root, pins(&base, &python, &deno), &base);
+    let components = components(&root, bundle(), &base);
     install(&components, Channel::Stable).await.unwrap();
-    assert_eq!(server.hits("python.tar.gz"), 0);
-    assert_eq!(server.hits("deno.zip"), 1);
-    assert!(root.join("deno-2.9.8/deno").is_file());
-    assert!(!root.join("downloads/python-3.13.17-20261001").exists());
+    assert!(root.join("quickjs-0.18.0-test/qjs").is_file());
+    assert!(!root.join("downloads/deno-2.9.8").exists());
     assert!(!root.join("downloads/python-3.13.hsdl").exists());
 }
 
-/// 重装：Python、deno 与 yt-dlp 都重下、换下在用的（内容坏了而路径还在，安装会当作装好了），yt-dlp 照记着的版本；
-/// 下载失败时在用的不动。
+/// 重装：随应用带的重新解出来、yt-dlp 重新下载，换下在用的（内容坏了而路径还在，安装会当作装好了），yt-dlp 照记着
+/// 的版本；yt-dlp 下载失败时在用的 yt-dlp 不动。
 #[tokio::test(flavor = "multi_thread")]
-async fn repairing_downloads_everything_again() {
+async fn repairing_puts_everything_in_place_again() {
     let root = test_dir("repair");
-    let (server, base, python, deno) = start(&["2026.10.26"]).await;
-    let components = components(&root, pins(&base, &python, &deno), &base);
+    let (server, base) = start(&["2026.10.26"]).await;
+    let components = components(&root, bundle(), &base);
     let first = install(&components, Channel::Stable).await.unwrap();
-    std::fs::write(&first.deno, b"broken").unwrap();
+    std::fs::write(&first.quickjs, b"broken").unwrap();
+    let wheel = "files/yt_dlp-2026.10.26-py3-none-any.whl";
+    let fetched = server.hits(wheel);
     assert_eq!(install(&components, Channel::Stable).await.unwrap(), first);
     let repaired = components
         .repair(
@@ -399,12 +387,14 @@ async fn repairing_downloads_everything_again() {
         .await
         .unwrap();
     assert_eq!(repaired, first);
-    assert_ne!(std::fs::read(&repaired.deno).unwrap(), b"broken");
-    assert_eq!(server.hits("python.tar.gz"), 2);
-    assert_eq!(server.hits("deno.zip"), 2);
-    // 下不到（服务器上没有了）：报错，在用的照旧
-    server.put("deno.zip", Vec::new());
-    std::fs::write(&repaired.deno, b"broken").unwrap();
+    assert_eq!(
+        std::fs::read(&repaired.quickjs).unwrap(),
+        b"#!/bin/sh\necho 42\n"
+    );
+    assert_eq!(server.hits(wheel), fetched + 1);
+    // yt-dlp 下不到（服务器上没有了）：报错，在用的照旧
+    server.files.lock().unwrap().remove(wheel);
+    std::fs::write(repaired.site.join("kept"), b"").unwrap();
     assert!(
         components
             .repair(
@@ -416,7 +406,7 @@ async fn repairing_downloads_everything_again() {
             .await
             .is_err()
     );
-    assert_eq!(std::fs::read(&repaired.deno).unwrap(), b"broken");
+    assert!(repaired.site.join("kept").exists());
     assert_eq!(components.installed().unwrap(), Some(repaired));
 }
 
@@ -425,17 +415,21 @@ async fn repairing_downloads_everything_again() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_interrupted_replacement_is_moved_back_when_sweeping() {
     let root = test_dir("trash");
-    let (_server, base, python, deno) = start(&["2026.10.26"]).await;
-    let components = components(&root, pins(&base, &python, &deno), &base);
+    let (_server, base) = start(&["2026.10.26"]).await;
+    let components = components(&root, bundle(), &base);
     let installed = install(&components, Channel::Stable).await.unwrap();
-    std::fs::rename(root.join("deno-2.9.8"), root.join("trash-deno-2.9.8-20")).unwrap();
-    std::fs::create_dir_all(root.join("trash-deno-2.9.8-10")).unwrap();
+    std::fs::rename(
+        root.join("quickjs-0.18.0-test"),
+        root.join("trash-quickjs-0.18.0-test-20"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("trash-quickjs-0.18.0-test-10")).unwrap();
     std::fs::create_dir_all(root.join("trash-yt-dlp-2026.10.26-5")).unwrap();
     assert_eq!(components.installed().unwrap(), None);
     // 没挪回之前清理：要挪回的那个留着
     components.sweep().await;
-    assert!(root.join("trash-deno-2.9.8-20").is_dir());
-    assert!(!root.join("trash-deno-2.9.8-10").exists());
+    assert!(root.join("trash-quickjs-0.18.0-test-20").is_dir());
+    assert!(!root.join("trash-quickjs-0.18.0-test-10").exists());
     components.recover();
     assert_eq!(components.installed().unwrap(), Some(installed));
     components.sweep().await;
@@ -452,8 +446,8 @@ async fn an_interrupted_replacement_is_moved_back_when_sweeping() {
 #[tokio::test(flavor = "multi_thread")]
 async fn updates_switch_only_after_the_new_version_passes() {
     let root = test_dir("update");
-    let (server, base, python, deno) = start(&["2026.10.21"]).await;
-    let components = components(&root, pins(&base, &python, &deno), &base);
+    let (server, base) = start(&["2026.10.21"]).await;
+    let components = components(&root, bundle(), &base);
     let first = install(&components, Channel::Stable).await.unwrap();
     assert_eq!(first.version, "2026.10.21");
 
@@ -530,15 +524,12 @@ async fn updates_switch_only_after_the_new_version_passes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_new_python_reinstalls_yt_dlp() {
     let root = test_dir("python");
-    let (_server, base, python, deno) = start(&["2026.10.21"]).await;
-    install(
-        &components(&root, pins(&base, &python, &deno), &base),
-        Channel::Stable,
-    )
-    .await
-    .unwrap();
-    let mut newer = pins(&base, &python, &deno);
-    newer.python.version = "3.14.10-20261110".to_owned();
+    let (_server, base) = start(&["2026.10.21"]).await;
+    install(&components(&root, bundle(), &base), Channel::Stable)
+        .await
+        .unwrap();
+    let mut newer = bundle();
+    newer.python.id = "3.14.10-test".to_owned();
     let components = components(&root, newer, &base);
     assert_eq!(components.installed().unwrap(), None);
     let installed = install(&components, Channel::Stable).await.unwrap();
@@ -546,19 +537,19 @@ async fn a_new_python_reinstalls_yt_dlp() {
     assert!(
         installed
             .python
-            .starts_with(root.join("python-3.14.10-20261110"))
+            .starts_with(root.join("python-3.14.10-test"))
     );
-    assert!(root.join("python-3.13.18-20261110").exists(), "安装时不删");
+    assert!(root.join("python-3.13.18-test").exists(), "安装时不删");
     components.sweep().await;
-    assert!(!root.join("python-3.13.18-20261110").exists());
+    assert!(!root.join("python-3.13.18-test").exists());
 }
 
 /// 状态文件坏了：读已装的报出，安装修好它（重装最新的）。
 #[tokio::test(flavor = "multi_thread")]
 async fn a_broken_state_file_is_repaired_by_installing() {
     let root = test_dir("broken-state");
-    let (_server, base, python, deno) = start(&["2026.10.26"]).await;
-    let components = components(&root, pins(&base, &python, &deno), &base);
+    let (_server, base) = start(&["2026.10.26"]).await;
+    let components = components(&root, bundle(), &base);
     install(&components, Channel::Stable).await.unwrap();
     std::fs::write(root.join("state.json"), b"").unwrap();
     assert!(matches!(components.installed(), Err(Error::Disk(_))));
@@ -570,8 +561,8 @@ async fn a_broken_state_file_is_repaired_by_installing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_nightly_channel_installs_the_latest_dev_release() {
     let root = test_dir("nightly");
-    let (_server, base, python, deno) = start(&["2026.10.26", "2026.11.16.232655.dev0"]).await;
-    let components = components(&root, pins(&base, &python, &deno), &base);
+    let (_server, base) = start(&["2026.10.26", "2026.11.16.232655.dev0"]).await;
+    let components = components(&root, bundle(), &base);
     assert_eq!(
         components
             .latest(&Proxy::Direct, Channel::Stable)
@@ -581,4 +572,43 @@ async fn the_nightly_channel_installs_the_latest_dev_release() {
     );
     let installed = install(&components, Channel::Nightly).await.unwrap();
     assert_eq!(installed.version, "2026.11.16.232655.dev0");
+}
+
+/// make runtime 备好的、随应用带的真的 Python 与 QuickJS-NG（third_party/runtime/dist，见 scripts/runtime.py）。
+fn real_bundle() -> Bundle {
+    let dist = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../third_party/runtime/dist");
+    let env = std::fs::read_to_string(dist.join("bundle.env"))
+        .unwrap_or_else(|error| panic!("先运行 make runtime：{error}"));
+    let get = |key: &str| {
+        env.lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}=")))
+            .unwrap_or_else(|| panic!("bundle.env 里没有 {key}"))
+            .to_owned()
+    };
+    let quickjs = get("QUICKJS_FILE");
+    Bundle {
+        python: Bundled {
+            id: get("PYTHON_ID"),
+            bytes: std::fs::read(dist.join("python.tar.zst")).unwrap().into(),
+            executable: get("PYTHON_EXECUTABLE"),
+        },
+        quickjs: Bundled {
+            id: get("QUICKJS_ID"),
+            bytes: std::fs::read(dist.join(&quickjs)).unwrap().into(),
+            executable: quickjs,
+        },
+    }
+}
+
+/// 随应用带的真的 Python 与 QuickJS-NG：解得出来（含符号链接与可执行权限），解出的 Python 跑得了 pip 离线安装、驱动
+/// 脚本与自检，QuickJS-NG 算得对。
+#[tokio::test(flavor = "multi_thread")]
+async fn the_real_bundled_runtime_unpacks_and_runs() {
+    let root = test_dir("real");
+    let (_server, base) = start(&["2026.10.26"]).await;
+    let components = components(&root, real_bundle(), &base);
+    let installed = install(&components, Channel::Stable).await.unwrap();
+    assert_eq!(installed.version, "2026.10.26");
+    assert!(installed.python.is_file());
+    assert!(installed.quickjs.is_file());
 }

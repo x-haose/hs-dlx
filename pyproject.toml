@@ -16,6 +16,8 @@ dev = [
     "ruff==0.17.0",
     # crates/ytdlp 的驱动脚本的测试对着本地网页跑真的 yt-dlp（通用解析器，不连外网）；应用运行时另从 PyPI 装
     "yt-dlp==2026.10.26",
+    # scripts/runtime.py 把随应用带的 Python 打成 tar 经 zstd 压缩（应用用纯 Rust 的 ruzstd 解）
+    "zstandard==0.25.0",
 ]
 
 [tool.uv]
@@ -52,6 +54,8 @@ ignore = [
 "tests/scripts/**" = ["S101", "D103"]
 # 运行 PATH 里的 cargo（与 Makefile 一样），参数是写死的与 deny.toml 里的平台
 "scripts/hs_m3u8.py" = ["S603", "S607"]
+# 下载写死的 https 地址（锁定版本的 GitHub 发布）；运行 PATH 里的 rustc 与刚核对、解开的 Python 与 QuickJS-NG
+"scripts/runtime.py" = ["S310", "S603", "S607"]
 # yt-dlp 的驱动脚本：常驻解析时任何异常都要回给应用、进程接着服务（yt-dlp 只包住它认得的异常，网站改版后解析器
 # 抛的 TypeError 等直接冒上来），所以按请求兜住 Exception；扩展名白名单只在 yt-dlp 的内部名字
 # `yt_dlp.utils._utils._UnsafeExtensionError` 下，用它而不抄一份（随 yt-dlp 的安全修复更新），自检核对它还在

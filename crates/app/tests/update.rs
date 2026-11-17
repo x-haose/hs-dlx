@@ -115,7 +115,7 @@ fn updates_are_found_downloaded_and_verified() {
         // 网页视频不在这里测：不给组件
         hs_dlx_app::WebConfig {
             root: std::env::temp_dir().join("hs-dlx-no-web"),
-            pins: None,
+            bundle: None,
             sources: hs_dlx_app::ytdlp::Sources::official(),
         },
     )
