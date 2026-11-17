@@ -1,6 +1,7 @@
 //! 填代理的一组输入：主机（默认本机）、端口、协议（默认连上去自己认）与可选的用户名、密码。保存时经
 //! [`hs_dlx_app::Service::identify_proxy`] 连上去核对，认出了才交出地址（[`ProxyEditorEvent::Identified`]），由所在的
-//! 一行存进设置。主机框里粘贴完整的代理地址（`socks5://u:p@host:1080` 之类）时拆进各框，协议照它写的。
+//! 一行存进设置。保存时主机框里是完整的代理地址（`socks5://u:p@host:1080` 之类）时拆进各框、协议照它写的，是
+//! `主机:端口` 时拆成两框（IPv6 地址除外）。存着的地址是 HTTP 或 SOCKS5 时协议显示为自动判断，换端口后重新认。
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::{
@@ -72,18 +73,12 @@ impl ProxyEditor {
         let typed = [&host, &port, &username, &password]
             .into_iter()
             .map(|input| {
-                let is_host = *input == host;
                 cx.subscribe_in(
                     input,
                     window,
-                    move |this: &mut Self, _, event: &InputEvent, window, cx| match event {
-                        InputEvent::PressEnter { .. } => this.save(cx),
-                        InputEvent::Change => {
-                            if is_host {
-                                this.split_pasted(window, cx);
-                            }
-                            this.changed(cx);
-                        }
+                    |this: &mut Self, _, event: &InputEvent, window, cx| match event {
+                        InputEvent::PressEnter { .. } => this.save(window, cx),
+                        InputEvent::Change => this.changed(cx),
                         InputEvent::Focus | InputEvent::Blur => {}
                     },
                 )
@@ -104,12 +99,16 @@ impl ProxyEditor {
             _typed: typed,
         };
         if let Some(url) = saved {
+            editor.choice = match written_choice(url) {
+                Choice::Fixed(_) => Choice::Auto,
+                choice => choice,
+            };
             editor.fill(url, window, cx);
         }
         editor
     }
 
-    /// 照 `url` 填各框与协议，算作没改过。
+    /// 照 `url` 填各框（协议不动），算作没改过。
     pub fn fill(&mut self, url: &Url, window: &mut Window, cx: &mut Context<Self>) {
         let host = url.host_str().unwrap_or_default();
         // IPv6 地址在地址里带方括号，框里不带
@@ -118,7 +117,10 @@ impl ProxyEditor {
             .and_then(|host| host.strip_suffix(']'))
             .unwrap_or(host)
             .to_owned();
-        let port = url.port().map(|port| port.to_string()).unwrap_or_default();
+        let port = url
+            .port_or_known_default()
+            .map(|port| port.to_string())
+            .unwrap_or_default();
         let decoded = |text: &str| {
             percent_encoding::percent_decode_str(text)
                 .decode_utf8_lossy()
@@ -126,11 +128,6 @@ impl ProxyEditor {
         };
         let username = decoded(url.username());
         let password = url.password().map(decoded).unwrap_or_default();
-        self.choice = match url.scheme() {
-            "http" => Choice::Fixed(ProxyProtocol::Http),
-            "socks5" | "socks5h" => Choice::Fixed(ProxyProtocol::Socks5),
-            other => Choice::Written(other.to_owned()),
-        };
         self.login = !username.is_empty();
         for (input, value) in [
             (&self.host, host),
@@ -164,18 +161,38 @@ impl ProxyEditor {
         cx.notify();
     }
 
-    /// 主机框里是完整的代理地址时拆进各框。
-    fn split_pasted(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 不再等在做的核对（所在一行改选了直连、跟随系统时）：它的结果不再交出。
+    pub fn cancel(&mut self, cx: &mut Context<Self>) {
+        self.identifying = None;
+        cx.notify();
+    }
+
+    /// 主机框里是完整的代理地址时拆进各框、协议照它写的；是 `主机:端口`（不是 IPv6 地址）时拆成两框。认不出的完整
+    /// 地址为原因。
+    fn split_host(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Result<(), String> {
         let text = self.host.read(cx).value().trim().to_owned();
-        if !text.contains("://") {
-            return;
-        }
-        if let Ok(url) = Url::parse(&text)
-            && url.host_str().is_some()
-        {
+        if text.contains("://") {
+            let url = Url::parse(&text)
+                .ok()
+                .filter(|url| url.host_str().is_some())
+                .ok_or_else(|| format!("{text} 不是代理地址"))?;
+            self.choice = written_choice(&url);
             self.fill(&url, window, cx);
             self.edited = true;
+            return Ok(());
         }
+        if text.parse::<std::net::Ipv6Addr>().is_err()
+            && let Some((host, port)) = text.rsplit_once(':')
+            && !host.contains(':')
+            && port.parse::<u16>().is_ok()
+        {
+            let (host, port) = (host.to_owned(), port.to_owned());
+            self.host
+                .update(cx, |input, cx| input.set_value(host, window, cx));
+            self.port
+                .update(cx, |input, cx| input.set_value(port, window, cx));
+        }
+        Ok(())
     }
 
     fn pick(&mut self, choice: Choice, cx: &mut Context<Self>) {
@@ -184,7 +201,12 @@ impl ProxyEditor {
     }
 
     /// 核对各框，连上去认；认出了交出地址。
-    pub fn save(&mut self, cx: &mut Context<Self>) {
+    pub fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(reason) = self.split_host(window, cx) {
+            self.error = Some(reason);
+            cx.notify();
+            return;
+        }
         let host = self.host.read(cx).value().trim().to_owned();
         let port = self.port.read(cx).value().trim().to_owned();
         let Ok(port) = port.parse::<u16>() else {
@@ -242,9 +264,18 @@ impl ProxyEditor {
     }
 }
 
+/// 照地址里写的协议定：HTTP、SOCKS5 为手选的那种，别的照写的存。
+fn written_choice(url: &Url) -> Choice {
+    match url.scheme() {
+        "http" => Choice::Fixed(ProxyProtocol::Http),
+        "socks5" | "socks5h" => Choice::Fixed(ProxyProtocol::Socks5),
+        other => Choice::Written(other.to_owned()),
+    }
+}
+
 /// 照写的协议拼地址，不核对。
 fn written(scheme: &str, host: &str, port: u16, login: Option<&ProxyLogin>) -> Result<Url, String> {
-    let host = if host.contains(':') && !host.starts_with('[') {
+    let host = if host.parse::<std::net::Ipv6Addr>().is_ok() {
         format!("[{host}]")
     } else {
         host.to_owned()
@@ -278,9 +309,9 @@ impl Render for ProxyEditor {
                 "save-proxy",
                 if busy { "在核对…" } else { "保存" },
                 Tone::Glow,
-                cx.listener(|this, _, _, cx| {
+                cx.listener(|this, _, window, cx| {
                     if this.identifying.is_none() {
-                        this.save(cx);
+                        this.save(window, cx);
                     }
                 }),
             ));

@@ -3,21 +3,24 @@
 由应用以 `python -I -X utf8 driver.py <命令> ...` 运行，环境变量 YTDLP_NO_PLUGINS 不加载插件。命令：
 
 - `requirements`：标准输入为 yt-dlp 某个版本的 Requires-Dist 列表（JSON），标准输出为它锁定的依赖（`pin` 与
-  `pin-curl-cffi` 两组，按本机的解释器与平台取舍，不要 mutagen）：`[{"name": 名字, "version": 版本}]`。
+  `pin-curl-cffi` 两组，Linux 上另有读 GNOME 密钥环的 `pin-secretstorage`，按本机的解释器与平台取舍，不要
+  mutagen）：`[{"name": 名字, "version": 版本}]`。
 - `pick`：标准输入为 `{包名: [{"filename": 文件名, ...}]}`（PyPI 上这个版本的各个文件），标准输出为每个包本机能装
   的、最合适的那个 wheel 的文件名：`{包名: 文件名}`；有包没有能装的时退出码非 0。
 - `selftest <site> <quickjs>`：导入 site 目录里的 yt-dlp 与 yt-dlp-ejs、核对它认得 QuickJS-NG，标准输出打出
   `{"yt_dlp": 规范化的版本}`。
 - `serve <site> <quickjs> <cache>`：常驻解析。标准输入每行一个请求，标准输出每行一个回应，一次只处理一个：
   - 请求 `{"id": 整数, "url": 网址, "proxy": 代理地址（空串为直连）, "cookies": Netscape 格式的 Cookie 或 null,
-    "generic": 只有通用解析器认得时也解析}`；`generic` 为假时只认得通用解析器的网址不发请求，直接回 `unsupported`；
-    视频没有格式时照网站说的原因（要登录、人机验证、限流、地区限制、不可用）回错误
+    "generic": 只有通用解析器认得时也解析, "browser": 另从这个浏览器读 Cookie（yt-dlp 的浏览器名）或 null}`；
+    `generic` 为假时只认得通用解析器的网址不发请求，直接回 `unsupported`；视频没有格式时照网站说的原因（要登录、人机
+    验证、限流、地区限制、不可用）回错误
   - 回应 `{"id": 同请求, "ok": 结果}` 或 `{"id": 同请求, "error": {"kind": 种类, "message": 说明}}`，种类见
-    `classify`。yt-dlp 自己的输出都转到标准错误，标准输出只有回应（纯 ASCII 的 JSON）。
+    `classify`；从浏览器读 Cookie 没成时种类为 `cookies`，另有 `reason`（见 `browser_cookies`）。yt-dlp 自己的输出
+    都转到标准错误，标准输出只有回应（纯 ASCII 的 JSON）。
   - 结果见 `trimmed`。
 - `download <site> <quickjs> <cache>`：用 yt-dlp 自己的下载器下一个格式（要模拟浏览器 TLS 指纹的、DASH 分片等应用的引擎
   下不了的）。标准输入的第一行为请求 `{"url": 网页地址, "format": 要的格式（`key_of` 的各项）,
-  "dir": 输出所在的目录, "name": 输出的文件名, "proxy", "cookies"}`；标准输出先是若干行进度
+  "dir": 输出所在的目录, "name": 输出的文件名, "proxy", "cookies", "browser"}`；标准输出先是若干行进度
   `{"progress": {"bytes": 已下字节, "total": 总字节或估算，不知道时为 null}}`，最后一行为 `{"ok": {}}` 或
   `{"error": ...}`（同 `serve`，格式编号找不到或属性对不上时种类为 `changed`）。中断后再下同一输出时接着 `.part` 续传；
   缺了的片段不跳过，报错。读到标准输入的结尾（应用退出了）即退出。
@@ -37,7 +40,7 @@ import traceback
 from typing import TYPE_CHECKING, Any, Protocol, TextIO, cast
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sized
+    from collections.abc import Callable, Mapping, Sized
     from types import ModuleType
 
 # yt-dlp 的解析结果：任意结构的 JSON 式字典
@@ -65,7 +68,7 @@ BLOCKED = frozenset({403, 412})
 # 下载进度至多多久报一次（秒）
 PROGRESS_INTERVAL = 0.2
 # 用 yt-dlp 锁定版本的这两组依赖：默认的依赖与模拟浏览器 TLS 指纹的 curl-cffi
-PIN_EXTRAS = ("pin", "pin-curl-cffi")
+PIN_EXTRAS = ("pin", "pin-curl-cffi", *(("pin-secretstorage",) if sys.platform.startswith("linux") else ()))
 # 不装的：mutagen 只用于往文件里嵌封面（GPL）
 EXCLUDED = frozenset({"mutagen"})
 
@@ -80,6 +83,8 @@ class CookieJar(Protocol):
 
 class WithCookies(Protocol):
     """YoutubeDL 里用到 Cookie 罐的部分。"""
+
+    params: dict[str, object]
 
     @property
     def cookiejar(self) -> Sized:
@@ -318,7 +323,7 @@ def params(request: Mapping[str, object], quickjs: str, cache: str, logger: Logg
     JavaScript 挑战；缓存放在应用的目录；不查自己是不是太旧。
     """
     cookies = text(request.get("cookies"))
-    browser = text(request.get("browser"))
+    browser = browser_of(request)
     return {
         "quiet": True,
         "logger": logger,
@@ -336,28 +341,79 @@ def params(request: Mapping[str, object], quickjs: str, cache: str, logger: Logg
     }
 
 
+def browser_of(request: Mapping[str, object]) -> str | None:
+    """要从哪个浏览器读 Cookie：请求里的，网址只有通用解析器认得时不读。
+
+    通用解析器会顺着网页去请求别的网站，带上浏览器里那些网站的 Cookie 等于替网页发了带登录的跨站请求（浏览器按
+    SameSite 不会带）。
+    """
+    browser = text(request.get("browser"))
+    if browser is None or matched(text(request.get("url")) or "") == "Generic":
+        return None
+    return browser
+
+
+# 读浏览器 Cookie 时 yt-dlp 的警告里，说明整罐加密的 Cookie 都解不开的（钥匙串或密钥环没给钥匙、钥匙不对）；别的
+# 警告（某一条解不开、数据库版本较新）不影响其余的，缺的若正是要用的，网站照样回要登录
+KEYLESS = ("no key found", "MAC check failed")
+# yt-dlp 的 cookies 模块里向 macOS 钥匙串要密码的函数
+KEYCHAIN_FUNCTION = "_get_mac_keyring_password"
+# 读 Linux 密钥环出错时 yt-dlp 报的错误里的字样
+KEYRING_ERRORS = ("secretstorage", "keyring", "kwallet")
+
+
 def browser_cookies(yt_dlp: ModuleType, ydl: WithCookies, browser: str | None, logger: Logger) -> Info | None:
-    """`ydl` 要从浏览器读 Cookie 时先读：读不出或读时有警告时为归了类的失败，否则为 None。
+    """`ydl` 要从浏览器读 Cookie 时先读：读不出或加密的都解不开时为归了类的失败，否则为 None。
 
-    yt-dlp 读一次后留着。读时的警告（钥匙串没给钥匙、有的解不开等）说明没读全，算失败，`reason` 写原因。
-
-    原因：`missing`（没找到这个浏览器的 Cookie 文件）、`denied`（系统不让读，macOS 上 Safari 要完全磁盘访问权限）、
-    `encrypted`（Windows 上的 Chrome 等加密成了只有它自己解得开的，DPAPI 解不开）、`locked`（浏览器开着、Windows 上
-    文件被锁）、`keychain`（macOS 钥匙串没给解开的钥匙）、`incomplete`（其余读时的警告）、`other`。
+    yt-dlp 读一次后留着。原因：`missing`（没找到这个浏览器的 Cookie 文件）、`denied`（系统不让读，macOS 上 Safari
+    要完全磁盘访问权限）、`encrypted`（Windows 上的 Chrome 等加密成了只有它自己解得开的，DPAPI 解不开）、`locked`
+    （浏览器开着、Windows 上文件被锁）、`keychain`（macOS 钥匙串没给解开的钥匙）、`keyring`（Linux 密钥环没给钥匙或
+    读不了）、`other`。失败时把 `cookiefile` 去掉：退出 `with` 时 yt-dlp 存 cookiefile 要再取 cookiejar，会再读一遍
+    浏览器、再抛一次，盖掉这里的结果。
     """
     if not browser:
         return None
     before = len(logger.warnings)
+    keyring = "keychain" if sys.platform == "darwin" else "keyring"
     try:
         # 第一次取 cookiejar 时读，读出的留在上面，解析与下载都用它
         len(ydl.cookiejar)
     except yt_dlp.utils.YoutubeDLError as error:
-        return {"error": {"kind": "cookies", **cookie_failure(error)}}
-    warned = logger.warnings[before:]
-    if not warned:
+        ydl.params["cookiefile"] = None
+        failure = cookie_failure(error)
+        # Linux 上读密钥环出错时 yt-dlp 报错（没有 secretstorage、读不了 GNOME 密钥环或 KWallet）
+        if failure["reason"] == "other" and any(mark in failure["message"] for mark in KEYRING_ERRORS):
+            failure["reason"] = keyring
+        return {"error": {"kind": "cookies", **failure}}
+    keyless = [warning for warning in logger.warnings[before:] if any(mark in warning for mark in KEYLESS)]
+    if not keyless:
         return None
-    reason = "keychain" if any("no key found" in warning for warning in warned) else "incomplete"
-    return {"error": {"kind": "cookies", "reason": reason, "message": clean("；".join(warned))}}
+    ydl.params["cookiefile"] = None
+    return {"error": {"kind": "cookies", "reason": keyring, "message": clean("；".join(keyless))}}
+
+
+def remember_keychain() -> None:
+    """在 macOS 上，同一个进程里读到的钥匙串密码留着。
+
+    yt-dlp 每次读 Chromium 系的 Cookie 都向钥匙串要一次，每次弹授权。没拿到的不留，下次照样要。yt-dlp 改了这个内部
+    函数的名字时不留（每次弹授权，结果不变）。
+    """
+    # 模块的命名空间：yt-dlp 读 Cookie 时按名字从这里取这个函数（给钥匙串里的名字与日志，没拿到时为 None）
+    namespace = vars(importlib.import_module("yt_dlp.cookies"))
+    original = cast("Callable[[str, object], bytes | None] | None", namespace.get(KEYCHAIN_FUNCTION))
+    if sys.platform != "darwin" or original is None:
+        return
+    found: dict[str, bytes] = {}
+
+    def remembered(name: str, logger: object) -> bytes | None:
+        if name not in found:
+            password = original(name, logger)
+            if password is None:
+                return None
+            found[name] = password
+        return found[name]
+
+    namespace[KEYCHAIN_FUNCTION] = remembered
 
 
 def cookie_failure(error: BaseException) -> dict[str, str]:
@@ -400,7 +456,7 @@ def extract(yt_dlp: ModuleType, request: Mapping[str, object], quickjs: str, cac
     logger = Logger()
     options = params(request, quickjs, cache, logger)
     with yt_dlp.YoutubeDL(options) as ydl:
-        failed = browser_cookies(yt_dlp, ydl, text(request.get("browser")), logger)
+        failed = browser_cookies(yt_dlp, ydl, browser_of(request), logger)
         if failed is not None:
             return failed
         try:
@@ -420,6 +476,7 @@ def serve(site: str, quickjs: str, cache: str, requests: TextIO, replies: TextIO
     """
     sys.path.insert(0, site)
     yt_dlp = importlib.import_module("yt_dlp")
+    remember_keychain()
     for line in requests:
         if not line.strip():
             continue
@@ -551,7 +608,7 @@ def download(yt_dlp: ModuleType, request: Mapping[str, object], quickjs: str, ca
 
     options["format"] = select
     with yt_dlp.YoutubeDL(options) as ydl:
-        failed = browser_cookies(yt_dlp, ydl, text(request.get("browser")), logger)
+        failed = browser_cookies(yt_dlp, ydl, browser_of(request), logger)
         if failed is not None:
             return failed
         try:

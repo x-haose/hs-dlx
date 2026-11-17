@@ -1,9 +1,10 @@
 //! 解析时从哪个浏览器读登录后的 Cookie（yt-dlp 的 `cookiesfrombrowser`）。每次解析现读：浏览器里登录着、Cookie 轮换
 //! 了也是新的。
 //!
-//! 能不能读因平台而异：macOS 上 Chromium 系第一次读时系统弹钥匙串的授权，Safari 要给应用完全磁盘访问权限；Windows 上
-//! Chrome 127 起把 Cookie 加密成只有它自己解得开的（app-bound encryption），yt-dlp 读不了；Firefox 各平台都能读。读
-//! 不了时解析报 [`crate::ExtractError::Cookies`]。
+//! 能不能读因平台而异：macOS 上 Chromium 系读时系统弹钥匙串的授权（一个解析进程里给过一次即留着），Safari 要给应用
+//! 完全磁盘访问权限；Linux 上 Chromium 系的钥匙在系统的密钥环里；Windows 上 Chrome、Edge、Brave 把 Cookie 加密成只有
+//! 它们自己解得开的（app-bound encryption），yt-dlp 读不了，不列出；Firefox 各平台都能读。读不了时解析报
+//! [`crate::ExtractError::Cookies`]。
 
 use std::path::PathBuf;
 
@@ -72,13 +73,19 @@ impl Browser {
         }
     }
 
-    /// 这台机器上有它的数据目录（用过它）的浏览器，按 [`Browser::ALL`] 的次序。目录的位置照 yt-dlp 2026.10.26 找
-    /// Cookie 的地方；Safari 在 macOS 上总算有（它的目录在应用沙盒里，没有完全磁盘访问权限时看不到）。
+    /// 这台机器上有它的数据目录（用过它）、yt-dlp 读得了的浏览器，按 [`Browser::ALL`] 的次序。目录的位置同 yt-dlp
+    /// 找 Cookie 的地方（见 [`Browser::data_dirs`]）；Safari 在 macOS 上总算有（它的目录在应用沙盒里，没有完全磁盘访问
+    /// 权限时看不到）。
     pub fn installed() -> Vec<Browser> {
         Browser::ALL
             .into_iter()
-            .filter(|browser| browser.present())
+            .filter(|browser| browser.readable() && browser.present())
             .collect()
+    }
+
+    /// yt-dlp 在这个平台上读得了：Windows 上 Chrome、Edge、Brave 的 Cookie 加密成了只有它们自己解得开的。
+    fn readable(self) -> bool {
+        !(cfg!(windows) && matches!(self, Browser::Chrome | Browser::Edge | Browser::Brave))
     }
 
     fn present(self) -> bool {

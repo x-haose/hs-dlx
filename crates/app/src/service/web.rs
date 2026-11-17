@@ -195,17 +195,17 @@ impl Service {
         self.shared.write(|tx| store::set_web_channel(tx, channel))
     }
 
-    /// 记下网页视频的画质取向：之后的解析照它挑画质选项。
     /// 记下解析时从哪个浏览器读 Cookie（None 为不读）：之后的解析与任务开始、继续照它。
     pub fn set_web_browser(&self, browser: Option<Browser>) -> Result<(), Error> {
         self.shared.write(|tx| store::set_web_browser(tx, browser))
     }
 
-    /// 这台机器上有数据目录的浏览器（见 [`Browser::installed`]）。
+    /// 这台机器上有数据目录、读得了的浏览器（见 [`Browser::installed`]）。
     pub fn web_browsers(&self) -> Vec<Browser> {
         Browser::installed()
     }
 
+    /// 记下网页视频的画质取向：之后的解析照它挑画质选项。
     pub fn set_web_preference(&self, preference: Preference) -> Result<(), Error> {
         self.shared
             .write(|tx| store::set_web_preference(tx, preference))

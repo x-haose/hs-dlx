@@ -104,8 +104,9 @@ impl NewTask {
 
     /// 探测失败：错误（与看过不是网页的说明）、请求经哪里走、缺请求头时的编辑框；底栏是重新探测与另找。被拒或取到错误
     /// 页的多半缺请求头，改了再探测；再试也一样的不给重新探测。网页视频要登录时主按钮是到网页里登录（嗅探页里登录、回到
-    /// 视频页后点「解析网页视频」，带着登录后的 Cookie 解析；从嗅探页来的回嗅探页，同一份 Cookie 再探测也一样），被拦截
-    /// 时另给到网页里登录。不是从嗅探页来的还可以在网页里打开它找视频流。
+    /// 视频页后点「解析网页视频」，带着登录后的 Cookie 解析；从嗅探页来的回嗅探页），另给重新探测（在常用的浏览器里登录
+    /// 了、或在设置里选了从浏览器读之后，再解析时现读）；被拦截时另给到网页里登录。不是从嗅探页来的还可以在网页里打开它
+    /// 找视频流。
     fn failed_inspector(
         &self,
         title: String,
@@ -116,16 +117,16 @@ impl NewTask {
         let headers = failure.kind.headers_likely_missing();
         let needs_login = failure.kind == FailureKind::WebLogin;
         let login = needs_login && !self.from_sniff;
-        let again = !needs_login && (headers || failure.kind.retry_helps());
+        let again = headers || failure.kind.retry_helps();
         let mut body = vec![ui::note(failure.message.clone(), true).into_any_element()];
         if let PageCheck::NotPage(note) = &self.page_check {
             body.push(ui::note(note.clone(), false).into_any_element());
         }
         if needs_login {
             let how = if self.from_sniff {
-                "回到网页里登录，回到视频页后再点顶上的「解析网页视频」；或在设置的「网页视频」里选从你常用的浏览器读登录信息"
+                "回到网页里登录，回到视频页后再点顶上的「解析网页视频」；或在设置的「网页视频 → 登录信息」里选你常用的浏览器（已选的在它里面登录这个网站），再点重新探测"
             } else {
-                "在打开的网页里登录，回到视频页后点顶上的「解析网页视频」；或在设置的「网页视频」里选从你常用的浏览器读登录信息"
+                "在打开的网页里登录，回到视频页后点顶上的「解析网页视频」；或在设置的「网页视频 → 登录信息」里选你常用的浏览器（已选的在它里面登录这个网站），再点重新探测"
             };
             body.push(ui::note(how.to_owned(), false).into_any_element());
         }
@@ -176,7 +177,19 @@ impl NewTask {
             );
         }
         let mut row = Vec::new();
-        if !self.from_sniff && !login {
+        if needs_login && again {
+            row.push(
+                ui::button(
+                    "reprobe",
+                    "重新探测",
+                    Tone::Plain,
+                    cx.listener(|this, _, window, cx| this.reprobe(window, cx)),
+                )
+                .flex_1()
+                .into_any_element(),
+            );
+        }
+        if !self.from_sniff && !needs_login {
             let url = self.url.clone();
             row.push(
                 ui::button(

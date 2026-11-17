@@ -294,11 +294,11 @@ impl SettingsView {
             )
         });
         let platform = if cfg!(target_os = "macos") {
-            "Chrome、Edge 等第一次读时系统弹钥匙串的授权，点「始终允许」；Safari 要在「系统设置 → 隐私与安全性 → 完全磁盘访问权限」里打开 hs-dlx"
+            "Chrome、Edge 等读时系统弹钥匙串的授权，点「允许」（解析进程重开后再弹一次；Firefox 不弹）；Safari 要在「系统设置 → 隐私与安全性 → 完全磁盘访问权限」里打开 hs-dlx"
         } else if cfg!(windows) {
-            "Windows 上 Chrome、Edge 等把 Cookie 加密成了只有它们自己解得开的，读得了的是 Firefox"
+            "Chrome、Edge、Brave 把 Cookie 加密成了只有它们自己解得开的，读不了，不列出"
         } else {
-            "Chrome 等的 Cookie 用系统的密钥环解开"
+            "Chrome 等的 Cookie 用系统的密钥环（GNOME 密钥环或 KWallet）解开，读时它要已解锁"
         };
         row(
             "登录信息",

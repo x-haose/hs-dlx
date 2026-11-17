@@ -33,6 +33,8 @@ class Warns(Protocol):
 # yt-dlp 装在开发环境的 site-packages 里：驱动脚本按目录导入
 SITE = str(Path(importlib.import_module("yt_dlp").__file__ or "").parent.parent)
 REQUEST_ID = 7
+# 有专门解析器的网址：读浏览器 Cookie 失败时不发请求，测试不联网
+YOUTUBE = "https://www.youtube.com/watch?v=V8dKO3snMG8"
 
 
 @pytest.fixture
@@ -156,16 +158,26 @@ def test_an_unexpected_error_is_answered_and_the_next_request_still_runs(
 def test_cookies_the_browser_cannot_give_fail_before_the_page_is_asked(
     site: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # 这台机器上（HOME 指到空目录）没有 Firefox 的 Cookie：说没找到
+    # 这台机器上（HOME 指到空目录）没有 Firefox 的 Cookie：说没找到，不发请求（网址是 YouTube 的，没联网）
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("APPDATA", str(tmp_path))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
-    request = {"id": REQUEST_ID, "url": f"{site}/video.html", "proxy": "", "browser": "firefox", "generic": True}
+    request = {"id": REQUEST_ID, "url": YOUTUBE, "proxy": "", "browser": "firefox", "generic": False}
     [reply] = serve([request], tmp_path)
     error = driver.mapping(reply["error"]) or {}
     assert (error["kind"], error["reason"]) == ("cookies", "missing")
 
-    # 读出来了但有的解不开（macOS 钥匙串没给钥匙时 yt-dlp 只警告、跳过）：没读全不算读到
+    # 同时带着嗅探页的 Cookie：退出时 yt-dlp 存 cookiefile 不再把读不出的又抛一遍
+    cookies_txt = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tFALSE\t0\tsession\tabc\n"
+    [reply] = serve([{**request, "cookies": cookies_txt}], tmp_path)
+    error = driver.mapping(reply["error"]) or {}
+    assert (error["kind"], error["reason"]) == ("cookies", "missing")
+
+    # 只有通用解析器认得的网址不读浏览器的 Cookie：照常解析出本地网页
+    [reply] = serve([{**request, "url": f"{site}/video.html", "generic": True}], tmp_path)
+    assert "ok" in reply
+
+    # 加密的都解不开（钥匙串没给钥匙时 yt-dlp 只警告、跳过）：没读成
     cookies = importlib.import_module("yt_dlp.cookies")
 
     def keyless(_browser: str, _profile: str | None, logger: Warns, **_options: object) -> object:
@@ -175,8 +187,26 @@ def test_cookies_the_browser_cannot_give_fail_before_the_page_is_asked(
     monkeypatch.setattr(cookies, "extract_cookies_from_browser", keyless)
     [reply] = serve([{**request, "browser": "chrome"}], tmp_path)
     error = driver.mapping(reply["error"]) or {}
-    assert (error["kind"], error["reason"]) == ("cookies", "keychain")
+    assert error["kind"] == "cookies"
+    assert error["reason"] == ("keychain" if sys.platform == "darwin" else "keyring")
     assert "no key found" in str(error["message"])
+
+
+def test_warnings_that_leave_the_other_cookies_readable_do_not_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 数据库版本较新、某一条解不开：其余照常用，缺的若要用网站自会说要登录
+    cookies = importlib.import_module("yt_dlp.cookies")
+    yt_dlp = importlib.import_module("yt_dlp")
+
+    def partly(_browser: str, _profile: str | None, logger: Warns, **_options: object) -> object:
+        logger.warning("Possibly unsupported firefox cookies database version: 18", only_once=True)
+        logger.warning("failed to parse Safari cookie because UTF-8 decoding failed", only_once=True)
+        return cookies.YoutubeDLCookieJar()
+
+    monkeypatch.setattr(cookies, "extract_cookies_from_browser", partly)
+    logger = driver.Logger()
+    options = driver.params({"url": YOUTUBE, "browser": "firefox"}, "qjs", "", logger)
+    with yt_dlp.YoutubeDL(options) as ydl:
+        assert driver.browser_cookies(yt_dlp, ydl, "firefox", logger) is None
 
 
 def test_lone_surrogates_and_nan_still_make_valid_json() -> None:

@@ -12,6 +12,10 @@ impl SettingsView {
     /// 选了一种方式：跟随系统、直连即存，存进了才选中；指定代理要填了端口、核对过再存。
     fn pick(&mut self, mode: Mode, cx: &mut Context<Self>) {
         self.proxy_error = None;
+        if mode != Mode::Custom {
+            // 在做的核对回来时不再存
+            self.address.update(cx, |editor, cx| editor.cancel(cx));
+        }
         match mode {
             Mode::System => self.save(Proxy::System, cx),
             Mode::Direct => self.save(Proxy::Direct, cx),

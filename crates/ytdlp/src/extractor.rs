@@ -657,9 +657,11 @@ fn cookie_trouble(browser: Option<Browser>, reason: Option<&str>, detail: &str) 
         ),
         Some("locked") => format!("{name} 开着时它的 Cookie 文件被锁着：关掉 {name} 再试"),
         Some("keychain") => format!(
-            "没拿到解开 {name} 的 Cookie 的钥匙：macOS 弹出钥匙串的授权时点「始终允许」后再试"
+            "没拿到解开 {name} 的 Cookie 的钥匙：macOS 弹出钥匙串的授权时点「允许」后再试；不想每次弹，改用 Firefox"
         ),
-        Some("incomplete") => format!("{name} 的 Cookie 没读全"),
+        Some("keyring") => format!(
+            "没从系统的密钥环拿到解开 {name} 的 Cookie 的钥匙：解开密钥环（GNOME 密钥环或 KWallet）后再试，或改用 Firefox"
+        ),
         _ => format!("读不出 {name} 的 Cookie"),
     };
     format!("{what}（{detail}）")

@@ -201,14 +201,14 @@ print(json.dumps(dirs))
 async fn cookies_a_browser_cannot_give_fail_before_any_request() {
     let (installed, cache) = installed("cookies");
     let extractor = Extractor::new(installed, cache, Duration::from_secs(60));
-    // 没有服务器：要是发了请求会报网络错误
-    let url = Url::parse("http://127.0.0.1:9/video").unwrap();
+    // 有专门解析器的网址（只有通用解析器认得的不读浏览器的 Cookie）：读不出即回，不联网
+    let url = Url::parse("https://www.youtube.com/watch?v=V8dKO3snMG8").unwrap();
     let error = extractor
         .extract(
             &Request {
                 url,
                 cookies: Vec::new(),
-                generic: true,
+                generic: false,
                 browser: Some(Browser::Whale),
             },
             &Proxy::Direct,

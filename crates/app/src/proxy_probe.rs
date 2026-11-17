@@ -1,9 +1,9 @@
 //! 认出一个代理端口说的协议：SOCKS5（RFC 1928，认证见 RFC 1929）或 HTTP（CONNECT 建隧道），并核对用户名与密码。
 //! 设置里填了主机与端口、没写协议时照它定协议；写了协议时照它核对。
 //!
-//! 两种同时试：SOCKS5 的握手只在本机与代理之间，一来一回即知；HTTP 要代理真去连 [`CONNECT_TARGET`]、回 200 才算
-//! （网页服务器对 CONNECT 也回 HTTP 的状态，只看回没回 HTTP 认不出是不是代理）。两种都通（Clash 等的混合端口）时取
-//! SOCKS5。
+//! 两种同时试：SOCKS5 的握手只在本机与代理之间，一来一回即知；HTTP 发 CONNECT 去 [`CONNECT_TARGET`]，回 200（建
+//! 起了隧道）、407（要登录）或 502、503、504（代理在，这次没连上外面）才算代理，网页服务器对 CONNECT 回的是 400、
+//! 405、501 之类。两种都只认协议，不要求此刻连得上外面。两种都通（Clash 等的混合端口）时取 SOCKS5。
 
 use std::time::Duration;
 
@@ -16,9 +16,9 @@ use tokio::net::TcpStream;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// 连上后等 SOCKS5 的握手回应最多多久：代理自己回，一来一回。HTTP 代理收到 SOCKS5 的握手多半一直等着，这里等满。
 const SOCKS_REPLY_TIMEOUT: Duration = Duration::from_secs(3);
-/// 连上后等 HTTP 代理回应最多多久：它要先连上 [`CONNECT_TARGET`] 才回，经远处的节点时要几秒。
+/// 连上后等 HTTP 代理回应最多多久：它连 [`CONNECT_TARGET`] 有了结果才回，经远处的节点时要几秒。
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
-/// HTTP 代理的 CONNECT 连去哪里：要是代理连得上、回 200 的地方。
+/// HTTP 代理的 CONNECT 连去哪里：代理连得上时回 200，连不上时回 502 等，都认作代理。
 const CONNECT_TARGET: &str = "www.gstatic.com:443";
 /// HTTP 回应的头最多读多少字节：只要状态行。
 const HEAD_LIMIT: usize = 8 * 1024;
@@ -58,7 +58,7 @@ pub enum ProxyProbeError {
     /// 给了用户名与密码，代理不认
     #[error("代理不认这个用户名与密码")]
     LoginRefused,
-    /// 要 SOCKS5，这个端口只说 HTTP
+    /// 要 SOCKS5（BT），这个端口只说 HTTP
     #[error("这个端口是 HTTP 代理：要填代理的 SOCKS5 端口（Clash 等的混合端口两种都行）")]
     HttpOnly,
 }
@@ -89,14 +89,18 @@ pub async fn identify(
             "端口要在 1 到 65535 之间".to_owned(),
         ));
     }
-    let bracketed = if host.contains(':') && !host.starts_with('[') {
+    let bracketed = if host.parse::<std::net::Ipv6Addr>().is_ok() {
         format!("[{host}]")
     } else {
         host.to_owned()
     };
     let at = format!("{bracketed}:{port}");
     let protocol = match wanted {
-        ProxyWanted::Only(ProxyProtocol::Socks5) => socks5(&at, login).await?,
+        // 两种都试：只说 HTTP 的端口报出是 HTTP，而不是笼统的「不是 SOCKS5」
+        ProxyWanted::Only(ProxyProtocol::Socks5) => match either(&at, login).await? {
+            ProxyProtocol::Socks5 => ProxyProtocol::Socks5,
+            ProxyProtocol::Http => return Err(ProxyProbeError::HttpOnly),
+        },
         ProxyWanted::Only(ProxyProtocol::Http) => http(&at, login).await?,
         ProxyWanted::Any => either(&at, login).await?,
     };
@@ -141,7 +145,8 @@ async fn either(at: &str, login: Option<&ProxyLogin>) -> Result<ProxyProtocol, P
     }
 }
 
-/// 两种都没认出时报哪个：要登录与登录被拒说明是代理，连不上说明端口没人听，都比「不像代理」有用。
+/// 两种都没认出时报哪个：要登录与登录被拒说明是代理，连不上说明端口没人听，都比「不像代理」有用；一样有用时报 HTTP
+/// 的（它带着回的状态，SOCKS5 的只有「不是 SOCKS5」）。
 fn worse(socks: ProxyProbeError, http: ProxyProbeError) -> ProxyProbeError {
     let rank = |error: &ProxyProbeError| match error {
         ProxyProbeError::LoginRefused => 0,
@@ -150,7 +155,7 @@ fn worse(socks: ProxyProbeError, http: ProxyProbeError) -> ProxyProbeError {
         ProxyProbeError::Invalid(_) | ProxyProbeError::HttpOnly => 3,
         ProxyProbeError::NotProxy(_) => 4,
     };
-    if rank(&socks) <= rank(&http) {
+    if rank(&socks) < rank(&http) {
         socks
     } else {
         http
@@ -256,8 +261,14 @@ async fn http(at: &str, login: Option<&ProxyLogin>) -> Result<ProxyProtocol, Pro
     };
     let head = match tokio::time::timeout(REPLY_TIMEOUT, talk).await {
         Ok(Ok(head)) => head,
-        Ok(Err(_)) | Err(_) => {
+        Ok(Err(_)) => {
             return Err(ProxyProbeError::NotProxy(format!("{at} 不是 HTTP 代理")));
+        }
+        Err(_) => {
+            return Err(ProxyProbeError::NotProxy(format!(
+                "{at} {} 秒内没回应 CONNECT：不是 HTTP 代理，或代理连外面一直没有结果",
+                REPLY_TIMEOUT.as_secs()
+            )));
         }
     };
     let line = String::from_utf8_lossy(&head);
@@ -266,11 +277,12 @@ async fn http(at: &str, login: Option<&ProxyLogin>) -> Result<ProxyProtocol, Pro
         .and_then(|rest| rest.get(2..5))
         .and_then(|code| code.parse::<u16>().ok());
     match (status, login) {
-        (Some(200), _) => Ok(ProxyProtocol::Http),
+        // 502、503、504：代理在，这次没连上外面（节点挂了、规则拦了），协议是对的
+        (Some(200 | 502 | 503 | 504), _) => Ok(ProxyProtocol::Http),
         (Some(407), None) => Err(ProxyProbeError::LoginNeeded),
         (Some(407), Some(_)) => Err(ProxyProbeError::LoginRefused),
         (Some(code), _) => Err(ProxyProbeError::NotProxy(format!(
-            "{at} 对 CONNECT 回了 HTTP {code}：不是代理，或代理连不上外网"
+            "{at} 对 CONNECT 回了 HTTP {code}：不是代理"
         ))),
         (None, _) => Err(ProxyProbeError::NotProxy(format!("{at} 不是 HTTP 代理"))),
     }
@@ -409,9 +421,16 @@ mod tests {
                 ProxyWanted::Only(ProxyProtocol::Socks5)
             )
             .await,
-            Err(ProxyProbeError::NotProxy(format!(
-                "127.0.0.1:{proxy} 不是 SOCKS5 代理"
-            )))
+            Err(ProxyProbeError::HttpOnly)
+        );
+        // 连不上外面的 HTTP 代理照样认得出
+        let stranded = http_server("HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+        assert_eq!(
+            identify("127.0.0.1", stranded, None, ProxyWanted::Any)
+                .await
+                .unwrap()
+                .as_str(),
+            format!("http://127.0.0.1:{stranded}/")
         );
         let guarded = http_server("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n").await;
         assert_eq!(
@@ -423,10 +442,13 @@ mod tests {
     #[tokio::test]
     async fn a_web_server_or_a_closed_port_is_not_taken_for_a_proxy() {
         let web = http_server("HTTP/1.1 405 Method Not Allowed\r\n\r\n").await;
-        assert!(matches!(
+        // 报 HTTP 那一路的：带着回的状态
+        assert_eq!(
             identify("127.0.0.1", web, None, ProxyWanted::Any).await,
-            Err(ProxyProbeError::NotProxy(_))
-        ));
+            Err(ProxyProbeError::NotProxy(format!(
+                "127.0.0.1:{web} 对 CONNECT 回了 HTTP 405：不是代理"
+            )))
+        );
         // 开过又关掉的端口：没人在听
         let closed = TcpListener::bind("127.0.0.1:0")
             .await

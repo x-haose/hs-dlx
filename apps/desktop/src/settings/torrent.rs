@@ -2,7 +2,7 @@
 
 use std::num::NonZeroU32;
 
-use gpui_kit::{Context, Div, FontWeight, ParentElement as _, Styled as _, div, px};
+use gpui_kit::{Context, Div, FontWeight, ParentElement as _, Styled as _, Window, div, px};
 use hs_dlx_app::Seeding;
 
 use super::{SettingsView, row};
@@ -100,15 +100,18 @@ impl SettingsView {
     }
 
     /// 改 BT 代理：`via` 为经代理（填了端口时核对后存），否则改回直连；存进了才换。
-    fn pick_torrent_proxy(&mut self, via: bool, cx: &mut Context<Self>) {
+    fn pick_torrent_proxy(&mut self, via: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.torrent_proxy_error = None;
         if via {
             self.torrent_proxy_picked = true;
             if self.torrent_address.read(cx).has_port(cx) {
                 self.torrent_address
-                    .update(cx, |editor, cx| editor.save(cx));
+                    .update(cx, |editor, cx| editor.save(window, cx));
             }
         } else {
+            // 在做的核对回来时不再存
+            self.torrent_address
+                .update(cx, |editor, cx| editor.cancel(cx));
             match self.tasks.read(cx).service().set_torrent_proxy(None) {
                 Ok(()) => {
                     self.torrent_proxy = None;
@@ -134,6 +137,7 @@ impl SettingsView {
         match saved {
             Ok(()) => {
                 self.torrent_proxy = Some(url);
+                self.torrent_proxy_picked = true;
                 self.torrent_proxy_error = None;
                 // 检测结果（与在做的检测）是按旧的设置量的
                 self.network_report = None;
@@ -225,13 +229,13 @@ impl SettingsView {
                 "torrent-direct",
                 "直连",
                 !picked,
-                cx.listener(|this, _, _, cx| this.pick_torrent_proxy(false, cx)),
+                cx.listener(|this, _, window, cx| this.pick_torrent_proxy(false, window, cx)),
             ))
             .child(ui::chip(
                 "torrent-socks",
                 "经 SOCKS5 代理",
                 picked,
-                cx.listener(|this, _, _, cx| this.pick_torrent_proxy(true, cx)),
+                cx.listener(|this, _, window, cx| this.pick_torrent_proxy(true, window, cx)),
             ));
         let input = picked.then(|| {
             div()
