@@ -14,7 +14,7 @@ use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, Buf
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Semaphore;
 
-use crate::components::{Installed, clear_proxy_env, proxy_for};
+use crate::components::{Installed, command, proxy_for};
 use crate::info::{Info, Wire};
 
 /// 同时最多几个解析进程：每个约占几十 MB 内存，一般一次只解析一个网址。
@@ -23,6 +23,8 @@ pub const WORKERS: usize = 2;
 const STDERR_TAIL: usize = 8192;
 /// 一行回应最多多少字节：YouTube 一个视频的结果约 100 KB（格式多、请求头长）。
 const REPLY_LIMIT: usize = 64 << 20;
+/// 进程退出后等读标准错误的任务读完最多多久：管道里剩下的很快读完。
+const STDERR_WAIT: Duration = Duration::from_secs(1);
 
 /// 发往网站的一个 Cookie（Netscape cookies.txt 的各列）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,9 +78,12 @@ pub enum ExtractError {
     /// 超过时限没解析完（进程已杀掉）
     #[error("解析超过 {0} 秒没完成")]
     TimedOut(u64),
-    /// 解析进程起不来、意外退出或回的认不出：原因是它标准错误的末尾
+    /// 解析进程意外退出或回的认不出：原因是它标准错误的末尾
     #[error("解析进程出错：{0}")]
     Crashed(String),
+    /// 解析进程起不来（组件的文件缺了或坏了）：重新安装组件
+    #[error("解析组件运行不了：{0}")]
+    Broken(String),
     /// 系统代理设置读不了
     #[error("{0}")]
     Proxy(String),
@@ -86,15 +91,48 @@ pub enum ExtractError {
     Cancelled,
 }
 
-/// 一个解析进程。
+/// 一个解析进程。释放即连同它起的子进程（yt-dlp 解 JavaScript 挑战时起的 deno）一起杀掉。
 struct Worker {
-    /// 丢弃即杀掉进程（kill_on_drop）
-    _child: Child,
+    child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
-    /// 标准错误的末尾，由后台任务一直读着（不读满了会让进程卡住）
+    /// 标准错误的末尾，由后台任务 `reading` 一直读着（不读满了会让进程卡住），进程退出时它读到结尾结束
     stderr: Arc<Mutex<String>>,
+    reading: tokio::task::JoinHandle<()>,
     next_id: u64,
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        if let Some(pid) = self.child.id() {
+            kill_tree(pid);
+        }
+    }
+}
+
+/// 杀掉进程 `pid` 与它起的子进程：Unix 上它是自己进程组的组长（见 [`Extractor::spawn`]），杀整个组；Windows 上按进程
+/// 树杀。进程已经退出时杀不到，不算失败。
+fn kill_tree(pid: u32) {
+    #[cfg(unix)]
+    let mut killer = {
+        let mut killer = std::process::Command::new("kill");
+        killer.args(["-KILL", "--", &format!("-{pid}")]);
+        killer
+    };
+    #[cfg(windows)]
+    let mut killer = {
+        use std::os::windows::process::CommandExt as _;
+        /// CREATE_NO_WINDOW
+        const NO_WINDOW: u32 = 0x0800_0000;
+        let mut killer = std::process::Command::new("taskkill");
+        killer
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .creation_flags(NO_WINDOW);
+        killer
+    };
+    killer.stdout(Stdio::null()).stderr(Stdio::null());
+    // 杀不到（已经退出了）或杀的命令起不来都不影响：本进程随 Child 的释放（kill_on_drop）照样杀掉
+    let _done = killer.status();
 }
 
 pub struct Extractor {
@@ -137,7 +175,10 @@ impl Extractor {
             () = cancel.cancelled() => return Err(ExtractError::Cancelled),
         };
         let idle = self.idle.lock().expect("锁里不会 panic").pop_front();
-        let mut worker = match idle {
+        // 闲着的进程可能已被系统或别的程序结束：不拿它解析
+        let alive = idle
+            .and_then(|mut worker| matches!(worker.child.try_wait(), Ok(None)).then_some(worker));
+        let mut worker = match alive {
             Some(worker) => worker,
             None => self.spawn()?,
         };
@@ -161,7 +202,11 @@ impl Extractor {
         };
         let reply = match reply {
             Ok(reply) => reply,
-            Err(reason) => return Err(ExtractError::Crashed(with_stderr(&reason, &worker))),
+            Err(reason) => {
+                // 进程退出了：等读标准错误的任务读完（一会儿）再取原因
+                let _read = tokio::time::timeout(STDERR_WAIT, &mut worker.reading).await;
+                return Err(ExtractError::Crashed(with_stderr(&reason, &worker)));
+            }
         };
         let parsed: Reply = match serde_json::from_str(&reply) {
             Ok(parsed) => parsed,
@@ -188,35 +233,38 @@ impl Extractor {
         }
     }
 
-    /// 起一个解析进程：隔离模式（不读 PYTHON* 环境变量与用户的 site-packages），不加载 yt-dlp 的插件，不读环境变量里的
-    /// 代理。
+    /// 起一个解析进程：隔离模式（不读 PYTHON* 环境变量与用户的 site-packages）、标准输入输出用 UTF-8（隔离模式不读
+    /// PYTHONIOENCODING，Windows 上管道默认按系统的 ANSI 代码页），不加载 yt-dlp 的插件，不读环境变量里的代理；Unix 上
+    /// 自成一个进程组，释放时连同子进程一起杀。
     fn spawn(&self) -> Result<Worker, ExtractError> {
         let installed = &self.installed;
-        let mut command = tokio::process::Command::new(&installed.python);
+        let mut command = command(&installed.python);
+        #[cfg(unix)]
+        command.process_group(0);
         command
             .arg("-I")
+            .arg("-X")
+            .arg("utf8")
             .arg(&installed.driver)
             .arg("serve")
             .arg(&installed.site)
             .arg(&installed.deno)
             .arg(&self.cache)
             .env("YTDLP_NO_PLUGINS", "1")
-            .env("PYTHONIOENCODING", "utf-8")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        clear_proxy_env(&mut command);
         let mut child = command
             .spawn()
-            .map_err(|error| ExtractError::Crashed(format!("起不来：{error}")))?;
+            .map_err(|error| ExtractError::Broken(format!("起不来：{error}")))?;
         let stdin = child.stdin.take().expect("上面设了 piped");
         let stdout = BufReader::new(child.stdout.take().expect("上面设了 piped"));
         let mut stderr_pipe = child.stderr.take().expect("上面设了 piped");
         let stderr = Arc::new(Mutex::new(String::new()));
         let tail = stderr.clone();
         // 进程退出时管道读到结尾，任务随之结束
-        tokio::spawn(async move {
+        let reading = tokio::spawn(async move {
             let mut buffer = vec![0; 4096];
             while let Ok(read) = stderr_pipe.read(&mut buffer).await {
                 if read == 0 {
@@ -234,10 +282,11 @@ impl Extractor {
             }
         });
         Ok(Worker {
-            _child: child,
+            child,
             stdin,
             stdout,
             stderr,
+            reading,
             next_id: 1,
         })
     }

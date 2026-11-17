@@ -19,7 +19,9 @@ pub struct Info {
     pub uploader: Option<String>,
     /// 可下的格式，按 yt-dlp 给的次序（大致由差到好）；播放列表为空
     pub formats: Vec<Format>,
-    /// 播放列表的条目（只列出，没解析）；不是播放列表时为 None
+    /// 有格式因 DRM 被滤掉（`formats` 里没有它们）
+    pub has_drm: bool,
+    /// 播放列表或分成几段的视频的条目；都不是时为 None
     pub entries: Option<Vec<Entry>>,
     /// yt-dlp 的警告，如缺 JavaScript 运行时、部分格式取不到
     pub warnings: Vec<String>,
@@ -105,8 +107,8 @@ pub struct Format {
     pub chunk_size: Option<u64>,
     /// 这个时刻（Unix 秒）之前不能开始下（YouTube 片头广告的时长）；None 为随时
     pub available_at: Option<i64>,
-    /// 有 DRM：下不了
-    pub drm: bool,
+    /// 可能有 DRM（确定有的 yt-dlp 已滤掉）：yt-dlp 自己会试着下
+    pub drm_maybe: bool,
     /// 要模拟浏览器的 TLS 指纹才下得了
     pub impersonate: bool,
 }
@@ -139,6 +141,7 @@ pub(crate) struct Wire {
     live_status: Option<String>,
     uploader: Option<String>,
     formats: Vec<WireFormat>,
+    has_drm: bool,
     entries: Option<Vec<WireEntry>>,
     warnings: Vec<String>,
 }
@@ -165,7 +168,7 @@ struct WireFormat {
     cookie: Option<String>,
     chunk_size: Option<f64>,
     available_at: Option<f64>,
-    has_drm: bool,
+    drm_maybe: bool,
     impersonate: bool,
 }
 
@@ -199,6 +202,7 @@ impl Wire {
                 .into_iter()
                 .map(WireFormat::into_format)
                 .collect(),
+            has_drm: self.has_drm,
             entries: self.entries.map(|entries| {
                 entries
                     .into_iter()
@@ -269,7 +273,7 @@ impl WireFormat {
                 .available_at
                 .filter(|at| at.is_finite())
                 .map(|at| at as i64),
-            drm: self.has_drm,
+            drm_maybe: self.drm_maybe,
             impersonate: self.impersonate,
         }
     }
@@ -297,7 +301,7 @@ mod tests {
     fn wire_formats_translate_to_tracks_sizes_and_limits() {
         let wire: Wire = serde_json::from_value(serde_json::json!({
             "extractor": "Youtube", "id": "abc", "title": "t", "webpage_url": null, "duration": 12.5,
-            "thumbnail": null, "live_status": "was_live", "uploader": null, "entries": null, "warnings": [],
+            "thumbnail": null, "live_status": "was_live", "uploader": null, "has_drm": false, "entries": null, "warnings": [],
             "formats": [
                 {
                     "format_id": "137", "url": "https://r.googlevideo.com/v", "protocol": "https", "ext": "mp4",
@@ -305,7 +309,7 @@ mod tests {
                     "tbr": 4000.0, "filesize": null, "filesize_approx": 1234.4, "format_note": "1080p",
                     "language": null, "language_preference": -1.0, "dynamic_range": "SDR",
                     "http_headers": {"User-Agent": "x", "Cookie": "leak=1"}, "cookie": "",
-                    "chunk_size": 10485760.0, "available_at": 1763400000.0, "has_drm": false, "impersonate": false
+                    "chunk_size": 10485760.0, "available_at": 1763400000.0, "drm_maybe": false, "impersonate": false
                 },
                 {
                     "format_id": "hls-1", "url": "https://e/x.m3u8", "protocol": "m3u8_native", "ext": "mp4",
@@ -313,7 +317,7 @@ mod tests {
                     "filesize": 99.0, "filesize_approx": null, "format_note": null, "language": "ja",
                     "language_preference": 10.0,
                     "dynamic_range": null, "http_headers": {}, "cookie": "a=b", "chunk_size": null,
-                    "available_at": null, "has_drm": true, "impersonate": true
+                    "available_at": null, "drm_maybe": true, "impersonate": true
                 }
             ]
         }))
@@ -356,6 +360,6 @@ mod tests {
             (video.language_preference, hls.language_preference),
             (Some(-1), Some(10))
         );
-        assert!(hls.drm && hls.impersonate);
+        assert!(hls.drm_maybe && hls.impersonate);
     }
 }

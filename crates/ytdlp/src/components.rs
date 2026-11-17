@@ -1,51 +1,53 @@
-//! 组件目录：按需下载、核对并解开 Python 与 deno（版本随应用锁定，见 [`Pins`]），用这个 Python 的 pip 从 PyPI 装
-//! yt-dlp；yt-dlp 的每个版本装进自己的目录，自检过了才记成当前的，没装成的不影响在用的。
+//! 组件目录：按需下载、核对并解开 Python 与 deno（版本随应用锁定，见 [`Pins`]）；yt-dlp 与它锁定版本的依赖（yt-dlp
+//! 每个版本发布的 `pin` 与 `pin-curl-cffi` 两组，不要 mutagen）的 wheel 也由核心下载、按 PyPI 给的 SHA-256 核对，
+//! 再交给这个 Python 的 pip 离线装进 yt-dlp 的版本目录：下载与组件包一样经应用的代理（含 SOCKS）、能续传、有字节
+//! 进度，pip 不联网。每个版本自检过了才记成当前的，没装成的不影响在用的。
 //!
 //! 目录布局（`root` 下）：
 //! - `python-<版本>/`、`deno-<版本>/`：解开的组件包；不是锁定版本的在装好之后删掉
-//! - `yt-dlp-<版本>/`：pip 的 `--target` 目录；保留当前的与上一个（新版出问题时还能换回）
-//! - `state.json`：当前的 yt-dlp 版本；先写临时文件再改名
-//! - `downloads/`：下载中的组件包与核心的任务目录（续传用），解开后删掉
+//! - `yt-dlp-<版本>/`：pip 的 `--target` 目录；保留当前的与上一个
+//! - `state.json`：当前与上一个 yt-dlp 版本、装它时的 Python 版本；先写临时文件、落盘再改名
+//! - `downloads/`：下载中与下好了的组件包、wheel 与核心的任务目录（续传用），用过即删
 //! - `staging/`：解包与 pip 安装的临时目录，每次安装前清空
 //! - `driver-<摘要>.py`：解析进程的驱动脚本，按内容命名，内容变了另写一个
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use hs_m3u8_core::{CancellationToken, Engine, FileOutputOptions, FileRequest, Proxy, Source, Url};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::Error;
 use crate::archive;
 use crate::pins::{Pinned, Pins};
 
-/// 解析进程的驱动脚本：自检、解析。
+/// 解析进程的驱动脚本：列依赖、挑 wheel、自检、解析。
 pub(crate) const DRIVER: &str = include_str!("driver.py");
-/// pip 装 yt-dlp 最多多久：要下载约 10 MB 的包（curl-cffi 最大），慢的网络与代理也够。
-const PIP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// pip 离线安装、驱动脚本列依赖与挑 wheel 最多多久：不联网，只解包。
+const PIP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// 自检最多多久：只导入模块、运行 deno 报版本。
 const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(60);
-/// 命令的错误输出最多留多少字节写进错误信息：pip 出错时末尾是原因。
+/// 命令的错误输出最多留多少字节写进错误信息：出错时末尾是原因。
 const STDERR_TAIL: usize = 4096;
 /// PyPI 的 JSON 接口响应最多多少字节：yt-dlp 的全部发布约 1.2 MB（2026-11）。
 const JSON_LIMIT: u64 = 16 << 20;
+/// yt-dlp 在 PyPI 上的名字。
+const PROJECT: &str = "yt-dlp";
 
 /// 从哪里取 yt-dlp。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sources {
-    /// pip 用的索引（PEP 503 的 simple 接口）
-    pub index: Url,
-    /// yt-dlp 的发布信息（PyPI 的 JSON 接口），查最新版本用
-    pub releases: Url,
+    /// PyPI 的 JSON 接口的根（`<根>/<项目>/json` 为项目，`<根>/<项目>/<版本>/json` 为一个版本），以 `/` 结尾
+    pub api: Url,
 }
 
 impl Sources {
     pub fn official() -> Sources {
         Sources {
-            index: Url::parse("https://pypi.org/simple/").expect("写死的地址"),
-            releases: Url::parse("https://pypi.org/pypi/yt-dlp/json").expect("写死的地址"),
+            api: Url::parse("https://pypi.org/pypi/").expect("写死的地址"),
         }
     }
 }
@@ -66,7 +68,7 @@ pub struct Installed {
     pub deno: PathBuf,
     /// yt-dlp 与依赖所在的目录（pip 的 `--target`），由驱动脚本加进 `sys.path`
     pub site: PathBuf,
-    /// yt-dlp 的版本
+    /// yt-dlp 的版本，PEP 440 规范化的写法（与 PyPI 上的一致）
     pub version: String,
     pub driver: PathBuf,
 }
@@ -76,13 +78,13 @@ pub struct Installed {
 pub enum Stage {
     Python,
     Deno,
-    /// pip 安装 yt-dlp 与依赖：没有字节数
+    /// 下载 yt-dlp 与依赖的 wheel 并装上
     YtDlp,
     /// 自检
     Checking,
 }
 
-/// 安装的进度：`bytes`、`total` 只在下载组件包时有。
+/// 安装的进度：`bytes`、`total` 为这一步要下载的字节（不知道总数时 `total` 为 None）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InstallProgress {
     pub stage: Stage,
@@ -95,8 +97,42 @@ pub struct InstallProgress {
 struct State {
     /// 当前的 yt-dlp 版本
     yt_dlp: String,
-    /// 上一个版本，新版出问题时还能换回；没有时为 None
+    /// 上一个版本；没有时为 None
     previous: Option<String>,
+    /// 装 yt-dlp 时用的 Python（[`Pinned::version`]）：依赖里有按解释器版本编译的扩展模块，换了 Python 要重装
+    python: String,
+}
+
+/// PyPI 上一个版本的发布：依赖声明与各个文件。
+#[derive(Deserialize)]
+struct Release {
+    info: ReleaseInfo,
+    urls: Vec<ReleaseFile>,
+}
+
+#[derive(Deserialize)]
+struct ReleaseInfo {
+    requires_dist: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+struct ReleaseFile {
+    filename: String,
+    url: String,
+    size: u64,
+    digests: Digests,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+struct Digests {
+    sha256: String,
+}
+
+/// 驱动脚本 `requirements` 列出的一个依赖。
+#[derive(Deserialize)]
+struct Requirement {
+    name: String,
+    version: String,
 }
 
 pub struct Components {
@@ -109,7 +145,7 @@ pub struct Components {
 }
 
 impl Components {
-    /// 组件放在 `root` 下（不存在时第一次安装时建）；`engine` 下载组件包、请求 PyPI 的接口。
+    /// 组件放在 `root` 下（不存在时第一次安装时建）；`engine` 下载组件、请求 PyPI 的接口。
     pub fn new(root: PathBuf, pins: Pins, sources: Sources, engine: Engine) -> Components {
         Components {
             root,
@@ -120,12 +156,15 @@ impl Components {
         }
     }
 
-    /// 装全了的组件；缺哪一样时为 None。驱动脚本按内容命名，应用升级后换了内容时在这里写出新的。状态文件读不出、内容
-    /// 认不出、驱动脚本写不出时报 [`Error::Disk`]。
+    /// 装全了的组件；缺哪一样（含 yt-dlp 不是用锁定的 Python 装的）时为 None。驱动脚本按内容命名，应用升级后换了内容时
+    /// 在这里写出新的。状态文件读不出、内容认不出、驱动脚本写不出时报 [`Error::Disk`]（[`Components::install`] 能修好）。
     pub fn installed(&self) -> Result<Option<Installed>, Error> {
         let Some(state) = self.state()? else {
             return Ok(None);
         };
+        if state.python != self.pins.python.version {
+            return Ok(None);
+        }
         let installed = self.installed_as(&state.yt_dlp);
         let present = [&installed.python, &installed.deno, &installed.site]
             .iter()
@@ -134,16 +173,14 @@ impl Components {
             return Ok(None);
         }
         if !installed.driver.exists() {
-            let temporary = installed.driver.with_extension("tmp");
-            std::fs::write(&temporary, DRIVER).map_err(|error| Error::disk(&temporary, &error))?;
-            std::fs::rename(&temporary, &installed.driver)
-                .map_err(|error| Error::disk(&installed.driver, &error))?;
+            write_atomically_blocking(&installed.driver, DRIVER.as_bytes())?;
         }
         Ok(Some(installed))
     }
 
-    /// 装上缺的：Python、deno（各经 `proxy` 下载、核对 SHA-256、解开）与 `channel` 上最新的 yt-dlp；已装全时直接
-    /// 返回。`cancel` 取消时报 [`Error::Cancelled`]，已下了的组件包留着下次续传。
+    /// 装上缺的：Python、deno（各经 `proxy` 下载、核对 SHA-256、解开）与 yt-dlp（状态文件记着的版本，没有或坏了时为
+    /// `channel` 上最新的）；已装全时直接返回。状态文件坏了时照没有处理、装好后重写。`cancel` 取消时报
+    /// [`Error::Cancelled`]，已下了的留着下次续传。
     pub async fn install(
         &self,
         proxy: &Proxy,
@@ -152,7 +189,7 @@ impl Components {
         cancel: &CancellationToken,
     ) -> Result<Installed, Error> {
         let _busy = self.busy.lock().await;
-        if let Some(installed) = self.installed()? {
+        if let Ok(Some(installed)) = self.installed() {
             return Ok(installed);
         }
         self.prepare().await?;
@@ -174,21 +211,24 @@ impl Components {
             cancel,
         )
         .await?;
-        let installed = match self.state()? {
-            Some(state) if self.installed_as(&state.yt_dlp).site.exists() => {
-                self.installed_as(&state.yt_dlp)
-            }
-            _ => {
-                self.install_yt_dlp(proxy, channel, None, progress, cancel)
-                    .await?
-            }
+        // 坏了的状态文件不挡着修：照没有处理
+        let wanted = match self.state() {
+            Ok(Some(state)) => Some(state.yt_dlp),
+            Ok(None) | Err(_) => None,
         };
+        let version = match wanted {
+            Some(version) => version,
+            None => self.latest(proxy, channel).await?,
+        };
+        let installed = self
+            .install_yt_dlp(proxy, &version, progress, cancel)
+            .await?;
         self.sweep().await;
         Ok(installed)
     }
 
-    /// 装上 yt-dlp 的 `version`（经 `proxy`）、自检，过了才换成当前的，上一个留着；已是当前的直接返回。Python 与 deno
-    /// 要已装好（见 [`Components::install`]），没装时报 [`Error::NotInstalled`]。
+    /// 装上 yt-dlp 的 `version`（PyPI 上的写法，经 `proxy`）、自检，过了才换成当前的，上一个留着；已是当前的直接返回。
+    /// Python 与 deno 要已装好（见 [`Components::install`]），没装时报 [`Error::NotInstalled`]。
     pub async fn update(
         &self,
         proxy: &Proxy,
@@ -202,13 +242,8 @@ impl Components {
             return Ok(current);
         }
         self.prepare().await?;
-        let channel = if version.contains(".dev") {
-            Channel::Nightly
-        } else {
-            Channel::Stable
-        };
         let installed = self
-            .install_yt_dlp(proxy, channel, Some(version), progress, cancel)
+            .install_yt_dlp(proxy, version, progress, cancel)
             .await?;
         self.sweep().await;
         Ok(installed)
@@ -216,25 +251,8 @@ impl Components {
 
     /// `channel` 上最新的 yt-dlp 版本（经 `proxy` 查 PyPI）。
     pub async fn latest(&self, proxy: &Proxy, channel: Channel) -> Result<String, Error> {
-        let mut source = Source::new(self.sources.releases.clone());
-        source.http.proxy = proxy.clone();
-        let call = hs_m3u8_core::Call {
-            method: hs_m3u8_core::Method::Get,
-            body: None,
-            limit: JSON_LIMIT,
-        };
-        let reply = self
-            .engine
-            .call(&source, &call)
-            .await
-            .map_err(Error::Download)?;
-        if reply.status != 200 {
-            return Err(Error::Index(format!(
-                "查 yt-dlp 的发布时 PyPI 回了 HTTP {}",
-                reply.status
-            )));
-        }
-        latest_of(&reply.body, channel)
+        let body = self.get(proxy, &format!("{PROJECT}/json")).await?;
+        latest_of(&body, channel)
     }
 
     fn installed_as(&self, version: &str) -> Installed {
@@ -263,6 +281,32 @@ impl Components {
         }
     }
 
+    /// 经 `proxy` 取 PyPI 的 JSON 接口 `<根>/<path>`。
+    async fn get(&self, proxy: &Proxy, path: &str) -> Result<Vec<u8>, Error> {
+        let url = self
+            .sources
+            .api
+            .join(path)
+            .map_err(|error| Error::Index(format!("{path}：{error}")))?;
+        let mut source = Source::new(url);
+        source.http.proxy = proxy.clone();
+        let call = hs_m3u8_core::Call {
+            method: hs_m3u8_core::Method::Get,
+            body: None,
+            limit: JSON_LIMIT,
+        };
+        let reply = self
+            .engine
+            .call(&source, &call)
+            .await
+            .map_err(Error::Download)?;
+        match reply.status {
+            200 => Ok(reply.body),
+            404 => Err(Error::Index(format!("PyPI 上没有 {path}"))),
+            status => Err(Error::Index(format!("PyPI 回了 HTTP {status}（{path}）"))),
+        }
+    }
+
     /// 建好目录、清空上次没装完留下的临时目录、写出驱动脚本。
     async fn prepare(&self) -> Result<(), Error> {
         let staging = self.root.join("staging");
@@ -271,7 +315,7 @@ impl Components {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(Error::disk(&staging, &error)),
         }
-        for dir in [&staging, &self.root.join("downloads")] {
+        for dir in [&staging, &self.root.join("downloads").join("wheels")] {
             tokio::fs::create_dir_all(dir)
                 .await
                 .map_err(|error| Error::disk(dir, &error))?;
@@ -283,31 +327,31 @@ impl Components {
         Ok(())
     }
 
-    /// 锁定的组件 `pinned` 在 `<name>-<版本>/` 下就位：没有时下载、核对、解开再改名就位。
-    async fn ensure(
+    /// 经 `proxy` 下载 `url` 到 `path`，内容的 SHA-256 须为 `sha256`；进度经 `report`（这次下了的、总的字节）。`path` 上
+    /// 已有（上次下好了没用完）时先核对：对得上直接用，对不上删掉重下。下到的对不上时删掉、报 [`Error::Mismatch`]。
+    async fn fetch(
         &self,
-        pinned: &Pinned,
-        name: &str,
-        stage: Stage,
+        url: &str,
+        sha256: &str,
+        path: &Path,
         proxy: &Proxy,
-        progress: &(dyn Fn(InstallProgress) + Sync),
+        report: &(dyn Fn(u64, Option<u64>) + Sync),
         cancel: &CancellationToken,
     ) -> Result<(), Error> {
-        let target = self.root.join(format!("{name}-{}", pinned.version));
-        if target.exists() {
-            return Ok(());
+        if path.exists() {
+            if checked(path, sha256).await?.is_ok() {
+                return Ok(());
+            }
+            remove(path).await?;
         }
-        let downloads = self.root.join("downloads");
-        let package = downloads.join(format!("{name}-{}", pinned.version));
-        let url = Url::parse(&pinned.url)
-            .map_err(|error| Error::Index(format!("{name} 的地址 {}：{error}", pinned.url)))?;
+        let url = Url::parse(url).map_err(|error| Error::Index(format!("地址 {url}：{error}")))?;
         let mut source = Source::new(url);
         source.http.proxy = proxy.clone();
-        let mut output = FileOutputOptions::new(package.clone());
-        output.work_dir = Some(downloads.join(format!("{name}-{}.hsdl", pinned.version)));
+        let mut output = FileOutputOptions::new(path.to_path_buf());
+        output.work_dir = Some(path.with_extension("hsdl"));
         let mut request = FileRequest::new(source, output);
-        // GitHub 的下载经重定向到每次签名不同的地址：以包的哈希担保内容，换了地址也续传
-        request.identity = Some(format!("sha256:{}", pinned.sha256));
+        // GitHub、PyPI 的下载经重定向到每次签名不同的地址：以内容的哈希担保，换了地址也续传
+        request.identity = Some(format!("sha256:{sha256}"));
         let job = self.engine.start_file(request).map_err(Error::Download)?;
         let control = job.control();
         let mut watching = control.progress();
@@ -319,7 +363,7 @@ impl Components {
                 changed = watching.changed() => {
                     if changed.is_ok() {
                         let now = watching.borrow_and_update().clone();
-                        progress(InstallProgress { stage, bytes: now.bytes, total: now.total });
+                        report(now.bytes, now.total);
                     }
                 }
                 () = cancel.cancelled() => {
@@ -333,30 +377,65 @@ impl Components {
             Err(hs_m3u8_core::Error::Cancelled) => return Err(Error::Cancelled),
             Err(error) => return Err(Error::Download(error)),
         }
+        if let Err(actual) = checked(path, sha256).await? {
+            remove(path).await?;
+            return Err(Error::Mismatch {
+                name: path.display().to_string(),
+                expected: sha256.to_owned(),
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    /// 锁定的组件 `pinned` 在 `<name>-<版本>/` 下就位：没有、或里面缺了可执行文件（被杀毒软件隔离、被删）时下载、
+    /// 核对、解开再改名就位。
+    async fn ensure(
+        &self,
+        pinned: &Pinned,
+        name: &str,
+        stage: Stage,
+        proxy: &Proxy,
+        progress: &(dyn Fn(InstallProgress) + Sync),
+        cancel: &CancellationToken,
+    ) -> Result<(), Error> {
+        let target = self.root.join(format!("{name}-{}", pinned.version));
+        if executable(&self.root, name, pinned).is_file() {
+            return Ok(());
+        }
+        if target.exists() {
+            tokio::fs::remove_dir_all(&target)
+                .await
+                .map_err(|error| Error::disk(&target, &error))?;
+        }
+        let package = self
+            .root
+            .join("downloads")
+            .join(format!("{name}-{}", pinned.version));
+        self.fetch(
+            &pinned.url,
+            &pinned.sha256,
+            &package,
+            proxy,
+            &|bytes, total| {
+                progress(InstallProgress {
+                    stage,
+                    bytes,
+                    total,
+                })
+            },
+            cancel,
+        )
+        .await?;
         let staging = self.root.join("staging").join(name);
         tokio::fs::create_dir_all(&staging)
             .await
             .map_err(|error| Error::disk(&staging, &error))?;
-        let (checked, expected, archive_kind) =
-            (package.clone(), pinned.sha256.clone(), pinned.archive);
-        let unpack_into = staging.clone();
-        tokio::task::spawn_blocking(move || {
-            let actual = archive::sha256_of(&checked)?;
-            if actual != expected {
-                // 内容不对的包不留着续传
-                let _gone = std::fs::remove_file(&checked);
-                return Err(Error::Mismatch {
-                    name: checked.display().to_string(),
-                    expected,
-                    actual,
-                });
-            }
-            archive::unpack(&checked, archive_kind, &unpack_into)
-        })
-        .await
-        .expect("核对与解包不会 panic，运行时关闭时本任务也一起丢弃")?;
-        let executable = staging.join(&pinned.executable);
-        if !executable.is_file() {
+        let (unpacked, kind, into) = (package.clone(), pinned.archive, staging.clone());
+        tokio::task::spawn_blocking(move || archive::unpack(&unpacked, kind, &into))
+            .await
+            .expect("解包不会 panic，运行时关闭时本任务也一起丢弃")?;
+        if !staging.join(&pinned.executable).is_file() {
             return Err(Error::Archive(format!(
                 "{name} 的包里没有 {}",
                 pinned.executable
@@ -365,41 +444,97 @@ impl Components {
         tokio::fs::rename(&staging, &target)
             .await
             .map_err(|error| Error::disk(&target, &error))?;
-        tokio::fs::remove_file(&package)
-            .await
-            .map_err(|error| Error::disk(&package, &error))?;
-        Ok(())
+        remove(&package).await
     }
 
-    /// 用装好的 Python 的 pip 装 yt-dlp（`version` 为 None 时装 `channel` 上最新的）进临时目录，自检，改名成
-    /// `yt-dlp-<版本>/` 再记成当前的。
+    /// 下载 yt-dlp `version` 与它锁定的依赖的 wheel（各按 PyPI 给的 SHA-256 核对），用装好的 Python 的 pip 离线装进
+    /// 临时目录，自检，改名成 `yt-dlp-<版本>/` 再记成当前的。
     async fn install_yt_dlp(
         &self,
         proxy: &Proxy,
-        channel: Channel,
-        version: Option<&str>,
+        version: &str,
         progress: &(dyn Fn(InstallProgress) + Sync),
         cancel: &CancellationToken,
     ) -> Result<Installed, Error> {
-        progress(InstallProgress {
-            stage: Stage::YtDlp,
-            bytes: 0,
-            total: None,
-        });
+        if version.is_empty()
+            || !version
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+        {
+            return Err(Error::Index(format!("版本号 {version:?} 认不出")));
+        }
+        let report = |bytes, total| {
+            progress(InstallProgress {
+                stage: Stage::YtDlp,
+                bytes,
+                total,
+            });
+        };
+        report(0, None);
         let python = executable(&self.root, "python", &self.pins.python);
+        let driver = self.driver_path();
+        // yt-dlp 这个版本与它锁定的依赖，各自在 PyPI 上的文件
+        let release = self.release(proxy, PROJECT, version).await?;
+        let requires = release.info.requires_dist.clone().unwrap_or_default();
+        let listed = run_driver(&python, &driver, "requirements", &requires, cancel).await?;
+        let requirements: Vec<Requirement> = serde_json::from_slice(&listed)
+            .map_err(|error| Error::Command(format!("驱动脚本列出的依赖认不出：{error}")))?;
+        let mut files: BTreeMap<String, Vec<ReleaseFile>> = BTreeMap::new();
+        files.insert(PROJECT.to_owned(), release.urls);
+        for requirement in &requirements {
+            let release = self
+                .release(proxy, &requirement.name, &requirement.version)
+                .await?;
+            files.insert(requirement.name.clone(), release.urls);
+        }
+        let picked = run_driver(&python, &driver, "pick", &files, cancel)
+            .await
+            .map_err(|error| match error {
+                Error::Command(reason) => Error::Unsupported(reason),
+                error => error,
+            })?;
+        let picked: BTreeMap<String, String> = serde_json::from_slice(&picked)
+            .map_err(|error| Error::Command(format!("驱动脚本挑的包认不出：{error}")))?;
+        let chosen: Vec<ReleaseFile> = picked
+            .iter()
+            .map(|(name, filename)| {
+                files
+                    .get(name)
+                    .and_then(|listed| listed.iter().find(|file| file.filename == *filename))
+                    .cloned()
+                    .ok_or_else(|| Error::Command(format!("驱动脚本挑了不在列的 {filename}")))
+            })
+            .collect::<Result<_, _>>()?;
+        // 逐个下载，进度按字节合计
+        let total: u64 = chosen.iter().map(|file| file.size).sum();
+        let wheels = self.root.join("downloads").join("wheels");
+        let mut done = 0;
+        let mut paths = Vec::new();
+        for file in &chosen {
+            if file.filename.contains(['/', '\\']) || !file.filename.ends_with(".whl") {
+                return Err(Error::Index(format!(
+                    "PyPI 给的文件名 {} 认不出",
+                    file.filename
+                )));
+            }
+            let path = wheels.join(&file.filename);
+            self.fetch(
+                &file.url,
+                &file.digests.sha256.to_ascii_lowercase(),
+                &path,
+                proxy,
+                &|bytes, _| report(done + bytes, Some(total)),
+                cancel,
+            )
+            .await?;
+            done += file.size;
+            paths.push(path);
+        }
+        report(total, Some(total));
         let staging = self.root.join("staging").join("yt-dlp");
-        let pip_proxy = proxy_for(proxy, &self.sources.index)?;
-        let args = pip_args(
-            &staging,
-            &self.sources.index,
-            channel,
-            version,
-            pip_proxy.as_ref(),
-        );
-        let mut command = tokio::process::Command::new(&python);
-        command.args(&args);
-        clear_proxy_env(&mut command);
-        run(command, PIP_TIMEOUT, cancel)
+        let mut pip = command(&python);
+        pip.args(pip_args(&staging)).args(&paths);
+        run(pip, PIP_TIMEOUT, cancel)
             .await
             .map_err(|error| match error {
                 Error::Command(reason) => Error::Pip(reason),
@@ -411,15 +546,13 @@ impl Components {
             total: None,
         });
         let deno = executable(&self.root, "deno", &self.pins.deno);
-        let found = self_test(&python, &self.driver_path(), &staging, &deno, cancel).await?;
-        if let Some(version) = version
-            && found != version
-        {
+        let found = self_test(&python, &driver, &staging, &deno, cancel).await?;
+        if found != version {
             return Err(Error::SelfTest(format!(
                 "要装的是 {version}，装上的是 {found}"
             )));
         }
-        let target = self.root.join(format!("yt-dlp-{found}"));
+        let target = self.root.join(format!("yt-dlp-{version}"));
         if target.exists() {
             tokio::fs::remove_dir_all(&target)
                 .await
@@ -428,20 +561,31 @@ impl Components {
         tokio::fs::rename(&staging, &target)
             .await
             .map_err(|error| Error::disk(&target, &error))?;
-        let previous = self
-            .state()?
-            .map(|state| state.yt_dlp)
-            .filter(|old| *old != found);
+        let previous = match self.state() {
+            Ok(Some(state)) => Some(state.yt_dlp).filter(|old| old != version),
+            Ok(None) | Err(_) => None,
+        };
         let state = State {
-            yt_dlp: found.clone(),
+            yt_dlp: version.to_owned(),
             previous,
+            python: self.pins.python.version.clone(),
         };
         write_atomically(
             &self.root.join("state.json"),
             &serde_json::to_vec(&state).expect("状态总能写成 JSON"),
         )
         .await?;
-        Ok(self.installed_as(&found))
+        for path in &paths {
+            remove(path).await?;
+        }
+        Ok(self.installed_as(version))
+    }
+
+    /// PyPI 上 `name` 的 `version` 这一版。
+    async fn release(&self, proxy: &Proxy, name: &str, version: &str) -> Result<Release, Error> {
+        let body = self.get(proxy, &format!("{name}/{version}/json")).await?;
+        serde_json::from_slice(&body)
+            .map_err(|error| Error::Index(format!("PyPI 回的 {name} {version} 认不出：{error}")))
     }
 
     /// 删掉不再用的：不是锁定版本的 Python、deno，不是当前与上一个的 yt-dlp，旧的驱动脚本。删不掉的留着，下次再删。
@@ -487,6 +631,27 @@ fn executable(root: &Path, name: &str, pinned: &Pinned) -> PathBuf {
     )
 }
 
+/// `path` 的内容与 `sha256` 对得上为 Ok；对不上为实际的哈希。
+async fn checked(path: &Path, sha256: &str) -> Result<Result<(), String>, Error> {
+    let (path, expected) = (path.to_path_buf(), sha256.to_owned());
+    tokio::task::spawn_blocking(move || {
+        let actual = archive::sha256_of(&path)?;
+        Ok(if actual == expected {
+            Ok(())
+        } else {
+            Err(actual)
+        })
+    })
+    .await
+    .expect("算哈希不会 panic，运行时关闭时本任务也一起丢弃")
+}
+
+async fn remove(path: &Path) -> Result<(), Error> {
+    tokio::fs::remove_file(path)
+        .await
+        .map_err(|error| Error::disk(path, &error))
+}
+
 /// 访问 `url` 时经的代理；直连时为 None。系统代理读不了时报 [`Error::Proxy`]。
 pub(crate) fn proxy_for(proxy: &Proxy, url: &Url) -> Result<Option<Url>, Error> {
     match proxy {
@@ -500,23 +665,25 @@ pub(crate) fn proxy_for(proxy: &Proxy, url: &Url) -> Result<Option<Url>, Error> 
     }
 }
 
-/// 子进程不读环境变量里的代理：代理只照应用的设置给。
-pub(crate) fn clear_proxy_env(command: &mut tokio::process::Command) {
+/// 起子进程的命令：不读环境变量里的代理（代理只照应用的设置给）；Windows 上不弹控制台窗口。
+pub(crate) fn command(program: &Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(program);
     for name in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"] {
         command.env_remove(name);
         command.env_remove(name.to_ascii_lowercase());
     }
+    #[cfg(windows)]
+    {
+        /// CREATE_NO_WINDOW
+        const NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(NO_WINDOW);
+    }
+    command
 }
 
-/// pip 装 yt-dlp 的参数：隔离模式（不读 PYTHON* 与 PIP_* 环境变量、用户的 site-packages 与 pip 配置），只装预编译
-/// 的包，不用缓存；默认的依赖组与 curl-cffi（模拟浏览器的 TLS 指纹，部分站点解析要它）。
-fn pip_args(
-    target: &Path,
-    index: &Url,
-    channel: Channel,
-    version: Option<&str>,
-    proxy: Option<&Url>,
-) -> Vec<String> {
+/// pip 离线装 `target` 的参数（后面接各个 wheel 文件）：隔离模式（不读 PYTHON* 与 PIP_* 环境变量、用户的
+/// site-packages 与 pip 配置），不联网、不解依赖（依赖已列全）、不用缓存。
+fn pip_args(target: &Path) -> Vec<String> {
     let mut args: Vec<String> = [
         "-I",
         "-m",
@@ -529,39 +696,31 @@ fn pip_args(
         "--no-color",
         "--progress-bar",
         "off",
-        "--only-binary=:all:",
-        "--timeout",
-        "30",
+        "--no-index",
+        "--no-deps",
     ]
     .map(str::to_owned)
     .into();
     args.push("--target".to_owned());
     args.push(target.to_string_lossy().into_owned());
-    args.push("--index-url".to_owned());
-    args.push(index.to_string());
-    if index.scheme() == "http"
-        && let Some(host) = index.host_str()
-    {
-        args.push("--trusted-host".to_owned());
-        args.push(host.to_owned());
-    }
-    if let Some(proxy) = proxy {
-        args.push("--proxy".to_owned());
-        args.push(proxy.to_string());
-    }
-    if channel == Channel::Nightly {
-        args.push("--pre".to_owned());
-    }
-    let mut requirement = "yt-dlp[default,curl-cffi]".to_owned();
-    if let Some(version) = version {
-        requirement.push_str("==");
-        requirement.push_str(version);
-    }
-    args.push(requirement);
     args
 }
 
-/// 自检：驱动脚本导入 `site` 里的 yt-dlp 与解 JavaScript 挑战的 yt-dlp-ejs，`deno` 报出版本；返回 yt-dlp 的版本。
+/// 运行驱动脚本的命令 `name`，标准输入为 `input` 的 JSON，返回标准输出。
+async fn run_driver(
+    python: &Path,
+    driver: &Path,
+    name: &str,
+    input: &impl Serialize,
+    cancel: &CancellationToken,
+) -> Result<Vec<u8>, Error> {
+    let mut script = command(python);
+    script.arg("-I").arg("-X").arg("utf8").arg(driver).arg(name);
+    let input = serde_json::to_vec(input).expect("驱动脚本的输入总能写成 JSON");
+    run_with(script, Some(input), PIP_TIMEOUT, cancel).await
+}
+
+/// 自检：驱动脚本导入 `site` 里的 yt-dlp 与解 JavaScript 挑战的 yt-dlp-ejs，`deno` 报出版本；返回 yt-dlp 规范化的版本。
 async fn self_test(
     python: &Path,
     driver: &Path,
@@ -569,10 +728,15 @@ async fn self_test(
     deno: &Path,
     cancel: &CancellationToken,
 ) -> Result<String, Error> {
-    let mut command = tokio::process::Command::new(python);
-    command.arg("-I").arg(driver).arg("selftest").arg(site);
-    clear_proxy_env(&mut command);
-    let out = run(command, SELF_TEST_TIMEOUT, cancel)
+    let mut selftest = command(python);
+    selftest
+        .arg("-I")
+        .arg("-X")
+        .arg("utf8")
+        .arg(driver)
+        .arg("selftest")
+        .arg(site);
+    let out = run(selftest, SELF_TEST_TIMEOUT, cancel)
         .await
         .map_err(|error| match error {
             Error::Command(reason) => Error::SelfTest(reason),
@@ -584,9 +748,9 @@ async fn self_test(
     }
     let report: Report = serde_json::from_slice(&out)
         .map_err(|error| Error::SelfTest(format!("驱动脚本的输出认不出：{error}")))?;
-    let mut command = tokio::process::Command::new(deno);
-    command.arg("--version");
-    let out = run(command, SELF_TEST_TIMEOUT, cancel)
+    let mut version = command(deno);
+    version.arg("--version");
+    let out = run(version, SELF_TEST_TIMEOUT, cancel)
         .await
         .map_err(|error| match error {
             Error::Command(reason) => Error::SelfTest(format!("deno 运行不了：{reason}")),
@@ -598,15 +762,29 @@ async fn self_test(
     Ok(report.yt_dlp)
 }
 
-/// 运行 `command` 到结束，返回标准输出；超过 `timeout` 或 `cancel` 时杀掉进程（后者报 [`Error::Cancelled`]），退出码
-/// 不为 0 时报 [`Error::Command`]（带错误输出的末尾）。
+/// 运行 `command` 到结束，返回标准输出（见 [`run_with`]）。
 pub(crate) async fn run(
+    command: tokio::process::Command,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<Vec<u8>, Error> {
+    run_with(command, None, timeout, cancel).await
+}
+
+/// 运行 `command` 到结束，标准输入为 `input`（None 时为空），返回标准输出；超过 `timeout` 或 `cancel` 时杀掉进程
+/// （后者报 [`Error::Cancelled`]），退出码不为 0 时报 [`Error::Command`]（带错误输出的末尾）。
+async fn run_with(
     mut command: tokio::process::Command,
+    input: Option<Vec<u8>>,
     timeout: Duration,
     cancel: &CancellationToken,
 ) -> Result<Vec<u8>, Error> {
     command
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -618,13 +796,25 @@ pub(crate) async fn run(
     let mut child = command
         .spawn()
         .map_err(|error| Error::Command(format!("{program} 起不来：{error}")))?;
+    let stdin = child.stdin.take();
     let mut stdout = child.stdout.take().expect("上面设了 piped");
     let mut stderr = child.stderr.take().expect("上面设了 piped");
+    let writing = async {
+        if let (Some(mut stdin), Some(input)) = (stdin, input) {
+            stdin.write_all(&input).await?;
+            // 关掉标准输入，对方读到结尾
+            stdin.shutdown().await?;
+        }
+        Ok::<(), std::io::Error>(())
+    };
     let reading = async {
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let (read_out, read_err) =
-            tokio::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err));
-        read_out.and(read_err).map(|_| (out, err))
+        let (written, read_out, read_err) = tokio::join!(
+            writing,
+            stdout.read_to_end(&mut out),
+            stderr.read_to_end(&mut err)
+        );
+        written.and(read_out).and(read_err).map(|_| (out, err))
     };
     let finished = async {
         let read = reading.await;
@@ -639,8 +829,7 @@ pub(crate) async fn run(
         },
         () = cancel.cancelled() => return Err(Error::Cancelled),
     };
-    let (out, err) =
-        read.map_err(|error| Error::Command(format!("读 {program} 的输出：{error}")))?;
+    let (out, err) = read.map_err(|error| Error::Command(format!("与 {program} 收发：{error}")))?;
     let status = status.map_err(|error| Error::Command(format!("等 {program} 结束：{error}")))?;
     if !status.success() {
         let text = String::from_utf8_lossy(&err);
@@ -656,15 +845,25 @@ pub(crate) async fn run(
     Ok(out)
 }
 
-/// 先写 `path` 旁的临时文件再改名：读的一方看到的要么是旧的、要么是完整的新内容。
+/// 先写 `path` 旁的临时文件、落盘，再改名：读的一方看到的要么是旧的、要么是完整的新内容，断电后也不会是半截。
 async fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    let (path, bytes) = (path.to_path_buf(), bytes.to_vec());
+    tokio::task::spawn_blocking(move || write_atomically_blocking(&path, &bytes))
+        .await
+        .expect("写文件不会 panic，运行时关闭时本任务也一起丢弃")
+}
+
+/// [`write_atomically`] 的阻塞版本。
+fn write_atomically_blocking(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    use std::io::Write as _;
     let temporary = path.with_extension("tmp");
-    tokio::fs::write(&temporary, bytes)
-        .await
+    let mut file =
+        std::fs::File::create(&temporary).map_err(|error| Error::disk(&temporary, &error))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
         .map_err(|error| Error::disk(&temporary, &error))?;
-    tokio::fs::rename(&temporary, path)
-        .await
-        .map_err(|error| Error::disk(path, &error))
+    drop(file);
+    std::fs::rename(&temporary, path).map_err(|error| Error::disk(path, &error))
 }
 
 /// PyPI 的 JSON 接口回的 `body` 里 `channel` 上最新的版本：稳定版为 `info.version`；每日构建为上传最晚的 `.dev` 版本
@@ -673,7 +872,7 @@ fn latest_of(body: &[u8], channel: Channel) -> Result<String, Error> {
     #[derive(Deserialize)]
     struct Project {
         info: Info,
-        releases: std::collections::BTreeMap<String, Vec<File>>,
+        releases: BTreeMap<String, Vec<File>>,
     }
     #[derive(Deserialize)]
     struct Info {
@@ -721,48 +920,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pip_runs_isolated_from_the_index_with_the_proxy() {
-        let index = Url::parse("http://127.0.0.1:9/simple/").unwrap();
-        let proxy = Url::parse("http://127.0.0.1:8080").unwrap();
-        let args = pip_args(
-            Path::new("/c/staging/yt-dlp"),
-            &index,
-            Channel::Nightly,
-            Some("2026.11.16.232655.dev0"),
-            Some(&proxy),
-        );
+    fn pip_installs_offline_into_the_target() {
+        let args = pip_args(Path::new("/c/staging/yt-dlp"));
         let joined = args.join(" ");
         assert!(
             joined.starts_with("-I -m pip --isolated install "),
             "{joined}"
         );
-        for part in [
-            "--only-binary=:all:",
-            "--target /c/staging/yt-dlp",
-            "--index-url http://127.0.0.1:9/simple/",
-            "--trusted-host 127.0.0.1",
-            "--proxy http://127.0.0.1:8080/",
-            "--pre",
-        ] {
+        for part in ["--no-index", "--no-deps", "--target /c/staging/yt-dlp"] {
             assert!(joined.contains(part), "缺 {part}：{joined}");
         }
-        assert_eq!(
-            args.last().unwrap(),
-            "yt-dlp[default,curl-cffi]==2026.11.16.232655.dev0"
-        );
-        let https = pip_args(
-            Path::new("/t"),
-            &Sources::official().index,
-            Channel::Stable,
-            None,
-            None,
-        );
-        assert!(
-            !https
-                .iter()
-                .any(|arg| arg == "--trusted-host" || arg == "--pre" || arg == "--proxy")
-        );
-        assert_eq!(https.last().unwrap(), "yt-dlp[default,curl-cffi]");
+        assert!(!joined.contains("--proxy") && !joined.contains("--index-url"));
     }
 
     #[test]

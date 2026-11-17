@@ -52,6 +52,9 @@ ignore = [
 "tests/scripts/**" = ["S101", "D103"]
 # 运行 PATH 里的 cargo（与 Makefile 一样），参数是写死的与 deny.toml 里的平台
 "scripts/hs_m3u8.py" = ["S603", "S607"]
+# yt-dlp 的驱动脚本：常驻解析时任何异常都要回给应用、进程接着服务（yt-dlp 只包住它认得的异常，网站改版后解析器
+# 抛的 TypeError 等直接冒上来），所以按请求兜住 Exception
+"crates/ytdlp/src/driver.py" = ["BLE001"]
 
 [tool.mypy]
 strict = true

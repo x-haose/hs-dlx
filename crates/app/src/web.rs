@@ -83,16 +83,17 @@ impl AudioCodec {
 pub enum Route {
     /// 自己的引擎：http(s) 文件走分段下载，HLS 走 HLS 引擎
     Own,
-    /// 交回 yt-dlp 自己下：要模拟浏览器 TLS 指纹的、DASH 分片与其余 yt-dlp 能下而我们没有引擎的协议
+    /// 交回 yt-dlp 自己下：要模拟浏览器 TLS 指纹的、可能有 DRM 的（yt-dlp 会试）、DASH 分片与其余 yt-dlp 能下而我们
+    /// 没有引擎的协议
     YtDlp,
     /// 这一版下不了：原因
     Unsupported(&'static str),
 }
 
-/// 格式 `format` 由谁下载。
+/// 格式 `format` 由谁下载（确定有 DRM 的格式 yt-dlp 已滤掉，不在这里）。
 pub fn route(format: &Format) -> Route {
-    if format.drm {
-        return Route::Unsupported("有 DRM");
+    if format.drm_maybe {
+        return Route::YtDlp;
     }
     match &format.protocol {
         Protocol::Other(protocol) if protocol.starts_with("rtmp") => {
@@ -340,7 +341,7 @@ mod tests {
             cookie: None,
             chunk_size: None,
             available_at: None,
-            drm: false,
+            drm_maybe: false,
             impersonate: false,
         }
     }
@@ -356,6 +357,7 @@ mod tests {
             live: Live::No,
             uploader: None,
             formats,
+            has_drm: false,
             entries: None,
             warnings: Vec::new(),
         }
@@ -452,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn routes_follow_protocol_drm_and_impersonation() {
+    fn routes_follow_protocol_possible_drm_and_impersonation() {
         let mut own = format("a", Some("avc1"), Some("none"), Some(720), 1.0);
         assert_eq!(route(&own), Route::Own);
         own.protocol = Protocol::Hls;
@@ -464,11 +466,14 @@ mod tests {
         assert_eq!(route(&own), Route::YtDlp);
         own.protocol = Protocol::Other("rtmp".to_owned());
         assert!(matches!(route(&own), Route::Unsupported(_)));
-        own.protocol = Protocol::Http;
-        own.drm = true;
-        assert!(matches!(route(&own), Route::Unsupported(_)));
         // 只有下不了的格式时没有选项
-        assert_eq!(choices(&info(vec![own]), Preference::Compatible), []);
+        assert_eq!(
+            choices(&info(vec![own.clone()]), Preference::Compatible),
+            []
+        );
+        own.protocol = Protocol::Http;
+        own.drm_maybe = true;
+        assert_eq!(route(&own), Route::YtDlp);
     }
 
     #[test]

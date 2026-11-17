@@ -32,9 +32,12 @@ pub enum Error {
     /// 本机读写失败
     #[error("{0}")]
     Disk(String),
-    /// pip 没装上 yt-dlp（网络、PyPI、这个版本没有本平台的包）：原因是 pip 错误输出的末尾
+    /// pip 没把下好的包装上（离线安装，与网络无关）：原因是 pip 错误输出的末尾
     #[error("pip 没装上 yt-dlp：{0}")]
     Pip(String),
+    /// yt-dlp 这个版本有依赖没有本平台能装的预编译包：换个版本（等下一版）
+    #[error("这个版本在本机装不了：{0}")]
+    Unsupported(String),
     /// 装上的 yt-dlp 或 deno 运行不了
     #[error("组件自检没过：{0}")]
     SelfTest(String),
@@ -57,5 +60,24 @@ pub enum Error {
 impl Error {
     fn disk(path: &Path, error: &std::io::Error) -> Error {
         Error::Disk(format!("{}：{error}", path.display()))
+    }
+
+    /// 原样再试可能就好：网络与服务器的临时故障（见核心的 [`hs_m3u8_core::Error::retryable`]），或下到的包对不上（已
+    /// 删掉，再试即重新下载）。其余要改设置、腾空间、等新版本或修应用。
+    pub fn retryable(&self) -> bool {
+        match self {
+            Error::Download(error) => error.retryable(),
+            Error::Mismatch { .. } => true,
+            Error::Archive(_)
+            | Error::Disk(_)
+            | Error::Pip(_)
+            | Error::Unsupported(_)
+            | Error::SelfTest(_)
+            | Error::Index(_)
+            | Error::Command(_)
+            | Error::Proxy(_)
+            | Error::NotInstalled
+            | Error::Cancelled => false,
+        }
     }
 }

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.server
 import importlib
+import importlib.metadata
 import io
 import json
 import threading
@@ -17,6 +18,7 @@ import driver
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
+    from types import ModuleType
 
 # yt-dlp 装在开发环境的 site-packages 里：驱动脚本按目录导入
 SITE = str(Path(importlib.import_module("yt_dlp").__file__ or "").parent.parent)
@@ -87,3 +89,66 @@ def test_a_url_only_the_generic_extractor_knows_is_unsupported_without_a_request
 def test_a_site_extractor_is_matched_before_the_generic_one() -> None:
     assert driver.matched("https://www.youtube.com/watch?v=dQw4w9WgXcQ") == "Youtube"
     assert driver.matched("https://example.com/page.html") == "Generic"
+
+
+def test_requirements_take_the_pinned_dependencies_without_mutagen() -> None:
+    requires: list[str] = importlib.metadata.distribution("yt-dlp").requires or []
+    found = {item["name"]: item["version"] for item in driver.requirements(list[object](requires))}
+    for name in ("certifi", "requests", "urllib3", "yt-dlp-ejs", "curl-cffi", "cffi", "pycparser", "brotli"):
+        assert name in found, f"缺 {name}：{found}"
+    assert "mutagen" not in found
+    # 别的解释器才要的不在
+    assert "brotlicffi" not in found
+    assert all(version and "*" not in version for version in found.values())
+
+
+def test_pick_takes_the_wheel_this_interpreter_can_install(capsys: pytest.CaptureFixture[str]) -> None:
+    files = {
+        "pure": [
+            {"filename": "pure-1.0.tar.gz"},
+            {"filename": "pure-1.0-cp27-cp27m-win32.whl"},
+            {"filename": "pure-1.0-py3-none-any.whl"},
+        ]
+    }
+    assert driver.pick(files) == {"pure": "pure-1.0-py3-none-any.whl"}
+    with pytest.raises(SystemExit):
+        driver.pick({"old": [{"filename": "old-1.0-cp27-cp27m-win32.whl"}]})
+    capsys.readouterr()
+
+
+def test_an_unexpected_error_is_answered_and_the_next_request_still_runs(
+    site: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = driver.extract
+    calls: list[str] = []
+
+    def flaky(yt_dlp: ModuleType, request: Mapping[str, object], deno: str, cache: str) -> dict[str, object]:
+        calls.append(str(request["url"]))
+        if len(calls) == 1:
+            message = "网站改版"
+            raise TypeError(message)
+        return real(yt_dlp, request, deno, cache)
+
+    monkeypatch.setattr(driver, "extract", flaky)
+    replies = serve(
+        [
+            {"id": 1, "url": f"{site}/video.html", "proxy": "", "cookies": None, "generic": True},
+            {"id": 2, "url": f"{site}/video.html", "proxy": "", "cookies": None, "generic": True},
+        ],
+        tmp_path,
+    )
+    error = driver.mapping(replies[0]["error"]) or {}
+    assert error["kind"] == "other"
+    assert "TypeError" in str(error["message"])
+    assert "ok" in replies[1]
+
+
+def test_lone_surrogates_and_nan_still_make_valid_json() -> None:
+    class Jar:
+        def get_cookie_header(self, url: str) -> str | None:
+            return url if not url else None
+
+    info = driver.trimmed({"title": "半个表情\ud83d", "duration": float("nan"), "id": "x"}, Jar(), [])
+    line = json.dumps(info, ensure_ascii=True, allow_nan=False)
+    assert json.loads(line)["title"] == "半个表情�"
+    assert json.loads(line)["duration"] is None

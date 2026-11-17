@@ -151,13 +151,16 @@ async fn only_the_generic_extractor_knowing_a_url_is_unsupported_unless_asked() 
     assert!(matches!(error, ExtractError::Unsupported(_)), "{error}");
 }
 
+/// 超时测试的时限（秒）：要比起进程、导入 yt-dlp 再发出请求（测试并行、机器忙时几秒）长，超时才落在挂着的请求上。
+const TIMEOUT: u64 = 20;
+
 /// 超过时限：杀掉进程报超时，下一次另起进程照常解析。
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hung_extraction_times_out_and_the_next_one_still_runs() {
     let (installed, cache) = installed("timeout");
     let (hit, hangs) = (Arc::new(Notify::new()), Arc::new(AtomicUsize::new(0)));
     let base = start(hit.clone(), hangs.clone()).await;
-    let extractor = Extractor::new(installed, cache, Duration::from_secs(5));
+    let extractor = Extractor::new(installed, cache, Duration::from_secs(TIMEOUT));
     let error = extractor
         .extract(
             &request(&base, "hang"),
@@ -166,7 +169,7 @@ async fn a_hung_extraction_times_out_and_the_next_one_still_runs() {
         )
         .await
         .unwrap_err();
-    assert_eq!(error, ExtractError::TimedOut(5));
+    assert_eq!(error, ExtractError::TimedOut(TIMEOUT));
     assert_eq!(hangs.load(Ordering::SeqCst), 1);
     extractor
         .extract(

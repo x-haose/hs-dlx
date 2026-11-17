@@ -1,6 +1,6 @@
-//! 组件的安装与更新，对着本地起的服务器：Python 与 deno 的包、PyPI 的 simple 索引与 JSON 接口都由它给。「Python」是
-//! 转调仓库开发环境（.venv）里真 Python 的脚本，pip 与驱动脚本照真的跑；deno 是报版本的脚本。脚本靠 shebang 运行，
-//! 只在类 Unix 系统上测（Windows 上的安装与这里同一套代码，只有可执行文件的路径不同）。
+//! 组件的安装与更新，对着本地起的服务器：Python 与 deno 的包、PyPI 的 JSON 接口与 wheel 都由它给。「Python」是转调
+//! 仓库开发环境（.venv）里真 Python 的脚本，驱动脚本列依赖、挑 wheel、pip 离线安装与自检都照真的跑；deno 是报版本的
+//! 脚本。脚本靠 shebang 运行，只在类 Unix 系统上测（Windows 上的安装与这里同一套代码，只有可执行文件的路径不同）。
 #![cfg(unix)]
 
 use std::collections::HashMap;
@@ -10,15 +10,29 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path as UrlPath, State};
-use axum::http::{StatusCode, header};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use hs_dlx_ytdlp::{Archive, Channel, Components, Error, Pinned, Pins, Sources, Stage};
+use hs_dlx_ytdlp::{Archive, Channel, Components, Error, Installed, Pinned, Pins, Sources, Stage};
 use hs_m3u8_core::{CancellationToken, Engine, Proxy, Url};
 use sha2::{Digest as _, Sha256};
 
-/// 服务器给出的文件：路径（不带开头的 `/`）到内容。
-type Files = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+/// 服务器：路径（不带开头的 `/`）到内容，与各路径被请求的次数。
+#[derive(Clone, Default)]
+struct Server {
+    files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    hits: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+impl Server {
+    fn put(&self, path: &str, bytes: Vec<u8>) {
+        self.files.lock().unwrap().insert(path.to_owned(), bytes);
+    }
+
+    fn hits(&self, path: &str) -> usize {
+        self.hits.lock().unwrap().get(path).copied().unwrap_or(0)
+    }
+}
 
 fn sha256(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
@@ -76,32 +90,28 @@ fn deno_package() -> Vec<u8> {
     zip.finish().unwrap().into_inner()
 }
 
-/// 测试用的 yt-dlp `version` 的 wheel：只有版本模块与 yt-dlp-ejs 的空包，够自检用。
-fn wheel(version: &str) -> (String, Vec<u8>) {
-    let name = format!("yt_dlp-{version}-py3-none-any.whl");
-    let info = format!("yt_dlp-{version}.dist-info");
-    let files = [
-        ("yt_dlp/__init__.py".to_owned(), String::new()),
-        (
-            "yt_dlp/version.py".to_owned(),
-            format!("__version__ = {version:?}\n"),
+/// 名为 `dist`（wheel 里的写法）、版本 `version`、内含 `files` 的纯 Python wheel 的文件名与内容。
+fn wheel(dist: &str, version: &str, files: &[(String, String)]) -> (String, Vec<u8>) {
+    let name = format!("{dist}-{version}-py3-none-any.whl");
+    let info = format!("{dist}-{version}.dist-info");
+    let mut all: Vec<(String, String)> = files.to_vec();
+    all.push((
+        format!("{info}/METADATA"),
+        format!(
+            "Metadata-Version: 2.1\nName: {}\nVersion: {version}\n",
+            dist.replace('_', "-")
         ),
-        ("yt_dlp_ejs/__init__.py".to_owned(), String::new()),
-        (
-            format!("{info}/METADATA"),
-            format!("Metadata-Version: 2.1\nName: yt-dlp\nVersion: {version}\n"),
-        ),
-        (
-            format!("{info}/WHEEL"),
-            "Wheel-Version: 1.0\nGenerator: hs-dlx-test\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
-                .to_owned(),
-        ),
-    ];
+    ));
+    all.push((
+        format!("{info}/WHEEL"),
+        "Wheel-Version: 1.0\nGenerator: hs-dlx-test\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+            .to_owned(),
+    ));
     let mut record = String::new();
     let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let options =
         zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    for (path, content) in &files {
+    for (path, content) in &all {
         zip.start_file(path.as_str(), options).unwrap();
         zip.write_all(content.as_bytes()).unwrap();
         record.push_str(&format!("{path},,\n"));
@@ -112,47 +122,114 @@ fn wheel(version: &str) -> (String, Vec<u8>) {
     (name, zip.finish().unwrap().into_inner())
 }
 
-async fn serve_file(State(files): State<Files>, UrlPath(path): UrlPath<String>) -> Response {
-    match files.lock().unwrap().get(&path) {
+/// PyPI 上一个版本的 JSON：依赖声明与各个文件（`files` 下的）。
+fn release_json(base: &Url, requires: &[&str], files: &[(String, Vec<u8>)]) -> Vec<u8> {
+    let urls: Vec<serde_json::Value> = files
+        .iter()
+        .map(|(name, bytes)| {
+            serde_json::json!({
+                "filename": name,
+                "url": base.join(&format!("files/{name}")).unwrap().as_str(),
+                "size": bytes.len(),
+                "digests": { "sha256": sha256(bytes).to_uppercase() },
+            })
+        })
+        .collect();
+    serde_json::json!({ "info": { "requires_dist": requires }, "urls": urls })
+        .to_string()
+        .into_bytes()
+}
+
+/// 在服务器上发布 yt-dlp `version`（wheel 的元数据也写这个版本，像 PyPI 上的一样；`yt_dlp.version` 的写法不同，自检
+/// 不该看它）与它锁定的依赖：certifi、yt-dlp-ejs；mutagen 锁定了但不该装（服务器上没有它，请求即失败）；brotlicffi
+/// 只给别的解释器。
+fn publish(server: &Server, base: &Url, version: &str) {
+    let (name, bytes) = wheel(
+        "yt_dlp",
+        version,
+        &[
+            ("yt_dlp/__init__.py".to_owned(), String::new()),
+            (
+                "yt_dlp/version.py".to_owned(),
+                "__version__ = 'not-the-pypi-spelling'\n".to_owned(),
+            ),
+        ],
+    );
+    // 别的平台的包不该被挑中
+    let foreign = format!("yt_dlp-{version}-cp27-cp27m-win32.whl");
+    let requires = [
+        "certifi==2026.10.23; extra == 'pin'",
+        "mutagen==1.48.1; extra == 'pin'",
+        "yt-dlp-ejs==0.8.0; extra == 'pin'",
+        "brotlicffi==1.2.1.0; (implementation_name != 'cpython') and extra == 'pin'",
+        "certifi>=2026.10.19; extra == 'default'",
+    ];
+    let files = [
+        (name.clone(), bytes.clone()),
+        (foreign.clone(), b"x".to_vec()),
+    ];
+    server.put(
+        &format!("pypi/yt-dlp/{version}/json"),
+        release_json(base, &requires, &files),
+    );
+    server.put(&format!("files/{name}"), bytes);
+    server.put(&format!("files/{foreign}"), b"x".to_vec());
+    for (dist, dep_version) in [("certifi", "2026.10.23"), ("yt_dlp_ejs", "0.8.0")] {
+        let (name, bytes) = wheel(
+            dist,
+            dep_version,
+            &[(format!("{dist}/__init__.py"), String::new())],
+        );
+        let files = [(name.clone(), bytes.clone())];
+        server.put(
+            &format!("pypi/{}/{dep_version}/json", dist.replace('_', "-")),
+            release_json(base, &[], &files),
+        );
+        server.put(&format!("files/{name}"), bytes);
+    }
+}
+
+/// 项目的 JSON：稳定版为 `stable`，另有每日构建 `nightly`（上传得更晚）。
+fn project_json(stable: &str, nightly: &str) -> Vec<u8> {
+    serde_json::json!({
+        "info": { "version": stable },
+        "releases": {
+            stable: [{ "upload_time_iso_8601": "2026-10-26T22:25:00.000000Z", "yanked": false }],
+            nightly: [{ "upload_time_iso_8601": "2026-11-16T23:30:00.000000Z", "yanked": false }]
+        }
+    })
+    .to_string()
+    .into_bytes()
+}
+
+async fn serve_file(State(server): State<Server>, UrlPath(path): UrlPath<String>) -> Response {
+    *server.hits.lock().unwrap().entry(path.clone()).or_default() += 1;
+    match server.files.lock().unwrap().get(&path) {
         Some(bytes) => bytes.clone().into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
-/// PEP 503 的项目页：列出 `files/` 下的各个 wheel，带哈希。
-async fn simple(State(files): State<Files>) -> Response {
-    let files = files.lock().unwrap();
-    let mut links: Vec<String> = files
-        .iter()
-        .filter(|(path, _)| path.ends_with(".whl"))
-        .map(|(path, bytes)| {
-            let name = path.trim_start_matches("files/");
-            format!(
-                "<a href=\"/{path}#sha256={}\">{name}</a><br>",
-                sha256(bytes)
-            )
-        })
-        .collect();
-    links.sort();
-    (
-        [(header::CONTENT_TYPE, "text/html")],
-        format!(
-            "<!DOCTYPE html><html><body>{}</body></html>",
-            links.join("")
-        ),
-    )
-        .into_response()
-}
-
-async fn start(files: Files) -> Url {
+/// 起服务器，放上组件包与 yt-dlp 的 `versions`（第一个为稳定版、第二个为每日构建，没有时同第一个）。
+async fn start(versions: &[&str]) -> (Server, Url, Vec<u8>, Vec<u8>) {
+    let server = Server::default();
     let app = axum::Router::new()
-        .route("/simple/yt-dlp/", get(simple))
         .route("/{*path}", get(serve_file))
-        .with_state(files);
+        .with_state(server.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    base
+    let (python, deno) = (python_package(), deno_package());
+    server.put("python.tar.gz", python.clone());
+    server.put("deno.zip", deno.clone());
+    for version in versions {
+        publish(&server, &base, version);
+    }
+    if let Some(stable) = versions.first() {
+        let nightly = versions.get(1).unwrap_or(stable);
+        server.put("pypi/yt-dlp/json", project_json(stable, nightly));
+    }
+    (server, base, python, deno)
 }
 
 fn pins(base: &Url, python: &[u8], deno: &[u8]) -> Pins {
@@ -174,49 +251,37 @@ fn pins(base: &Url, python: &[u8], deno: &[u8]) -> Pins {
     }
 }
 
-fn sources(base: &Url) -> Sources {
-    Sources {
-        index: base.join("simple/").unwrap(),
-        releases: base.join("pypi/yt-dlp/json").unwrap(),
-    }
-}
-
-/// 服务器上的组件包与 yt-dlp 的 `versions`。
-fn files(versions: &[&str]) -> (Files, Vec<u8>, Vec<u8>) {
-    let (python, deno) = (python_package(), deno_package());
-    let mut map = HashMap::new();
-    map.insert("python.tar.gz".to_owned(), python.clone());
-    map.insert("deno.zip".to_owned(), deno.clone());
-    for version in versions {
-        let (name, bytes) = wheel(version);
-        map.insert(format!("files/{name}"), bytes);
-    }
-    (Arc::new(Mutex::new(map)), python, deno)
-}
-
-fn components(root: &Path, pins: Pins, sources: Sources) -> Components {
+fn components(root: &Path, pins: Pins, base: &Url) -> Components {
     Components::new(
         root.to_path_buf(),
         pins,
-        sources,
+        Sources {
+            api: base.join("pypi/").unwrap(),
+        },
         Engine::new(NonZeroUsize::new(4).unwrap()),
     )
 }
 
-/// 从无到有装全：下载、核对、解开 Python 与 deno，pip 从索引装上最新的稳定版并自检；再装一次什么也不做。
+async fn install(components: &Components, channel: Channel) -> Result<Installed, Error> {
+    components
+        .install(&Proxy::Direct, channel, &|_| {}, &CancellationToken::new())
+        .await
+}
+
+/// 从无到有装全：下载、核对、解开 Python 与 deno，下载 yt-dlp 与锁定的依赖（不要 mutagen、不要别的平台的包）、pip
+/// 离线装上并自检；再装一次什么也不做；驱动脚本不在了（应用升级后换了内容）时读已装的即写出。
 #[tokio::test(flavor = "multi_thread")]
 async fn components_install_from_nothing() {
     let root = test_dir("fresh");
-    let (files, python, deno) = files(&["2026.10.21", "2026.10.26"]);
-    let base = start(files.clone()).await;
-    let components = components(&root, pins(&base, &python, &deno), sources(&base));
+    let (server, base, python, deno) = start(&["2026.10.26"]).await;
+    let components = components(&root, pins(&base, &python, &deno), &base);
     assert_eq!(components.installed().unwrap(), None);
-    let stages = Mutex::new(Vec::new());
+    let seen = Mutex::new(Vec::new());
     let installed = components
         .install(
             &Proxy::Direct,
             Channel::Stable,
-            &|progress| stages.lock().unwrap().push(progress.stage),
+            &|progress| seen.lock().unwrap().push(progress),
             &CancellationToken::new(),
         )
         .await
@@ -228,73 +293,85 @@ async fn components_install_from_nothing() {
             .ends_with("python-3.13.18-20261110/python/bin/python3")
     );
     assert!(installed.deno.ends_with("deno-2.9.8/deno"));
-    assert!(installed.site.join("yt_dlp/version.py").exists());
-    assert!(installed.driver.exists());
-    assert_eq!(components.installed().unwrap(), Some(installed.clone()));
-    let stages = stages.into_inner().unwrap();
-    for stage in [Stage::Python, Stage::Deno, Stage::YtDlp, Stage::Checking] {
-        assert!(stages.contains(&stage), "没报 {stage:?}：{stages:?}");
+    for module in ["yt_dlp", "certifi", "yt_dlp_ejs"] {
+        assert!(installed.site.join(module).is_dir(), "缺 {module}");
     }
-    // 下载的包解开后删掉
+    assert!(!installed.site.join("mutagen").exists());
+    assert_eq!(server.hits("pypi/mutagen/1.48.1/json"), 0);
+    assert_eq!(
+        server.hits("files/yt_dlp-2026.10.26-cp27-cp27m-win32.whl"),
+        0
+    );
+    let seen = seen.into_inner().unwrap();
+    for stage in [Stage::Python, Stage::Deno, Stage::YtDlp, Stage::Checking] {
+        assert!(seen.iter().any(|p| p.stage == stage), "没报 {stage:?}");
+    }
+    // 下 yt-dlp 时按字节报进度，最后到总数
+    let last = seen.iter().rev().find(|p| p.stage == Stage::YtDlp).unwrap();
+    assert!(
+        last.total.is_some() && Some(last.bytes) == last.total,
+        "{last:?}"
+    );
+    // 下载的包与 wheel 用过即删
     assert!(!root.join("downloads/python-3.13.18-20261110").exists());
-    // 驱动脚本不在了（应用升级后换了内容）时读已装的组件即写出
+    assert_eq!(
+        std::fs::read_dir(root.join("downloads/wheels"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert_eq!(components.installed().unwrap(), Some(installed.clone()));
+    // 装全了再装不再请求
+    server.files.lock().unwrap().clear();
+    assert_eq!(
+        install(&components, Channel::Stable).await.unwrap(),
+        installed
+    );
     std::fs::remove_file(&installed.driver).unwrap();
     assert_eq!(components.installed().unwrap(), Some(installed.clone()));
     assert!(installed.driver.exists());
-    // 装全了再装不再请求：服务器上的包没了也照样返回
-    files.lock().unwrap().clear();
-    let again = components
-        .install(
-            &Proxy::Direct,
-            Channel::Stable,
-            &|_| {},
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(again, installed);
 }
 
-/// 下到的包与锁定的哈希不符：报出、删掉，不解开。
+/// 下到的包与锁定的哈希不符：报出（可重试）、删掉，不解开。
 #[tokio::test(flavor = "multi_thread")]
 async fn a_package_that_does_not_match_its_pin_is_refused() {
     let root = test_dir("mismatch");
-    let (files, python, deno) = files(&["2026.10.26"]);
-    let base = start(files).await;
+    let (_server, base, python, deno) = start(&["2026.10.26"]).await;
     let mut pins = pins(&base, &python, &deno);
     pins.deno.sha256 = "0".repeat(64);
-    let components = components(&root, pins, sources(&base));
-    let error = components
-        .install(
-            &Proxy::Direct,
-            Channel::Stable,
-            &|_| {},
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap_err();
+    let components = components(&root, pins, &base);
+    let error = install(&components, Channel::Stable).await.unwrap_err();
     assert!(matches!(error, Error::Mismatch { .. }), "{error}");
+    assert!(error.retryable());
     assert!(!root.join("deno-2.9.8").exists());
     assert!(!root.join("downloads/deno-2.9.8").exists());
     assert_eq!(components.installed().unwrap(), None);
 }
 
-/// 更新到新版：装进另一个目录、自检过了才换成当前的，上一个留着，更早的删掉；要装的版本索引里没有时报出、在用的不变。
+/// 上次下好了没用完的包：内容对得上直接用（不再请求），对不上删掉重下；解开了一半、缺了可执行文件的目录重装。
+#[tokio::test(flavor = "multi_thread")]
+async fn leftovers_from_an_interrupted_install_are_checked_not_trusted() {
+    let root = test_dir("leftovers");
+    let (server, base, python, deno) = start(&["2026.10.26"]).await;
+    std::fs::create_dir_all(root.join("downloads")).unwrap();
+    std::fs::write(root.join("downloads/python-3.13.18-20261110"), &python).unwrap();
+    std::fs::write(root.join("downloads/deno-2.9.8"), b"half").unwrap();
+    std::fs::create_dir_all(root.join("deno-2.9.8")).unwrap();
+    let components = components(&root, pins(&base, &python, &deno), &base);
+    install(&components, Channel::Stable).await.unwrap();
+    assert_eq!(server.hits("python.tar.gz"), 0);
+    assert_eq!(server.hits("deno.zip"), 1);
+    assert!(root.join("deno-2.9.8/deno").is_file());
+}
+
+/// 更新：装进另一个目录、自检过了才换成当前的，上一个留着，更早的删掉；每日构建的版本号带 `.dev0`（元数据也这样
+/// 写）；要装的版本 PyPI 上没有时报出、在用的不变。
 #[tokio::test(flavor = "multi_thread")]
 async fn updates_switch_only_after_the_new_version_passes() {
     let root = test_dir("update");
-    let (files, python, deno) = files(&["2026.10.21"]);
-    let base = start(files.clone()).await;
-    let components = components(&root, pins(&base, &python, &deno), sources(&base));
-    let first = components
-        .install(
-            &Proxy::Direct,
-            Channel::Stable,
-            &|_| {},
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
+    let (server, base, python, deno) = start(&["2026.10.21"]).await;
+    let components = components(&root, pins(&base, &python, &deno), &base);
+    let first = install(&components, Channel::Stable).await.unwrap();
     assert_eq!(first.version, "2026.10.21");
 
     let missing = components
@@ -306,12 +383,11 @@ async fn updates_switch_only_after_the_new_version_passes() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(missing, Error::Pip(_)), "{missing}");
+    assert!(matches!(missing, Error::Index(_)), "{missing}");
     assert_eq!(components.installed().unwrap(), Some(first.clone()));
 
     for version in ["2026.10.26", "2026.11.16.232655.dev0"] {
-        let (name, bytes) = wheel(version);
-        files.lock().unwrap().insert(format!("files/{name}"), bytes);
+        publish(&server, &base, version);
         let updated = components
             .update(&Proxy::Direct, version, &|_| {}, &CancellationToken::new())
             .await
@@ -323,24 +399,50 @@ async fn updates_switch_only_after_the_new_version_passes() {
     assert!(!root.join("yt-dlp-2026.10.21").exists(), "更早的删掉");
 }
 
-/// 查最新版本：稳定版与每日构建各按 PyPI 的 JSON 接口。
+/// 换了锁定的 Python（应用升级）：已装的 yt-dlp 不算装好，安装时用新的 Python 重装同一版本，旧的 Python 删掉。
 #[tokio::test(flavor = "multi_thread")]
-async fn the_latest_version_comes_from_the_releases_api() {
-    let root = test_dir("latest");
-    let (files, python, deno) = files(&[]);
-    let body = serde_json::json!({
-        "info": { "version": "2026.10.26" },
-        "releases": {
-            "2026.10.26": [{ "upload_time_iso_8601": "2026-10-26T22:25:00.000000Z", "yanked": false }],
-            "2026.11.16.232655.dev0": [{ "upload_time_iso_8601": "2026-11-16T23:30:00.000000Z", "yanked": false }]
-        }
-    });
-    files
-        .lock()
-        .unwrap()
-        .insert("pypi/yt-dlp/json".to_owned(), body.to_string().into_bytes());
-    let base = start(files).await;
-    let components = components(&root, pins(&base, &python, &deno), sources(&base));
+async fn a_new_python_reinstalls_yt_dlp() {
+    let root = test_dir("python");
+    let (_server, base, python, deno) = start(&["2026.10.21"]).await;
+    install(
+        &components(&root, pins(&base, &python, &deno), &base),
+        Channel::Stable,
+    )
+    .await
+    .unwrap();
+    let mut newer = pins(&base, &python, &deno);
+    newer.python.version = "3.14.10-20261110".to_owned();
+    let components = components(&root, newer, &base);
+    assert_eq!(components.installed().unwrap(), None);
+    let installed = install(&components, Channel::Stable).await.unwrap();
+    assert_eq!(installed.version, "2026.10.21");
+    assert!(
+        installed
+            .python
+            .starts_with(root.join("python-3.14.10-20261110"))
+    );
+    assert!(!root.join("python-3.13.18-20261110").exists());
+}
+
+/// 状态文件坏了：读已装的报出，安装修好它（重装最新的）。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_broken_state_file_is_repaired_by_installing() {
+    let root = test_dir("broken-state");
+    let (_server, base, python, deno) = start(&["2026.10.26"]).await;
+    let components = components(&root, pins(&base, &python, &deno), &base);
+    install(&components, Channel::Stable).await.unwrap();
+    std::fs::write(root.join("state.json"), b"").unwrap();
+    assert!(matches!(components.installed(), Err(Error::Disk(_))));
+    let installed = install(&components, Channel::Stable).await.unwrap();
+    assert_eq!(components.installed().unwrap(), Some(installed));
+}
+
+/// 查最新版本按 PyPI 的 JSON 接口；每日构建渠道装上的就是最新的那个每日构建。
+#[tokio::test(flavor = "multi_thread")]
+async fn the_nightly_channel_installs_the_latest_dev_release() {
+    let root = test_dir("nightly");
+    let (_server, base, python, deno) = start(&["2026.10.26", "2026.11.16.232655.dev0"]).await;
+    let components = components(&root, pins(&base, &python, &deno), &base);
     assert_eq!(
         components
             .latest(&Proxy::Direct, Channel::Stable)
@@ -348,11 +450,6 @@ async fn the_latest_version_comes_from_the_releases_api() {
             .unwrap(),
         "2026.10.26"
     );
-    assert_eq!(
-        components
-            .latest(&Proxy::Direct, Channel::Nightly)
-            .await
-            .unwrap(),
-        "2026.11.16.232655.dev0"
-    );
+    let installed = install(&components, Channel::Nightly).await.unwrap();
+    assert_eq!(installed.version, "2026.11.16.232655.dev0");
 }

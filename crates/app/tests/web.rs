@@ -60,7 +60,7 @@ fn lay_out(root: &Path) {
     std::os::unix::fs::symlink(site, root.join("yt-dlp-dev")).unwrap();
     std::fs::write(
         root.join("state.json"),
-        r#"{"yt_dlp":"dev","previous":null}"#,
+        r#"{"yt_dlp":"dev","previous":null,"python":"test"}"#,
     )
     .unwrap();
 }
