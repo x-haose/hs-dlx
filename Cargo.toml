@@ -27,8 +27,6 @@ unsafe_code = "forbid"
 axum = "0.8.9"
 # Basic 认证头的值：relay 给上游代理、粘贴的 curl 命令里的 -u
 base64 = "0.23.1"
-# 桌面界面的事件时刻按本地时区显示
-chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 dirs = "7.0.0"
 # 顶栏显示保存目录所在盘的可用空间
 fs4 = { version = "1.1.0", default-features = false }
@@ -40,6 +38,8 @@ gtk = "0.18"
 hs-m3u8-core = { git = "https://github.com/x-haose/hs-m3u8", rev = "4b6f5b50016af56d287461a5030d21758d00ea18" }
 # 比较路径时统一 Unicode 写法（NFC）
 icu_normalizer = { version = "2.4.0", default-features = false, features = ["compiled_data"] }
+# 桌面界面的事件时刻按本地时区显示
+jiff = "1.0.0"
 # 应用更新时验安装包的 minisign 签名：没有外部依赖，能边读边验
 minisign-verify = "0.3.0"
 # 新建任务时把地址里的路径段解码成标题

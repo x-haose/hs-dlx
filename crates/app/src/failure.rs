@@ -74,6 +74,16 @@ pub enum FailureKind {
     CloudApi,
     /// 云离线：下完的文件与网盘给的 GCID 不符，已删掉，再继续时重下这个文件
     Integrity,
+    /// 网页视频：网站要登录（或登录过期了），在嗅探页里登录这个网站后再继续
+    WebLogin,
+    /// 网页视频：网站按地区限制，换个代理（出口）后再继续
+    WebGeo,
+    /// 网页视频：网页解析不了，多为网站改版了、yt-dlp 要更新，更新后再继续
+    WebExtract,
+    /// 网页视频：网站说视频不可用了（删了、转为私密等），或选中的画质已经没有了：只能放弃或另建
+    WebGone,
+    /// 网页视频：解析组件没装好或坏了，重新安装后再继续
+    WebComponents,
     /// 其余（任务目录正被别的任务或没做完的放弃占着、本机建不出 HTTP 客户端、不经暂停的取消）
     Other,
 }
@@ -173,7 +183,7 @@ impl FailureKind {
     }
 
     /// 合并（写 MP4、核对能否合并）时的错误。
-    fn of_remux(error: &RemuxError) -> FailureKind {
+    pub(crate) fn of_remux(error: &RemuxError) -> FailureKind {
         match error {
             RemuxError::Io { .. } | RemuxError::OpenOutput { .. } => FailureKind::Disk,
             RemuxError::Unsupported(_) => FailureKind::Mp4Unsupported,
@@ -208,9 +218,10 @@ impl FailureKind {
     }
 
     /// 用户处理了外面的情况（网络恢复、腾出空间、挪走挡路的文件、重新登录网盘、等网盘额度恢复）后再试，有没有可能
-    /// 成功；不需要处理什么的暂时性故障（408、429、5xx、超时、停滞、云端下载失败、校验不符）同样算。证书、内容不对、
-    /// 来源变了、放不进 MP4、没有可写出的、不支持、网盘接口变了与其余再试也一样的不算：它们要改请求头、换输出、改为
-    /// 续录、升级应用，或只能放弃。核心的 `Error::retryable` 只说「什么都不改」时，这里多算了要用户先处理的。
+    /// 成功；不需要处理什么的暂时性故障（408、429、5xx、超时、停滞、云端下载失败、校验不符）同样算，网页视频的要登录、
+    /// 地区限制、解析失败、组件坏了（登录、换代理、更新或重装组件之后）也算。证书、内容不对、来源变了、放不进 MP4、没有
+    /// 可写出的、不支持、网盘接口变了、网页视频没了与其余再试也一样的不算：它们要改请求头、换输出、改为续录、升级应用，
+    /// 或只能放弃。核心的 `Error::retryable` 只说「什么都不改」时，这里多算了要用户先处理的。
     pub fn retry_helps(self) -> bool {
         match self {
             FailureKind::Status(code) => matches!(code, 408 | 429 | 500..=599),
@@ -222,8 +233,13 @@ impl FailureKind {
             | FailureKind::CloudQuota
             | FailureKind::CloudFailed
             | FailureKind::Integrity
+            | FailureKind::WebLogin
+            | FailureKind::WebGeo
+            | FailureKind::WebExtract
+            | FailureKind::WebComponents
             | FailureKind::Other => true,
-            FailureKind::CloudApi
+            FailureKind::WebGone
+            | FailureKind::CloudApi
             | FailureKind::Certificate
             | FailureKind::SourceChanged
             | FailureKind::NotExpected
@@ -236,8 +252,8 @@ impl FailureKind {
     }
 
     /// 改了请求头再跑可能有不同结果：失败出在请求上（被拒、错误页、网络、停滞），或还没跑出结果（没有可写出的，接着
-    /// 录制）。证书、不支持、放不进 MP4、来源变了、本机磁盘、保存位置被占、云离线的各种与其余再试也一样的，与请求头
-    /// 无关（云离线任务没有请求头）。
+    /// 录制），或网页视频要登录（换上登录后的 Cookie）。证书、不支持、放不进 MP4、来源变了、本机磁盘、保存位置被占、
+    /// 云离线的各种、网页视频的其余与再试也一样的，与请求头无关（云离线任务没有请求头）。
     pub fn headers_can_change_outcome(self) -> bool {
         match self {
             FailureKind::Status(_)
@@ -246,8 +262,13 @@ impl FailureKind {
             | FailureKind::Network
             | FailureKind::Stalled
             | FailureKind::NothingToWrite
+            | FailureKind::WebLogin
             | FailureKind::Other => true,
             FailureKind::Certificate
+            | FailureKind::WebGeo
+            | FailureKind::WebExtract
+            | FailureKind::WebGone
+            | FailureKind::WebComponents
             | FailureKind::CloudLogin
             | FailureKind::CloudQuota
             | FailureKind::CloudFailed
@@ -294,6 +315,11 @@ impl FailureKind {
             FailureKind::CloudFailed => "cloud-failed".into(),
             FailureKind::CloudApi => "cloud-api".into(),
             FailureKind::Integrity => "integrity".into(),
+            FailureKind::WebLogin => "web-login".into(),
+            FailureKind::WebGeo => "web-geo".into(),
+            FailureKind::WebExtract => "web-extract".into(),
+            FailureKind::WebGone => "web-gone".into(),
+            FailureKind::WebComponents => "web-components".into(),
             FailureKind::Other => "other".into(),
         }
     }
@@ -318,6 +344,11 @@ impl FailureKind {
             "cloud-failed" => FailureKind::CloudFailed,
             "cloud-api" => FailureKind::CloudApi,
             "integrity" => FailureKind::Integrity,
+            "web-login" => FailureKind::WebLogin,
+            "web-geo" => FailureKind::WebGeo,
+            "web-extract" => FailureKind::WebExtract,
+            "web-gone" => FailureKind::WebGone,
+            "web-components" => FailureKind::WebComponents,
             "other" => FailureKind::Other,
             _ => FailureKind::Status(code.strip_prefix("status:")?.parse().ok()?),
         })
@@ -347,6 +378,11 @@ pub(crate) fn every() -> Vec<FailureKind> {
         FailureKind::CloudFailed,
         FailureKind::CloudApi,
         FailureKind::Integrity,
+        FailureKind::WebLogin,
+        FailureKind::WebGeo,
+        FailureKind::WebExtract,
+        FailureKind::WebGone,
+        FailureKind::WebComponents,
         FailureKind::Other,
     ];
     for kind in &all {
@@ -369,6 +405,11 @@ pub(crate) fn every() -> Vec<FailureKind> {
             | FailureKind::CloudFailed
             | FailureKind::CloudApi
             | FailureKind::Integrity
+            | FailureKind::WebLogin
+            | FailureKind::WebGeo
+            | FailureKind::WebExtract
+            | FailureKind::WebGone
+            | FailureKind::WebComponents
             | FailureKind::Other => {}
         }
     }

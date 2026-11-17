@@ -58,7 +58,7 @@ pub(super) struct Web {
     cache: PathBuf,
     state: watch::Sender<WebState>,
     /// 装好了才有；换了 yt-dlp 的版本时换掉（旧的进程随最后一个引用释放而结束）
-    extractor: Mutex<Option<Arc<Extractor>>>,
+    pub(super) extractor: Mutex<Option<Arc<Extractor>>>,
     /// 在安装：取消它的信号
     installing: Mutex<Option<CancellationToken>>,
 }

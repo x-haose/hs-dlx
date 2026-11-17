@@ -127,6 +127,11 @@ impl Tasks {
                     Kind::File(file) => (None, Some(file.path.clone())),
                     Kind::Torrent(torrent) => (None, Some(torrent.root.clone())),
                     Kind::Cloud(cloud) => (None, cloud.root.clone()),
+                    Kind::Web(web) => match web.container {
+                        hs_dlx_app::web::Container::Mp4 => (Some(web.path.clone()), None),
+                        hs_dlx_app::web::Container::Matroska
+                        | hs_dlx_app::web::Container::Original => (None, Some(web.path.clone())),
+                    },
                 };
                 let checking = cx.background_executor().spawn(async move {
                     let mp4 = mp4.filter(|p| p.is_file());
@@ -153,16 +158,20 @@ impl Tasks {
     /// 读任务目录里已完成的内容（BT 任务读存着的续传数据）；`then_resume` 时读完即继续，读到的片数作本次运行的起点
     /// （读不出时不估剩余时间）。读完（及继续）后，选了退出、都已停下的即退出。
     fn inspect(&mut self, id: TaskId, then_resume: bool, cx: &mut Context<Self>) {
-        let Some((reading, torrent, cloud)) = self.row(id).map(|row| {
+        let Some((reading, torrent, cloud, web)) = self.row(id).map(|row| {
             (
                 row.reading,
                 row.task.spec.torrent().is_some(),
                 row.task.spec.cloud().is_some(),
+                row.task.spec.web().is_some(),
             )
         }) else {
             return;
         };
-        let read = if cloud {
+        let read = if web {
+            cx.background_executor()
+                .spawn(async move { Ok(Ok(Disk::Web)) })
+        } else if cloud {
             // 只读存储，不碰磁盘
             let files = self.service.cloud_files(id).map(Disk::Cloud);
             cx.background_executor().spawn(async move { Ok(files) })
@@ -312,6 +321,8 @@ impl Tasks {
                 let done: u64 = files.iter().filter(|f| f.done).map(|f| f.size).sum();
                 (Some(0), None, (done > 0).then(|| format::bytes(done)))
             }
+            // 各路已下的要重新解析之后才知道
+            Disk::Web => (Some(0), None, None),
             Disk::Unread | Disk::Unreadable(_) => (None, None, None),
         };
         let label = resume_label(
@@ -326,6 +337,7 @@ impl Tasks {
                 row.file_progress = None;
                 row.torrent_progress = None;
                 row.cloud_progress = None;
+                row.web_progress = None;
                 row.rate = Rate::new(Instant::now(), baseline);
                 if let Some(start) = start {
                     row.timeline.begin(start);

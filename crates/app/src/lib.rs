@@ -30,13 +30,13 @@ pub use netcheck::{NetCheck, NetItem, NetworkReport};
 pub use preference::StoredPreference;
 pub use service::{
     CloudPhase, CloudProgress, Downloaded, Event, Events, MetadataFetch, MetadataHandle,
-    PikPakLogin, Resolved, Service, UpdateDownload, WebConfig, WebState,
+    PikPakLogin, Resolved, Service, UpdateDownload, WebConfig, WebProgress, WebState,
 };
 pub use settings::{Seeding, Settings, Theme};
 pub use store::Store;
 pub use task::{
     CloudFile, CloudProvider, CloudSpec, Draft, DraftKind, Expected, FileSpec, Finished, HlsSpec,
-    Kind, OutputKind, OutputSpec, Status, Task, TaskId, TaskSpec, TorrentSpec,
+    Kind, OutputKind, OutputSpec, Status, Task, TaskId, TaskSpec, TorrentSpec, WebSpec,
 };
 pub use torrent::{
     MetadataProgress, SavedTorrent, SeedEnd, TorrentFile, TorrentInfo, TorrentNetwork,

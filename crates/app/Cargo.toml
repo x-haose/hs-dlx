@@ -18,6 +18,8 @@ hs-m3u8-core.workspace = true
 icu_normalizer.workspace = true
 minisign-verify.workspace = true
 percent-encoding.workspace = true
+# 网页视频带的 Cookie 发往网页所在的可注册域名
+psl.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -9,10 +9,10 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-chrono.workspace = true
 dirs.workspace = true
 fs4.workspace = true
 gpui-kit.workspace = true
+jiff.workspace = true
 hs-dlx-app = { path = "../../crates/app" }
 hs-m3u8-core.workspace = true
 hs-dlx-instance = { path = "../../crates/instance" }

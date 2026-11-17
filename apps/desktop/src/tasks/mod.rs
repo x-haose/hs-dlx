@@ -285,6 +285,19 @@ impl Tasks {
                     row.cloud_progress = Some(*progress);
                 }
             }
+            Event::WebProgress { id, progress } => {
+                if let Some(row) = self.row_mut(id) {
+                    if let hs_dlx_app::WebProgress::Fetching { received, .. } = progress.as_ref() {
+                        row.rate.update(Instant::now(), *received, 0);
+                    }
+                    for (level, text) in
+                        crate::signals::between_web(row.web_progress.as_ref(), &progress)
+                    {
+                        row.signal(level, text);
+                    }
+                    row.web_progress = Some(*progress);
+                }
+            }
             Event::Renamed { id } => match self.service.task(id) {
                 Ok(task) => {
                     if let Some(row) = self.row_mut(id) {

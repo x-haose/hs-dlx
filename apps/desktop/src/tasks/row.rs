@@ -3,10 +3,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use chrono::{Local, TimeZone as _};
 use hs_dlx_app::{
     CloudFile, CloudProgress, Finished, Kind, OutputSpec, SavedTorrent, Status, Task, TaskSpec,
-    TorrentProgress,
+    TorrentProgress, WebProgress,
 };
 use hs_m3u8_core::{FileCount, FileProgress, Progress, Saved, Stage};
 
@@ -33,6 +32,8 @@ pub enum Disk {
     Torrent(SavedTorrent),
     /// 云离线任务读到了：存储里记着的文件（列出文件之前为空）
     Cloud(Vec<CloudFile>),
+    /// 网页视频任务：不读任务目录（各路的大小要重新解析才知道），继续时接着下
+    Web,
 }
 
 /// 完成任务的输出此刻在不在：完成时与打开应用时在后台查一次，渲染时不碰文件系统。
@@ -53,6 +54,8 @@ pub struct Row {
     pub torrent_progress: Option<TorrentProgress>,
     /// 云离线任务这次运行最近的进度；继续时清掉
     pub cloud_progress: Option<CloudProgress>,
+    /// 网页视频任务这次运行最近的进度；继续时清掉
+    pub web_progress: Option<WebProgress>,
     /// 任务不在运行时任务目录里已完成的内容；停下时作废重读，运行中留着继续前读到的
     pub disk: Disk,
     /// 读任务目录的代次：每次作废 `disk` 时加一，只收发起时代次相同的结果
@@ -76,11 +79,9 @@ pub struct Row {
 
 impl Row {
     pub fn new(task: Task, now: Instant) -> Row {
-        // 存储里的时间是本应用写的 Unix 秒；换不成本地时刻（超出 chrono 的范围）时不写时刻
-        let at = Local
-            .timestamp_opt(task.created_at, 0)
-            .earliest()
-            .map_or_else(|| "—".to_owned(), |t| t.format("%m-%d %H:%M").to_string());
+        // 存储里的时间是本应用写的 Unix 秒；换不成本地时刻（超出能表示的范围）时不写时刻
+        let at =
+            crate::clock::local(task.created_at, "%m-%d %H:%M").unwrap_or_else(|| "—".to_owned());
         let file_name = file_name(&task.spec);
         let mut signals = Vec::new();
         signals::push(
@@ -104,6 +105,7 @@ impl Row {
             file_progress: None,
             torrent_progress: None,
             cloud_progress: None,
+            web_progress: None,
             disk: Disk::Unread,
             reading: 0,
             present: None,
@@ -124,7 +126,7 @@ impl Row {
     }
 
     pub fn signal(&mut self, level: Level, text: String) {
-        let at = Local::now().format("%H:%M:%S").to_string();
+        let at = crate::clock::now("%H:%M:%S");
         signals::push(&mut self.signals, at, level, text);
     }
 
@@ -243,7 +245,10 @@ impl Amount {
                 duration: saved.duration,
             }),
             // 存储里是 HLS 任务、目录里却是文件任务的：服务按种类开始任务，读到时核心已报目录种类不符
-            Disk::Read(Some(Saved::File(_)) | None) | Disk::Torrent(_) | Disk::Cloud(_) => None,
+            Disk::Read(Some(Saved::File(_)) | None)
+            | Disk::Torrent(_)
+            | Disk::Cloud(_)
+            | Disk::Web => None,
             Disk::Unread | Disk::Unreadable(_) => row.progress.as_ref().map(from_progress),
         }
     }
@@ -275,6 +280,25 @@ impl FileAmount {
             Kind::File(_) => Self::of_file(row),
             Kind::Torrent(_) => Self::of_torrent(row),
             Kind::Cloud(_) => Self::of_cloud(row),
+            Kind::Web(_) => Self::of_web(row),
+        }
+    }
+
+    /// 网页视频任务的：只在运行中按这次运行的进度（下载时为各路合计，合并时为写了的）；停着的不知道。
+    fn of_web(row: &Row) -> Option<FileAmount> {
+        if row.task.status != Status::Running {
+            return None;
+        }
+        match row.web_progress.as_ref()? {
+            WebProgress::Fetching { bytes, total, .. } => Some(FileAmount {
+                bytes: *bytes,
+                total: *total,
+            }),
+            WebProgress::Merging { written, total } => Some(FileAmount {
+                bytes: *written,
+                total: Some(*total),
+            }),
+            WebProgress::Resolving | WebProgress::Waiting { .. } => None,
         }
     }
 
@@ -307,7 +331,7 @@ impl FileAmount {
                 bytes: files.iter().filter(|f| f.done).map(|f| f.size).sum(),
                 total: Some(files.iter().filter(|f| !f.skipped).map(|f| f.size).sum()),
             }),
-            Disk::Cloud(_) | Disk::Read(_) | Disk::Torrent(_) => None,
+            Disk::Cloud(_) | Disk::Read(_) | Disk::Torrent(_) | Disk::Web => None,
             Disk::Unread | Disk::Unreadable(_) => {
                 row.cloud_progress.as_ref().and_then(from_progress)
             }
@@ -327,7 +351,10 @@ impl FileAmount {
                 bytes: saved.bytes,
                 total: saved.total,
             }),
-            Disk::Read(Some(Saved::Hls(_)) | None) | Disk::Torrent(_) | Disk::Cloud(_) => None,
+            Disk::Read(Some(Saved::Hls(_)) | None)
+            | Disk::Torrent(_)
+            | Disk::Cloud(_)
+            | Disk::Web => None,
             Disk::Unread | Disk::Unreadable(_) => row.file_progress.as_ref().map(from_progress),
         }
     }
@@ -345,7 +372,7 @@ impl FileAmount {
                 bytes: saved.info.done,
                 total: Some(saved.info.wanted()),
             }),
-            Disk::Read(_) | Disk::Cloud(_) => None,
+            Disk::Read(_) | Disk::Cloud(_) | Disk::Web => None,
             Disk::Unread | Disk::Unreadable(_) => row.torrent_progress.as_ref().map(from_progress),
         }
     }
@@ -377,7 +404,8 @@ pub fn main_output(spec: &TaskSpec) -> Option<&Path> {
     spec.outputs().first().copied()
 }
 
-/// 存成了什么：HLS 为输出的种类，文件任务为「文件」，BT 任务为「BT」，云离线任务为「PikPak 云离线」。
+/// 存成了什么：HLS 为输出的种类，文件任务为「文件」，BT 任务为「BT」，云离线任务为「PikPak 云离线」，网页视频为
+/// 「网页视频」。
 pub fn saved_as(spec: &TaskSpec) -> &'static str {
     match &spec.kind {
         Kind::Hls(hls) => match hls.output {
@@ -388,6 +416,7 @@ pub fn saved_as(spec: &TaskSpec) -> &'static str {
         Kind::File(_) => "文件",
         Kind::Torrent(_) => "BT",
         Kind::Cloud(_) => "PikPak 云离线",
+        Kind::Web(_) => "网页视频",
     }
 }
 

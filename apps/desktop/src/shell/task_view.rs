@@ -593,6 +593,9 @@ fn reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
     if row.task.spec.cloud().is_some() {
         return cloud_reads(row, now);
     }
+    if row.task.spec.web().is_some() {
+        return web_reads(row, now);
+    }
     if row.task.spec.hls().is_none() {
         return file_reads(row, now);
     }
@@ -671,6 +674,32 @@ fn file_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
             cell("大小", size),
         ],
     }
+}
+
+/// 网页视频任务的 [`reads`]（完成的除外）：下载时为速度、剩余、已下；别的时候为空（停着的已下要重新解析才知道）。
+fn web_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
+    let cell = |label: &'static str, value: String| (SharedString::from(label), value.into());
+    let fetching = matches!(
+        row.web_progress,
+        Some(hs_dlx_app::WebProgress::Fetching { .. })
+    );
+    let Some(amount) = FileAmount::of(row).filter(|_| fetching) else {
+        return Vec::new();
+    };
+    let speed = row.rate.bytes_per_second(now);
+    let left = amount
+        .total
+        .map(|total| total.saturating_sub(amount.bytes))
+        .filter(|_| speed > 0.0)
+        .map_or_else(
+            || "—".to_owned(),
+            |left| format::duration(Duration::from_secs_f64(left as f64 / speed)),
+        );
+    vec![
+        cell("速度", format!("{}/s", format::bytes(speed as u64))),
+        cell("剩余", left),
+        cell("已下", format::bytes(amount.bytes)),
+    ]
 }
 
 /// BT 任务的 [`reads`]（完成的除外）：在下时为速度、剩余、已下、要下的大小、节点数（其中做种的）与上传速度，停着的

@@ -3,6 +3,7 @@
 //! main_window）。
 
 mod backdrop;
+mod clock;
 mod dial;
 mod dock;
 mod format;

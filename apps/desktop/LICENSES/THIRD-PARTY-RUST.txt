@@ -268,6 +268,10 @@ itertools 0.14.0  MIT OR Apache-2.0  https://github.com/rust-itertools/itertools
 itoa 1.0.18  MIT OR Apache-2.0  https://github.com/dtolnay/itoa
 javascriptcore-rs 1.1.2  MIT  https://github.com/tauri-apps/javascriptcore-rs
 javascriptcore-rs-sys 1.1.1  MIT  https://github.com/tauri-apps/javascriptcore-rs
+jiff 1.0.0  Unlicense OR MIT  https://github.com/BurntSushi/jiff
+jiff-core 1.0.0  Unlicense OR MIT  https://github.com/BurntSushi/jiff
+jiff-tzdb 1.0.0  Unlicense OR MIT  https://github.com/BurntSushi/jiff
+jiff-tzdb-platform 1.0.0  Unlicense OR MIT  https://github.com/BurntSushi/jiff
 keyboard-types 0.8.3  MIT OR Apache-2.0  https://github.com/rust-windowing/keyboard-types
 khronos-egl 6.0.0  MIT/Apache-2.0  https://github.com/timothee-haudebourg/khronos-egl
 ksni 0.3.7  Unlicense  https://github.com/iovxw/ksni
@@ -1917,6 +1921,10 @@ DEALINGS IN THE SOFTWARE.
 aho-corasick 1.1.5：COPYING
 byteorder 1.5.0：COPYING
 globset 0.4.21：COPYING
+jiff 1.0.0：COPYING
+jiff-core 1.0.0：COPYING
+jiff-tzdb 1.0.0：COPYING
+jiff-tzdb-platform 1.0.0：COPYING
 memchr 2.8.3：COPYING
 same-file 1.0.6：COPYING
 walkdir 2.5.0：COPYING
@@ -1932,6 +1940,10 @@ aho-corasick 1.1.5：LICENSE-MIT
 byteorder 1.5.0：LICENSE-MIT
 byteorder-lite 0.1.0：LICENSE-MIT
 globset 0.4.21：LICENSE-MIT
+jiff 1.0.0：LICENSE-MIT
+jiff-core 1.0.0：LICENSE-MIT
+jiff-tzdb 1.0.0：LICENSE-MIT
+jiff-tzdb-platform 1.0.0：LICENSE-MIT
 memchr 2.8.3：LICENSE-MIT
 walkdir 2.5.0：LICENSE-MIT
 --------------------------------------------------------------------------------
@@ -1963,6 +1975,10 @@ aho-corasick 1.1.5：UNLICENSE
 byteorder 1.5.0：UNLICENSE
 byteorder-lite 0.1.0：UNLICENSE
 globset 0.4.21：UNLICENSE
+jiff 1.0.0：UNLICENSE
+jiff-core 1.0.0：UNLICENSE
+jiff-tzdb 1.0.0：UNLICENSE
+jiff-tzdb-platform 1.0.0：UNLICENSE
 ksni 0.3.7：UNLICENSE
 memchr 2.8.3：UNLICENSE
 same-file 1.0.6：UNLICENSE

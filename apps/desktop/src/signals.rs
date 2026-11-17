@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use hs_dlx_app::{CloudPhase, CloudProgress, TorrentPhase, TorrentProgress};
+use hs_dlx_app::{CloudPhase, CloudProgress, TorrentPhase, TorrentProgress, WebProgress};
 use hs_m3u8_core::{
     FetchErrorKind, FetchFailure, FileProgress, HttpErrorKind, Progress, Purpose, Retrying, Stage,
 };
@@ -134,6 +134,33 @@ pub fn between_file(before: Option<&FileProgress>, now: &FileProgress) -> Vec<(L
         found.push((Level::Info, "下载完，装上文件".to_owned()));
     }
     found
+}
+
+/// 网页视频任务从 `before`（这次运行里上一次的进度；刚开始时为 None）到 `now` 之间新发生的事：解析网页、等网站允许
+/// 开始、开始下第几路、开始合并。
+pub fn between_web(before: Option<&WebProgress>, now: &WebProgress) -> Vec<(Level, String)> {
+    let line = match (before, now) {
+        (Some(WebProgress::Resolving), WebProgress::Resolving) => None,
+        (_, WebProgress::Resolving) => Some("解析网页".to_owned()),
+        (Some(WebProgress::Waiting { .. }), WebProgress::Waiting { .. }) => None,
+        (_, WebProgress::Waiting { until }) => {
+            let at = crate::clock::local(*until, "%H:%M:%S").unwrap_or_default();
+            Some(format!("网站要求等到 {at} 才能开始下（片头广告的时长）"))
+        }
+        (Some(WebProgress::Fetching { part: was, .. }), WebProgress::Fetching { part, .. })
+            if was == part =>
+        {
+            None
+        }
+        (_, WebProgress::Fetching { part, parts, .. }) => Some(match (*parts, *part) {
+            (1, _) => "开始下载".to_owned(),
+            (_, 0) => "下载视频".to_owned(),
+            _ => "下载音频".to_owned(),
+        }),
+        (Some(WebProgress::Merging { .. }), WebProgress::Merging { .. }) => None,
+        (_, WebProgress::Merging { .. }) => Some("合并视频与音频".to_owned()),
+    };
+    line.map(|line| (Level::Info, line)).into_iter().collect()
 }
 
 /// 云离线任务从 `before`（这次运行里上一次的进度；刚开始时为 None）到 `now` 之间新发生的事：网盘排队、在下、被暂停、

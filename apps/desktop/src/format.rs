@@ -146,6 +146,23 @@ pub fn failure(kind: FailureKind) -> (String, &'static str) {
             "校验".into(),
             "下完的文件与网盘上的不符，已删掉：继续时重下",
         ),
+        FailureKind::WebLogin => (
+            "登录".into(),
+            "网站要登录：在嗅探页里打开这个网站登录，再把 Cookie 带进任务后继续",
+        ),
+        FailureKind::WebGeo => ("地区".into(), "网站按地区限制：换个代理出口后继续"),
+        FailureKind::WebExtract => (
+            "解析".into(),
+            "网页解析不了，多为网站改版了：在设置里更新 yt-dlp 后继续",
+        ),
+        FailureKind::WebGone => (
+            "没了".into(),
+            "网站说视频不可用了，或选中的画质已经没有：只能放弃，或重新粘贴网页另建",
+        ),
+        FailureKind::WebComponents => (
+            "组件".into(),
+            "网页视频的解析组件没装好或坏了：在设置里重新安装后继续",
+        ),
         FailureKind::Other => ("!".into(), "原因见错误信息"),
     }
 }

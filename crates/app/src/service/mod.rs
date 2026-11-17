@@ -26,9 +26,11 @@ use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
 mod cloud;
 mod web;
+mod web_task;
 
 pub use cloud::{CloudPhase, CloudProgress};
 pub use web::{Resolved, WebConfig, WebState};
+pub use web_task::WebProgress;
 
 use crate::preference::StoredPreference;
 use crate::public_trackers::{self, PublicTrackers};
@@ -38,7 +40,7 @@ use crate::update::{self, Release, Restart, UpdateFeed, Version};
 use crate::{
     CloudSpec, Draft, DraftKind, Error, Failure, FileSpec, Finished, HlsSpec, Kind,
     MetadataProgress, OutputSpec, SavedTorrent, Seeding, Settings, Status, Task, TaskId, TaskSpec,
-    Theme, TorrentInfo, TorrentNetwork, TorrentProgress, TorrentSpec, naming,
+    Theme, TorrentInfo, TorrentNetwork, TorrentProgress, TorrentSpec, WebSpec, naming,
 };
 use hs_dlx_cloud::pikpak::{self, Session};
 
@@ -95,6 +97,11 @@ pub enum Event {
     CloudProgress {
         id: TaskId,
         progress: Box<CloudProgress>,
+    },
+    /// 运行中的网页视频任务的进度：解析、等待、各路的下载（节流同上）与合并
+    WebProgress {
+        id: TaskId,
+        progress: Box<WebProgress>,
     },
     /// 任务的标题或输出变了（云离线任务列出文件、定下内容的根），要重读任务（[`Service::task`]）
     Renamed { id: TaskId },
@@ -188,6 +195,8 @@ enum Control {
     Torrent(CancellationToken),
     /// 取消即暂停
     Cloud(CancellationToken),
+    /// 取消即暂停
+    Web(CancellationToken),
 }
 
 impl Control {
@@ -195,15 +204,17 @@ impl Control {
         match self {
             Control::Hls(control) => control.cancel(),
             Control::File(control) => control.cancel(),
-            Control::Torrent(cancel) | Control::Cloud(cancel) => cancel.cancel(),
+            Control::Torrent(cancel) | Control::Cloud(cancel) | Control::Web(cancel) => {
+                cancel.cancel();
+            }
         }
     }
 
-    /// 停止录制；文件、BT 与云离线任务没有录制，什么也不做。
+    /// 停止录制；文件、BT、云离线与网页视频任务没有录制，什么也不做。
     fn stop(&self) {
         match self {
             Control::Hls(control) => control.stop(),
-            Control::File(_) | Control::Torrent(_) | Control::Cloud(_) => {}
+            Control::File(_) | Control::Torrent(_) | Control::Cloud(_) | Control::Web(_) => {}
         }
     }
 }
@@ -214,6 +225,7 @@ enum Launched {
     File(Job<FileOutput, FileProgress>),
     Torrent(TorrentRun),
     Cloud(cloud::CloudRun),
+    Web(web_task::WebRun),
 }
 
 /// 开始了的 BT 任务。
@@ -233,6 +245,7 @@ impl Launched {
             Launched::File(job) => job.control().cancel(),
             Launched::Torrent(run) => run.cancel.cancel(),
             Launched::Cloud(run) => run.cancel.cancel(),
+            Launched::Web(run) => run.cancel.cancel(),
         }
     }
 }
@@ -1027,6 +1040,15 @@ impl Service {
             if task.spec.torrent().is_some() || task.spec.cloud().is_some() {
                 return Err(Error::InvalidInput(format!("{id}没有请求头")));
             }
+            if task.spec.web().is_some()
+                && let Some((name, _)) = headers
+                    .iter()
+                    .find(|(name, _)| !name.eq_ignore_ascii_case("cookie"))
+            {
+                return Err(Error::InvalidInput(format!(
+                    "网页视频只带 Cookie，不带 {name}"
+                )));
+            }
             store::set_headers(tx, id, &headers)
         })
     }
@@ -1166,6 +1188,17 @@ async fn run_discard(
     // 先记为放弃没做完：之后被打断、超时或删不掉记录，任务都停在这个状态，不能继续，只能再放弃
     shared.write(|tx| store::set_status(tx, id, &Status::DiscardUnfinished))?;
     let task = shared.get(id)?;
+    if task.spec.web().is_some() {
+        shared.discard_web(id, task.work_dir.as_deref()).await?;
+        return shared
+            .write(|tx| store::delete(tx, id))
+            .map(|()| Vec::new())
+            .map_err(|cause| Error::RecordNotDeleted {
+                id,
+                leftovers: Vec::new(),
+                cause: Box::new(cause),
+            });
+    }
     if let Some(spec) = task.spec.cloud() {
         shared
             .discard_cloud(id, spec, task.work_dir.as_deref())
@@ -1617,6 +1650,19 @@ impl Shared {
                 Some(info)
             }
             DraftKind::Hls { .. } | DraftKind::File { .. } => None,
+            DraftKind::Web { .. } => {
+                // 只带 Cookie：解析与下载时按网页所在的域名带上；别的请求头 yt-dlp 自己定
+                if let Some((name, _)) = draft
+                    .headers
+                    .iter()
+                    .find(|(name, _)| !name.eq_ignore_ascii_case("cookie"))
+                {
+                    return Err(Error::InvalidInput(format!(
+                        "网页视频只带 Cookie，不带 {name}"
+                    )));
+                }
+                None
+            }
             DraftKind::Cloud { provider } => {
                 return self
                     .create_cloud(
@@ -1635,10 +1681,16 @@ impl Shared {
             (DraftKind::Torrent { .. }, Some(info)) => info.name.clone(),
             (DraftKind::Torrent { .. }, None) => unreachable!("BT 的草稿上面已读出种子信息"),
             (DraftKind::Cloud { .. }, _) => unreachable!("云离线的草稿上面已交给 create_cloud"),
+            (DraftKind::Web { title, ext, .. }, _) => {
+                format!("{}.{ext}", naming::clean_title(title))
+            }
         };
         let preference = match &draft.kind {
             DraftKind::Hls { preference, .. } => Some(StoredPreference::try_from(preference)?),
-            DraftKind::File { .. } | DraftKind::Torrent { .. } | DraftKind::Cloud { .. } => None,
+            DraftKind::File { .. }
+            | DraftKind::Torrent { .. }
+            | DraftKind::Cloud { .. }
+            | DraftKind::Web { .. } => None,
         };
         // 取名与插入之间别的新建可能插入了占用同一路径的任务，插入时报 PathTaken，就重新取名：每重来一次存储里就多了
         // 一个这次取名时没见过的任务。冲突的路径取名时已见过，即两处算出的路径不一致，是不变量被破坏，照原样报出
@@ -1702,6 +1754,29 @@ impl Shared {
                     (root_name, None, Some(placed), kind)
                 }
                 DraftKind::Cloud { .. } => unreachable!("云离线的草稿上面已交给 create_cloud"),
+                DraftKind::Web {
+                    extractor,
+                    video_id,
+                    video,
+                    audio,
+                    container,
+                    ..
+                } => {
+                    let (name, path) = named(&draft.folder, move || {
+                        naming::file_output_for(&folder, &base, &taken)
+                    })
+                    .await?;
+                    let work_dir = naming::file_work_dir(&path);
+                    let kind = Kind::Web(WebSpec {
+                        extractor: extractor.clone(),
+                        video_id: video_id.clone(),
+                        video: video.clone(),
+                        audio: audio.clone(),
+                        container: *container,
+                        path,
+                    });
+                    (name, Some(work_dir), None, kind)
+                }
             };
             let spec = TaskSpec {
                 title,
@@ -1804,6 +1879,10 @@ impl Shared {
             Kind::Cloud(_) => {
                 let proxy = store::settings(tx)?.proxy;
                 Launched::Cloud(self.launch_cloud(tx, task, proxy)?)
+            }
+            Kind::Web(_) => {
+                let proxy = store::settings(tx)?.proxy;
+                Launched::Web(self.launch_web(task, proxy)?)
             }
         })
     }
@@ -1914,6 +1993,18 @@ impl Shared {
                     let _ended = run.done.await;
                     return;
                 }
+                Launched::Web(run) => {
+                    let _ended = run.done.await;
+                    let work_dir = work_dir.expect("网页视频任务有任务目录");
+                    if let Err(error) = web_task::remove_work_dir(&work_dir).await {
+                        // 同下
+                        let _closed = shared.events.send(Event::Orphaned {
+                            paths: vec![work_dir],
+                            reason: error.to_string(),
+                        });
+                    }
+                    return;
+                }
             };
             let work_dir = work_dir.expect("HLS 与文件任务有任务目录");
             let (paths, reason) = match written {
@@ -1948,6 +2039,7 @@ impl Shared {
             Launched::File(job) => self.track_file(task, job),
             Launched::Torrent(job) => self.track_torrent(task, job),
             Launched::Cloud(run) => self.track_cloud(task, run),
+            Launched::Web(run) => self.track_web(task, run),
         }
     }
 
@@ -2145,6 +2237,28 @@ impl Shared {
                 .await
                 .expect("云离线任务的运行不会 panic，运行时关闭时本任务也一起丢弃");
             let (status, result) = cloud::ending(outcome);
+            let ending = Ending {
+                status,
+                result,
+                total: None,
+                resume: None,
+                seeding: None,
+            };
+            shared.conclude(id, ending, leftovers, guard);
+        });
+    }
+
+    /// 网页视频任务的 [`Shared::track`]。
+    fn track_web(self: &Arc<Self>, task: &Task, run: web_task::WebRun) {
+        let id = task.id;
+        let guard = self.register(id, Control::Web(run.cancel.clone()));
+        let shared = self.clone();
+        self.tracker.spawn(async move {
+            let (outcome, leftovers) = run
+                .done
+                .await
+                .expect("网页视频任务的运行不会 panic，运行时关闭时本任务也一起丢弃");
+            let (status, result) = web_task::ending(outcome);
             let ending = Ending {
                 status,
                 result,
