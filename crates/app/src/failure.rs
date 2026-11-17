@@ -197,7 +197,13 @@ impl FailureKind {
             | RemuxError::Mux(_)
             | RemuxError::Reread { .. }
             | RemuxError::VerifyStreams { .. }
-            | RemuxError::VerifyPackets { .. } => FailureKind::Unrecoverable,
+            | RemuxError::VerifyPackets { .. }
+            // 只有合并完整文件时才有（网页视频的音视频）
+            | RemuxError::NoInputs
+            | RemuxError::OutputIsInput { .. }
+            | RemuxError::MissingStream { .. }
+            | RemuxError::FileFormat { .. }
+            | RemuxError::EmptyInput { .. } => FailureKind::Unrecoverable,
         }
     }
 
