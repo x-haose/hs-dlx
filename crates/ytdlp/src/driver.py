@@ -89,6 +89,7 @@ def format_of(fmt: Mapping[str, object], jar: CookieJar) -> Info:
         "filesize_approx": number(fmt.get("filesize_approx")),
         "format_note": text(fmt.get("format_note")),
         "language": text(fmt.get("language")),
+        "language_preference": number(fmt.get("language_preference")),
         "dynamic_range": text(fmt.get("dynamic_range")),
         "http_headers": {key: str(value) for key, value in headers.items()},
         "cookie": jar.get_cookie_header(url) if url else None,

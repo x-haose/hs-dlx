@@ -92,6 +92,9 @@ pub struct Format {
     /// 网站的说法，如 `1080p60`、`Premium`
     pub note: Option<String>,
     pub language: Option<String>,
+    /// 音轨的语言是不是视频本来的语言：越大越是（yt-dlp 的约定：10 为本来的，-1 为不知道，-10 为别的语言；YouTube 的
+    /// 默认音轨为 5）；None 为没说
+    pub language_preference: Option<i32>,
     /// 动态范围，如 `SDR`、`HDR10`
     pub dynamic_range: Option<String>,
     /// 下载时原样带上的请求头（不含 Cookie）
@@ -156,6 +159,7 @@ struct WireFormat {
     filesize_approx: Option<f64>,
     format_note: Option<String>,
     language: Option<String>,
+    language_preference: Option<f64>,
     dynamic_range: Option<String>,
     http_headers: std::collections::BTreeMap<String, String>,
     cookie: Option<String>,
@@ -249,6 +253,10 @@ impl WireFormat {
             size,
             note: self.format_note,
             language: self.language,
+            language_preference: self
+                .language_preference
+                .filter(|preference| preference.is_finite())
+                .map(|preference| preference.round() as i32),
             dynamic_range: self.dynamic_range,
             headers: self
                 .http_headers
@@ -295,7 +303,7 @@ mod tests {
                     "format_id": "137", "url": "https://r.googlevideo.com/v", "protocol": "https", "ext": "mp4",
                     "vcodec": "avc1.640028", "acodec": "none", "width": 1920.0, "height": 1080.0, "fps": 30.0,
                     "tbr": 4000.0, "filesize": null, "filesize_approx": 1234.4, "format_note": "1080p",
-                    "language": null, "dynamic_range": "SDR",
+                    "language": null, "language_preference": -1.0, "dynamic_range": "SDR",
                     "http_headers": {"User-Agent": "x", "Cookie": "leak=1"}, "cookie": "",
                     "chunk_size": 10485760.0, "available_at": 1763400000.0, "has_drm": false, "impersonate": false
                 },
@@ -303,6 +311,7 @@ mod tests {
                     "format_id": "hls-1", "url": "https://e/x.m3u8", "protocol": "m3u8_native", "ext": "mp4",
                     "vcodec": null, "acodec": null, "width": null, "height": null, "fps": null, "tbr": null,
                     "filesize": 99.0, "filesize_approx": null, "format_note": null, "language": "ja",
+                    "language_preference": 10.0,
                     "dynamic_range": null, "http_headers": {}, "cookie": "a=b", "chunk_size": null,
                     "available_at": null, "has_drm": true, "impersonate": true
                 }
@@ -343,6 +352,10 @@ mod tests {
             })
         );
         assert_eq!(hls.cookie.as_deref(), Some("a=b"));
+        assert_eq!(
+            (video.language_preference, hls.language_preference),
+            (Some(-1), Some(10))
+        );
         assert!(hls.drm && hls.impersonate);
     }
 }

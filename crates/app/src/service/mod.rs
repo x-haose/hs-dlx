@@ -25,8 +25,10 @@ use tokio::task::JoinHandle;
 use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
 mod cloud;
+mod web;
 
 pub use cloud::{CloudPhase, CloudProgress};
+pub use web::{Resolved, WebConfig, WebState};
 
 use crate::preference::StoredPreference;
 use crate::public_trackers::{self, PublicTrackers};
@@ -298,6 +300,8 @@ struct Shared {
     pikpak: Mutex<Option<Arc<Session>>>,
     /// PikPak 的接口所在
     pikpak_endpoints: pikpak::Endpoints,
+    /// 网页视频的组件与解析
+    web: web::Web,
 }
 
 /// 一个在做种的任务的控制。
@@ -323,6 +327,7 @@ impl Service {
         max_requests: NonZeroUsize,
         network: TorrentNetwork,
         pikpak: pikpak::Endpoints,
+        web: WebConfig,
     ) -> Result<(Service, Events), Error> {
         let tx = store.transaction()?;
         store::pause_interrupted(&tx)?;
@@ -347,6 +352,7 @@ impl Service {
             Engine::new(max_requests)
         };
         let (events, receiver) = mpsc::unbounded_channel();
+        let web = web::Web::new(web, engine.clone());
         let shared = Arc::new(Shared {
             engine,
             store: Mutex::new(store),
@@ -369,6 +375,7 @@ impl Service {
             seeders: Mutex::new(HashMap::new()),
             pikpak: Mutex::new(None),
             pikpak_endpoints: pikpak,
+            web,
         });
         let service = Service {
             shared,
@@ -433,6 +440,8 @@ impl Service {
                 seeder.cancel.cancel();
             }
         }
+        // 安装中的网页视频组件：已下的组件包留着下次续传
+        self.shared.web.cancel_install();
         // 取公共 tracker 列表、探 BT 代理的不改存储，不用等
         drop(lock(&self.shared.public_fetch).take());
         drop(lock(&self.shared.proxy_probe).take());

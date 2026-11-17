@@ -144,6 +144,12 @@ fn main() {
                         MAX_REQUESTS,
                         TorrentNetwork::Internet,
                         hs_dlx_app::pikpak::Endpoints::official(),
+                        // 网页视频的组件放在任务存储旁的 components 下
+                        hs_dlx_app::WebConfig {
+                            root: path.with_file_name("components"),
+                            pins: hs_dlx_app::ytdlp::Pins::official(),
+                            sources: hs_dlx_app::ytdlp::Sources::official(),
+                        },
                     )
                         .map_err(|error| Failure::new("启动失败", error.to_string()))?;
                     let settings = service

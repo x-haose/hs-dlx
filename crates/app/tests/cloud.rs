@@ -452,6 +452,12 @@ fn service(dir: &Path, base: &Url) -> (Service, mpsc::UnboundedReceiver<Event>) 
             public_trackers: Vec::new(),
         },
         hs_dlx_app::pikpak::Endpoints::at(base.clone()),
+        // 网页视频不在这里测：不给组件
+        hs_dlx_app::WebConfig {
+            root: std::env::temp_dir().join("hs-dlx-no-web"),
+            pins: None,
+            sources: hs_dlx_app::ytdlp::Sources::official(),
+        },
     )
     .unwrap();
     service.0.set_proxy(&hs_m3u8_core::Proxy::Direct).unwrap();

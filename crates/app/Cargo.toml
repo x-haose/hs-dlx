@@ -11,6 +11,8 @@ publish = false
 [dependencies]
 base64.workspace = true
 hs-dlx-cloud = { path = "../cloud" }
+# 网页视频：yt-dlp 的组件安装与解析
+hs-dlx-ytdlp = { path = "../ytdlp" }
 hs-dlx-torrent = { path = "../torrent" }
 hs-m3u8-core.workspace = true
 icu_normalizer.workspace = true

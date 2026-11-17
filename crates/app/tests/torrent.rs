@@ -129,6 +129,12 @@ fn service_with(
         NonZeroUsize::new(8).unwrap(),
         TorrentNetwork::Loopback { public_trackers },
         hs_dlx_app::pikpak::Endpoints::official(),
+        // 网页视频不在这里测：不给组件
+        hs_dlx_app::WebConfig {
+            root: std::env::temp_dir().join("hs-dlx-no-web"),
+            pins: None,
+            sources: hs_dlx_app::ytdlp::Sources::official(),
+        },
     )
     .unwrap()
 }

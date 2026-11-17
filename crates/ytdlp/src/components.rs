@@ -120,7 +120,8 @@ impl Components {
         }
     }
 
-    /// 装全了的组件；缺哪一样时为 None。状态文件读不出、内容认不出时报 [`Error::Disk`]。
+    /// 装全了的组件；缺哪一样时为 None。驱动脚本按内容命名，应用升级后换了内容时在这里写出新的。状态文件读不出、内容
+    /// 认不出、驱动脚本写不出时报 [`Error::Disk`]。
     pub fn installed(&self) -> Result<Option<Installed>, Error> {
         let Some(state) = self.state()? else {
             return Ok(None);
@@ -129,7 +130,16 @@ impl Components {
         let present = [&installed.python, &installed.deno, &installed.site]
             .iter()
             .all(|path| path.exists());
-        Ok(present.then_some(installed))
+        if !present {
+            return Ok(None);
+        }
+        if !installed.driver.exists() {
+            let temporary = installed.driver.with_extension("tmp");
+            std::fs::write(&temporary, DRIVER).map_err(|error| Error::disk(&temporary, &error))?;
+            std::fs::rename(&temporary, &installed.driver)
+                .map_err(|error| Error::disk(&installed.driver, &error))?;
+        }
+        Ok(Some(installed))
     }
 
     /// 装上缺的：Python、deno（各经 `proxy` 下载、核对 SHA-256、解开）与 `channel` 上最新的 yt-dlp；已装全时直接

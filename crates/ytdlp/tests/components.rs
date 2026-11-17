@@ -237,6 +237,10 @@ async fn components_install_from_nothing() {
     }
     // 下载的包解开后删掉
     assert!(!root.join("downloads/python-3.13.18-20261110").exists());
+    // 驱动脚本不在了（应用升级后换了内容）时读已装的组件即写出
+    std::fs::remove_file(&installed.driver).unwrap();
+    assert_eq!(components.installed().unwrap(), Some(installed.clone()));
+    assert!(installed.driver.exists());
     // 装全了再装不再请求：服务器上的包没了也照样返回
     files.lock().unwrap().clear();
     let again = components

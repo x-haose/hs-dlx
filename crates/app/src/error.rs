@@ -89,6 +89,12 @@ pub enum Error {
     /// 用云离线前要先登录网盘
     #[error("没登录 PikPak")]
     NotLoggedIn,
+    /// 这个平台没有网页视频（yt-dlp）的组件
+    #[error("这个平台上用不了网页视频的解析")]
+    WebUnavailable,
+    /// 网页视频的组件还没装好
+    #[error("还没装网页视频的解析组件")]
+    WebNotReady,
     /// 调网盘的接口失败（提交、登录等不在任务里做的）
     #[error(transparent)]
     PikPak(#[from] hs_dlx_cloud::pikpak::Error),
