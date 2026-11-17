@@ -4,6 +4,7 @@ members = [
     "apps/desktop",
     "crates/app",
     "crates/cloud",
+    "crates/ytdlp",
     "crates/instance",
     "crates/macos",
     "crates/relay",

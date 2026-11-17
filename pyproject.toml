@@ -10,8 +10,12 @@ dependencies = []
 dev = [
     "basedpyright==1.40.2",
     "mypy==2.4.0",
+    # crates/ytdlp 的测试用它的 pip 把测试用的 yt-dlp 包装进组件目录，与应用用 python-build-standalone 带的 pip 同样调用
+    "pip==26.3",
     "pytest==9.1.1",
     "ruff==0.17.0",
+    # crates/ytdlp 的驱动脚本的测试对着本地网页跑真的 yt-dlp（通用解析器，不连外网）；应用运行时另从 PyPI 装
+    "yt-dlp==2026.10.26",
 ]
 
 [tool.uv]
@@ -22,7 +26,7 @@ package = false
 [tool.ruff]
 line-length = 120
 target-version = "py312"
-src = ["scripts", "tests/scripts"]
+src = ["scripts", "tests/scripts", "crates/ytdlp/src"]
 
 [tool.ruff.lint]
 select = ["ALL"]
@@ -51,21 +55,21 @@ ignore = [
 
 [tool.mypy]
 strict = true
-files = ["scripts", "tests/scripts"]
-# tests/scripts 下的测试按顶层模块导入 scripts 下的脚本
-mypy_path = ["scripts"]
+files = ["scripts", "tests/scripts", "crates/ytdlp/src"]
+# tests/scripts 下的测试按顶层模块导入 scripts 下的脚本与 yt-dlp 的驱动脚本
+mypy_path = ["scripts", "crates/ytdlp/src"]
 python_version = "3.12"
 
 [tool.basedpyright]
-include = ["scripts", "tests/scripts"]
-extraPaths = ["scripts"]
+include = ["scripts", "tests/scripts", "crates/ytdlp/src"]
+extraPaths = ["scripts", "crates/ytdlp/src"]
 pythonVersion = "3.12"
 typeCheckingMode = "strict"
 
 [tool.pytest.ini_options]
 testpaths = ["tests/scripts"]
-# tests/scripts 下的测试导入 scripts 下的脚本
-pythonpath = ["scripts"]
+# tests/scripts 下的测试导入 scripts 下的脚本与 yt-dlp 的驱动脚本
+pythonpath = ["scripts", "crates/ytdlp/src"]
 addopts = ["--strict-markers", "--strict-config"]
 # 警告即失败；预期的警告用 pytest.warns 断言
 filterwarnings = ["error"]
