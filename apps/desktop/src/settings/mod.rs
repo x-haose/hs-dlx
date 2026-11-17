@@ -5,6 +5,7 @@ mod appearance;
 mod cloud;
 mod general;
 mod torrent;
+mod web;
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -43,16 +44,19 @@ pub enum Section {
     Torrent,
     /// 云离线的网盘账号
     Cloud,
+    /// 网页视频的组件、更新渠道与画质
+    Web,
     Appearance,
     /// 更新、版本与第三方声明
     About,
 }
 
 impl Section {
-    const ALL: [Section; 5] = [
+    const ALL: [Section; 6] = [
         Section::Download,
         Section::Torrent,
         Section::Cloud,
+        Section::Web,
         Section::Appearance,
         Section::About,
     ];
@@ -62,6 +66,7 @@ impl Section {
             Section::Download => "下载",
             Section::Torrent => "BT",
             Section::Cloud => "网盘",
+            Section::Web => "网页视频",
             Section::Appearance => "外观",
             Section::About => "更新与关于",
         }
@@ -72,6 +77,7 @@ impl Section {
             Section::Download => "settings-download",
             Section::Torrent => "settings-torrent",
             Section::Cloud => "settings-cloud",
+            Section::Web => "settings-web",
             Section::Appearance => "settings-appearance",
             Section::About => "settings-about",
         }
@@ -137,6 +143,9 @@ pub struct SettingsView {
     section: Section,
     /// 右边各行的滚动位置：换组时回到顶上
     scroll: ScrollHandle,
+    web: web::WebSettings,
+    /// 看着网页视频组件的状态
+    _web: Task<()>,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
@@ -199,6 +208,16 @@ impl SettingsView {
             });
         });
         let mode = mode_of(&proxy);
+        let web_states = tasks.read(cx).service().web_state();
+        let web = web::WebSettings {
+            state: web_states.borrow().clone(),
+            channel: settings.web_channel,
+            preference: settings.web_preference,
+            latest: None,
+            checking: None,
+            error: None,
+        };
+        let web_watch = Self::watch_web(cx, web_states);
         SettingsView {
             tasks,
             home,
@@ -228,6 +247,8 @@ impl SettingsView {
             _torrent_typed: torrent_typed,
             section: Section::Download,
             scroll: ScrollHandle::new(),
+            web,
+            _web: web_watch,
         }
     }
 
@@ -253,6 +274,11 @@ impl Render for SettingsView {
                 ]
             }
             Section::Cloud => vec![self.render_pikpak(cx)],
+            Section::Web => vec![
+                self.render_web_components(cx),
+                self.render_web_channel(cx),
+                self.render_web_preference(cx),
+            ],
             Section::Appearance => vec![self.render_theme(cx)],
             Section::About => vec![self.render_updates(cx), self.render_about(cx)],
         };

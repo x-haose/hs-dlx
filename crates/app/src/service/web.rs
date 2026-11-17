@@ -15,6 +15,7 @@ use tokio_util::task::AbortOnDropHandle;
 
 use super::{Service, lock};
 use crate::Error;
+use crate::store;
 use crate::web::{Choice, Preference, choices};
 
 /// 一次解析最多多久：YouTube 第一次要下播放器、解 JavaScript 挑战，慢的网络与代理下约半分钟。
@@ -40,6 +41,11 @@ pub enum WebState {
     Installing(InstallProgress),
     /// 装好了：yt-dlp 的版本
     Ready(String),
+    /// 装好了（`version` 照常在用），上次更新没成：原因
+    UpdateFailed {
+        version: String,
+        reason: String,
+    },
     /// 没装成（可再装）：原因
     Failed(String),
 }
@@ -92,6 +98,19 @@ impl Web {
         }
     }
 
+    /// 装好了在用的 yt-dlp 版本；没装好（含正在装）时为 None。
+    fn version(&self) -> Option<String> {
+        match &*self.state.borrow() {
+            WebState::Ready(version) | WebState::UpdateFailed { version, .. } => {
+                Some(version.clone())
+            }
+            WebState::Unavailable
+            | WebState::Missing
+            | WebState::Installing(_)
+            | WebState::Failed(_) => None,
+        }
+    }
+
     /// 取消在做的安装（退出时）。
     pub(super) fn cancel_install(&self) {
         if let Some(cancel) = lock(&self.installing).as_ref() {
@@ -101,6 +120,89 @@ impl Web {
 }
 
 impl Service {
+    /// 记下网页视频的 yt-dlp 渠道：之后的安装与更新照它。
+    pub fn set_web_channel(&self, channel: Channel) -> Result<(), Error> {
+        self.shared.write(|tx| store::set_web_channel(tx, channel))
+    }
+
+    /// 记下网页视频的画质取向：之后的解析照它挑画质选项。
+    pub fn set_web_preference(&self, preference: Preference) -> Result<(), Error> {
+        self.shared
+            .write(|tx| store::set_web_preference(tx, preference))
+    }
+
+    /// 经设置里的代理查设置里的渠道上最新的 yt-dlp：比装着的新（版本不同）时为它，已是最新时为 None。组件没装好时报
+    /// [`Error::WebNotReady`]；句柄在任何执行器上都可等待。
+    pub fn check_web_update(
+        &self,
+    ) -> Result<AbortOnDropHandle<Result<Option<String>, hs_dlx_ytdlp::Error>>, Error> {
+        let web = &self.shared.web;
+        let current = web.version().ok_or(Error::WebNotReady)?;
+        let settings = self.settings()?;
+        let shared = self.shared.clone();
+        Ok(AbortOnDropHandle::new(self.runtime().spawn(async move {
+            let components = shared.web.components.as_ref().expect("装好了即有组件");
+            let latest = components
+                .latest(&settings.proxy, settings.web_channel)
+                .await?;
+            Ok((latest != current).then_some(latest))
+        })))
+    }
+
+    /// 把 yt-dlp 换成 `version`（经设置里的代理），进度与结果见 [`Service::web_state`]：装好、自检过了才换上，在用的
+    /// 解析进程随之换成新的；没装成时照旧用原来的版本，状态回到它并带上原因。组件没装好、或正在装时报
+    /// [`Error::WebNotReady`]。
+    pub fn update_web(&self, version: String) -> Result<(), Error> {
+        let web = &self.shared.web;
+        let current = web.version().ok_or(Error::WebNotReady)?;
+        let proxy = self.settings()?.proxy;
+        let cancel = {
+            let mut installing = lock(&web.installing);
+            if installing.is_some() {
+                return Err(Error::WebNotReady);
+            }
+            let cancel = CancellationToken::new();
+            *installing = Some(cancel.clone());
+            cancel
+        };
+        let shared = self.shared.clone();
+        let _entered = self.runtime().enter();
+        self.shared.tracker.spawn(async move {
+            let web = &shared.web;
+            let components = web.components.as_ref().expect("装好了即有组件");
+            let state = web.state.clone();
+            let updated = components
+                .update(
+                    &proxy,
+                    &version,
+                    &|progress| {
+                        state.send_replace(WebState::Installing(progress));
+                    },
+                    &cancel,
+                )
+                .await;
+            let next = match updated {
+                Ok(installed) => {
+                    let version = installed.version.clone();
+                    *lock(&web.extractor) = Some(Arc::new(Extractor::new(
+                        installed,
+                        web.cache.clone(),
+                        EXTRACT_TIMEOUT,
+                    )));
+                    WebState::Ready(version)
+                }
+                // 没换成：原来的照旧在用
+                Err(error) => WebState::UpdateFailed {
+                    version: current,
+                    reason: error.to_string(),
+                },
+            };
+            *lock(&web.installing) = None;
+            web.state.send_replace(next);
+        });
+        Ok(())
+    }
+
     /// 网页视频的组件的状态，随安装进度与结果变。
     pub fn web_state(&self) -> watch::Receiver<WebState> {
         self.shared.web.state.subscribe()
@@ -113,10 +215,11 @@ impl Service {
         if web.components.is_none() {
             return Err(Error::WebUnavailable);
         }
-        let proxy = self.settings()?.proxy;
+        let settings = self.settings()?;
+        let (proxy, channel) = (settings.proxy, settings.web_channel);
         let cancel = {
             let mut installing = lock(&web.installing);
-            if installing.is_some() || matches!(*web.state.borrow(), WebState::Ready(_)) {
+            if installing.is_some() || web.version().is_some() {
                 return Ok(());
             }
             let cancel = CancellationToken::new();
@@ -132,7 +235,7 @@ impl Service {
             let installed = components
                 .install(
                     &proxy,
-                    Channel::Stable,
+                    channel,
                     &|progress| {
                         state.send_replace(WebState::Installing(progress));
                     },
@@ -163,19 +266,19 @@ impl Service {
         self.shared.web.cancel_install();
     }
 
-    /// 经设置里的代理解析网页地址 `url`（带 `cookies`），给出画质选项（取向 `preference`）。组件没装好时报
+    /// 经设置里的代理解析网页地址 `url`（带 `cookies`），按设置里的取向给出画质选项。组件没装好时报
     /// [`Error::WebNotReady`]，读不出设置时报错；句柄在任何执行器上都可等待，释放它即取消（解析进程随之杀掉）。只有
     /// 通用解析器认得的地址报 [`ExtractError::Unsupported`]（转嗅探页找）。
     pub fn resolve(
         &self,
         url: Url,
         cookies: Vec<Cookie>,
-        preference: Preference,
     ) -> Result<AbortOnDropHandle<Result<Resolved, ExtractError>>, Error> {
         let extractor = lock(&self.shared.web.extractor)
             .clone()
             .ok_or(Error::WebNotReady)?;
-        let proxy = self.settings()?.proxy;
+        let settings = self.settings()?;
+        let (proxy, preference) = (settings.proxy, settings.web_preference);
         let request = Request {
             url,
             cookies,

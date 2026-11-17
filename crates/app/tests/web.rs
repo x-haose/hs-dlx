@@ -7,7 +7,6 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use hs_dlx_app::web::Container;
-use hs_dlx_app::web::Preference;
 use hs_dlx_app::ytdlp::{Archive, ExtractError, Pinned, Pins, Sources};
 use hs_dlx_app::{
     Draft, DraftKind, Error, Event, FailureKind, Service, Status, Store, TaskId, TorrentNetwork,
@@ -107,11 +106,7 @@ fn installed_components_are_ready_and_resolve_through_the_driver() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     // 只有通用解析器认得的地址：驱动脚本不发请求即回不支持（转嗅探页）
     let handle = service
-        .resolve(
-            Url::parse("http://127.0.0.1:9/page").unwrap(),
-            Vec::new(),
-            Preference::Compatible,
-        )
+        .resolve(Url::parse("http://127.0.0.1:9/page").unwrap(), Vec::new())
         .unwrap();
     let result = runtime.block_on(handle).unwrap();
     assert!(
@@ -128,7 +123,6 @@ fn resolving_before_the_components_are_installed_is_refused() {
     let refused = service.resolve(
         Url::parse("https://www.youtube.com/watch?v=x").unwrap(),
         Vec::new(),
-        Preference::Compatible,
     );
     assert!(matches!(refused, Err(Error::WebNotReady)));
 }

@@ -643,6 +643,8 @@ fn rebuild_with_cloud(tx: &Transaction<'_>) -> Result<(), Error> {
 ///   （`web_path`）；有任务目录（各路各一个核心的任务目录在里面）。只属于网页视频的列在别的任务为 NULL。请求头只放
 ///   Cookie（解析与下载时带上）。
 /// - 失败的种类加 `web-login`、`web-geo`、`web-extract`、`web-gone`、`web-components`。其余约束不变，已有的行原样搬过来。
+/// - 设置加网页视频的 yt-dlp 渠道（`web_channel`：`stable`、`nightly`）与画质取向（`web_preference`：`compatible`、
+///   `quality`），没设过为稳定版、兼容优先。
 fn rebuild_with_web(tx: &Transaction<'_>) -> Result<(), Error> {
     let counter = task_counter(tx)?;
     tx.execute_batch(
@@ -742,7 +744,11 @@ fn rebuild_with_web(tx: &Transaction<'_>) -> Result<(), Error> {
                               duration_ms, bytes, width, height, write_only
             FROM task;
         DROP TABLE task;
-        ALTER TABLE task_v12 RENAME TO task;",
+        ALTER TABLE task_v12 RENAME TO task;
+        ALTER TABLE settings ADD COLUMN web_channel TEXT NOT NULL DEFAULT 'stable'
+            CHECK (web_channel IN ('stable', 'nightly'));
+        ALTER TABLE settings ADD COLUMN web_preference TEXT NOT NULL DEFAULT 'compatible'
+            CHECK (web_preference IN ('compatible', 'quality'));",
     )?;
     keep_task_counter(tx, counter)
 }
@@ -1918,11 +1924,24 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
         Option<u32>,
         bool,
         Option<String>,
+        String,
+        String,
     );
-    let (folder, proxy, theme, seed, ratio, minutes, upload, check_updates, torrent_proxy): Columns =
-        tx.query_row(
+    let (
+        folder,
+        proxy,
+        theme,
+        seed,
+        ratio,
+        minutes,
+        upload,
+        check_updates,
+        torrent_proxy,
+        web_channel,
+        web_preference,
+    ): Columns = tx.query_row(
             "SELECT folder, proxy, theme, seed, seed_ratio_percent, seed_minutes, upload_limit, check_updates,
-                    torrent_proxy
+                    torrent_proxy, web_channel, web_preference
              FROM settings WHERE id = 1",
             [],
             |row| {
@@ -1936,6 +1955,8 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
                     row.get(6)?,
                     row.get(7)?,
                     row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
                 ))
             },
         )?;
@@ -1980,7 +2001,43 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
         upload_limit,
         check_updates,
         torrent_proxy,
+        web_channel: match web_channel.as_str() {
+            "stable" => hs_dlx_ytdlp::Channel::Stable,
+            "nightly" => hs_dlx_ytdlp::Channel::Nightly,
+            _ => return Err(Error::Corrupt("设置里的 yt-dlp 渠道".to_owned())),
+        },
+        web_preference: match web_preference.as_str() {
+            "compatible" => crate::web::Preference::Compatible,
+            "quality" => crate::web::Preference::Quality,
+            _ => return Err(Error::Corrupt("设置里的画质取向".to_owned())),
+        },
     })
+}
+
+/// 记下网页视频的 yt-dlp 渠道。
+pub fn set_web_channel(tx: &Transaction<'_>, channel: hs_dlx_ytdlp::Channel) -> Result<(), Error> {
+    let code = match channel {
+        hs_dlx_ytdlp::Channel::Stable => "stable",
+        hs_dlx_ytdlp::Channel::Nightly => "nightly",
+    };
+    tx.execute("UPDATE settings SET web_channel = ?1 WHERE id = 1", [code])?;
+    Ok(())
+}
+
+/// 记下网页视频的画质取向。
+pub fn set_web_preference(
+    tx: &Transaction<'_>,
+    preference: crate::web::Preference,
+) -> Result<(), Error> {
+    let code = match preference {
+        crate::web::Preference::Compatible => "compatible",
+        crate::web::Preference::Quality => "quality",
+    };
+    tx.execute(
+        "UPDATE settings SET web_preference = ?1 WHERE id = 1",
+        [code],
+    )?;
+    Ok(())
 }
 
 /// 记下 BT 经的 SOCKS5 代理（None 为直连）；调用方已校验（见 [`crate::socks::check`]）。

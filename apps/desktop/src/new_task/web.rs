@@ -5,7 +5,7 @@ use gpui_kit::{
     AnyElement, Context, Div, InteractiveElement as _, IntoElement, ParentElement as _,
     SharedString, StatefulInteractiveElement as _, Styled as _, div, px,
 };
-use hs_dlx_app::web::{AudioCodec, Choice, Container, Preference, VideoCodec};
+use hs_dlx_app::web::{AudioCodec, Choice, Container, VideoCodec};
 use hs_dlx_app::ytdlp::{ExtractError, Live, Stage};
 use hs_dlx_app::{Failure, FailureKind, Resolved, WebState};
 
@@ -34,7 +34,7 @@ impl NewTask {
     pub(super) fn resolve_page(&mut self, first: bool, cx: &mut Context<Self>) {
         let state = self.service.web_state().borrow().clone();
         match state {
-            WebState::Ready(_) => self.resolve(cx),
+            WebState::Ready(_) | WebState::UpdateFailed { .. } => self.resolve(cx),
             WebState::Unavailable => self.not_resolvable(first, cx),
             WebState::Missing | WebState::Installing(_) | WebState::Failed(_) => {
                 self.probing = Probing::NeedsWeb(state);
@@ -57,7 +57,7 @@ impl NewTask {
                     if !matches!(this.probing, Probing::NeedsWeb(_)) {
                         return false;
                     }
-                    if matches!(state, WebState::Ready(_)) {
+                    if matches!(state, WebState::Ready(_) | WebState::UpdateFailed { .. }) {
                         this.resolve(cx);
                         return false;
                     }
@@ -85,21 +85,17 @@ impl NewTask {
 
     /// 交给 yt-dlp 解析（之前的结果作废）。
     fn resolve(&mut self, cx: &mut Context<Self>) {
-        let handle =
-            match self
-                .service
-                .resolve(self.url.clone(), Vec::new(), Preference::Compatible)
-            {
-                Ok(handle) => handle,
-                Err(error) => {
-                    self.probing = Probing::Failed(Failure {
-                        kind: FailureKind::WebComponents,
-                        message: error.to_string(),
-                    });
-                    cx.notify();
-                    return;
-                }
-            };
+        let handle = match self.service.resolve(self.url.clone(), Vec::new()) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.probing = Probing::Failed(Failure {
+                    kind: FailureKind::WebComponents,
+                    message: error.to_string(),
+                });
+                cx.notify();
+                return;
+            }
+        };
         self.probing = Probing::Resolving;
         self.animate(cx);
         self._probe = cx.spawn(async move |this, cx| {
@@ -228,7 +224,10 @@ impl NewTask {
             WebState::Failed(reason) => {
                 body.push(ui::note(format!("上次没装成：{reason}"), true).into_any_element());
             }
-            WebState::Missing | WebState::Ready(_) | WebState::Unavailable => {}
+            WebState::Missing
+            | WebState::Ready(_)
+            | WebState::UpdateFailed { .. }
+            | WebState::Unavailable => {}
         }
         if !matches!(state, WebState::Installing(_)) {
             foot.push(
