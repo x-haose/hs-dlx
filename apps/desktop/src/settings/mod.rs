@@ -215,6 +215,7 @@ impl SettingsView {
             preference: settings.web_preference,
             latest: None,
             checking: None,
+            previous: tasks.read(cx).service().web_previous(),
             error: None,
         };
         let web_watch = Self::watch_web(cx, web_states);

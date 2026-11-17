@@ -448,6 +448,21 @@ async fn updates_switch_only_after_the_new_version_passes() {
         assert_eq!(components.installed().unwrap(), Some(updated));
     }
     assert!(root.join("yt-dlp-2026.10.21").exists(), "更新时不删");
+    // 换回上一个：不联网，换后上一个是刚才在用的；再换一次又回来
+    let hits = server.hits("pypi/yt-dlp/2026.10.26/json");
+    let back = components
+        .rollback(&CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(back.version, "2026.10.26");
+    assert_eq!(back.previous.as_deref(), Some("2026.11.16.232655.dev0"));
+    assert_eq!(components.installed().unwrap(), Some(back));
+    assert_eq!(server.hits("pypi/yt-dlp/2026.10.26/json"), hits);
+    let again = components
+        .rollback(&CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(again.version, "2026.11.16.232655.dev0");
     components.sweep().await;
     assert!(root.join("yt-dlp-2026.10.26").exists(), "上一个留着");
     assert!(!root.join("yt-dlp-2026.10.21").exists(), "更早的删掉");

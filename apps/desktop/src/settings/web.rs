@@ -19,6 +19,8 @@ pub(super) struct WebSettings {
     pub latest: Option<Result<Option<String>, String>>,
     /// 在查新版：释放即取消
     pub checking: Option<Task<()>>,
+    /// 可换回的上一个 yt-dlp 版本：组件的状态变了时重新取
+    pub previous: Option<String>,
     /// 最近一次操作没成的原因
     pub error: Option<String>,
 }
@@ -34,6 +36,7 @@ impl SettingsView {
                 let state = states.borrow_and_update().clone();
                 let open = this.update(cx, |this, cx| {
                     this.web.state = state;
+                    this.web.previous = this.tasks.read(cx).service().web_previous();
                     // 换了版本，查到的不再作数
                     this.web.latest = None;
                     cx.notify();
@@ -88,6 +91,17 @@ impl SettingsView {
             .read(cx)
             .service()
             .update_web(version)
+            .err()
+            .map(|error| error.to_string());
+        cx.notify();
+    }
+
+    fn rollback_web(&mut self, cx: &mut Context<Self>) {
+        self.web.error = self
+            .tasks
+            .read(cx)
+            .service()
+            .rollback_web()
             .err()
             .map(|error| error.to_string());
         cx.notify();
@@ -161,6 +175,15 @@ impl SettingsView {
                         cx.listener(|this, _, _, cx| this.check_web(cx)),
                     )),
                 }
+                // 新版出了问题时换回更新前的
+                .children(self.web.previous.clone().map(|previous| {
+                    ui::button(
+                        "web-rollback",
+                        format!("换回 {previous}"),
+                        Tone::Ghost,
+                        cx.listener(|this, _, _, cx| this.rollback_web(cx)),
+                    )
+                }))
                 // 文件坏了而进程还起得来时解析报错，没有别的办法认出：由用户重装
                 .child(ui::button(
                     "web-reinstall",

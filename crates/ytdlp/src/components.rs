@@ -71,6 +71,8 @@ pub struct Installed {
     pub site: PathBuf,
     /// yt-dlp 的版本，PEP 440 规范化的写法（与 PyPI 上的一致）
     pub version: String,
+    /// 上一个 yt-dlp 版本（更新前的，留着可换回，见 [`Components::rollback`]）；没有时为 None
+    pub previous: Option<String>,
     pub driver: PathBuf,
 }
 
@@ -166,7 +168,7 @@ impl Components {
         if state.python != self.pins.python.version {
             return Ok(None);
         }
-        let installed = self.installed_as(&state.yt_dlp);
+        let installed = self.installed_as(&state.yt_dlp, state.previous.clone());
         let present = [&installed.python, &installed.deno, &installed.site]
             .iter()
             .all(|path| path.exists());
@@ -219,6 +221,26 @@ impl Components {
             remove_dir(dir).await?;
         }
         self.install_missing(proxy, channel, progress, cancel).await
+    }
+
+    /// 换回上一个 yt-dlp（更新后新版出了问题时）：不联网，自检过了才换，换后上一个是刚才在用的。没有上一个（没更新过，
+    /// 或它的目录没了）时报 [`Error::NoPrevious`]，没装时报 [`Error::NotInstalled`]。
+    pub async fn rollback(&self, cancel: &CancellationToken) -> Result<Installed, Error> {
+        let _busy = self.busy.lock().await;
+        let current = self.installed()?.ok_or(Error::NotInstalled)?;
+        let previous = current.previous.clone().ok_or(Error::NoPrevious)?;
+        let back = self.installed_as(&previous, Some(current.version.clone()));
+        if !back.site.is_dir() {
+            return Err(Error::NoPrevious);
+        }
+        let found = self_test(&back.python, &back.driver, &back.site, &back.deno, cancel).await?;
+        if found != previous {
+            return Err(Error::SelfTest(format!(
+                "要换回的是 {previous}，那个目录里装的是 {found}"
+            )));
+        }
+        self.write_state(&previous, Some(current.version)).await?;
+        Ok(back)
     }
 
     /// 删掉不再用的：锁定版本以外的 Python 与 deno、当前与上一个以外的 yt-dlp、旧的驱动脚本。更新之后用旧版本的
@@ -295,14 +317,29 @@ impl Components {
         latest_of(&body, channel)
     }
 
-    fn installed_as(&self, version: &str) -> Installed {
+    fn installed_as(&self, version: &str, previous: Option<String>) -> Installed {
         Installed {
             python: executable(&self.root, "python", &self.pins.python),
             deno: executable(&self.root, "deno", &self.pins.deno),
             site: self.root.join(format!("yt-dlp-{version}")),
             version: version.to_owned(),
+            previous,
             driver: self.driver_path(),
         }
+    }
+
+    /// 记下当前（`yt_dlp`）与上一个 yt-dlp 版本：先写临时文件、落盘再改名。
+    async fn write_state(&self, yt_dlp: &str, previous: Option<String>) -> Result<(), Error> {
+        let state = State {
+            yt_dlp: yt_dlp.to_owned(),
+            previous,
+            python: self.pins.python.version.clone(),
+        };
+        write_atomically(
+            &self.root.join("state.json"),
+            &serde_json::to_vec(&state).expect("状态总能写成 JSON"),
+        )
+        .await
     }
 
     fn driver_path(&self) -> PathBuf {
@@ -636,20 +673,11 @@ impl Components {
             Ok(Some(state)) => Some(state.yt_dlp).filter(|old| old != version),
             Ok(None) | Err(_) => None,
         };
-        let state = State {
-            yt_dlp: version.to_owned(),
-            previous,
-            python: self.pins.python.version.clone(),
-        };
-        write_atomically(
-            &self.root.join("state.json"),
-            &serde_json::to_vec(&state).expect("状态总能写成 JSON"),
-        )
-        .await?;
+        self.write_state(version, previous.clone()).await?;
         for path in &paths {
             remove(path).await?;
         }
-        Ok(self.installed_as(version))
+        Ok(self.installed_as(version, previous))
     }
 
     /// PyPI 上 `name` 的 `version` 这一版。

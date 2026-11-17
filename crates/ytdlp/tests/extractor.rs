@@ -53,6 +53,7 @@ fn installed(name: &str) -> (Installed, PathBuf) {
             deno: PathBuf::from("deno"),
             site,
             version: "dev".to_owned(),
+            previous: None,
             driver: Path::new(env!("CARGO_MANIFEST_DIR")).join("src/driver.py"),
         },
         cache,

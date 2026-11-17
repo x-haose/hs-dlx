@@ -53,6 +53,9 @@ pub enum Error {
     /// 还没装组件
     #[error("还没装 yt-dlp 的组件")]
     NotInstalled,
+    /// 没有可换回的上一个 yt-dlp 版本（没更新过，或它的目录没了）
+    #[error("没有可换回的上一个 yt-dlp 版本")]
+    NoPrevious,
     #[error("已取消")]
     Cancelled,
 }
@@ -77,6 +80,7 @@ impl Error {
             | Error::Command(_)
             | Error::Proxy(_)
             | Error::NotInstalled
+            | Error::NoPrevious
             | Error::Cancelled => false,
         }
     }

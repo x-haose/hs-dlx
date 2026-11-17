@@ -219,6 +219,54 @@ impl Service {
         Ok(())
     }
 
+    /// 换回上一个 yt-dlp 版本（不联网，见 [`Components::rollback`]），结果见 [`Service::web_state`]：自检过了才换，在用
+    /// 的解析进程随之换成它；没换成时照旧用原来的，状态回到它并带上原因。组件没装好、正在装时报
+    /// [`Error::WebNotReady`]。
+    pub fn rollback_web(&self) -> Result<(), Error> {
+        let web = &self.shared.web;
+        let current = web.version().ok_or(Error::WebNotReady)?;
+        let cancel = {
+            let mut installing = lock(&web.installing);
+            if installing.is_some() {
+                return Err(Error::WebNotReady);
+            }
+            let cancel = CancellationToken::new();
+            *installing = Some(cancel.clone());
+            cancel
+        };
+        let shared = self.shared.clone();
+        let _entered = self.runtime().enter();
+        self.shared.tracker.spawn(async move {
+            let web = &shared.web;
+            let components = web.components.as_ref().expect("装好了即有组件");
+            let next = match components.rollback(&cancel).await {
+                Ok(installed) => {
+                    let version = installed.version.clone();
+                    *lock(&web.extractor) = Some(Arc::new(Extractor::new(
+                        installed,
+                        web.cache.clone(),
+                        EXTRACT_TIMEOUT,
+                    )));
+                    WebState::Ready(version)
+                }
+                Err(error) => WebState::UpdateFailed {
+                    version: current,
+                    reason: error.to_string(),
+                },
+            };
+            *lock(&web.installing) = None;
+            web.state.send_replace(next);
+        });
+        Ok(())
+    }
+
+    /// 可换回的上一个 yt-dlp 版本（见 [`Service::rollback_web`]）；没装好或没有时为 None。
+    pub fn web_previous(&self) -> Option<String> {
+        lock(&self.shared.web.extractor)
+            .as_ref()
+            .and_then(|extractor| extractor.installed().previous.clone())
+    }
+
     /// 网页视频的组件的状态，随安装进度与结果变。
     pub fn web_state(&self) -> watch::Receiver<WebState> {
         self.shared.web.state.subscribe()
