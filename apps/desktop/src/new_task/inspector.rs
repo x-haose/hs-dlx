@@ -1,7 +1,8 @@
 //! 新建页右边的检查面板：标题与主机；探测中为进行到哪一步与请求经哪里走；认出播放列表为探测结果的读数、清晰度之外
 //! 的选择（音轨、输出、保存位置、请求头）与开始；认出文件为大小、类型、能否续传与保存位置、请求头、开始；探测失败为
 //! 错误与能做的事（改请求头重新探测、重新探测、在网页里找视频流）；磁力链接取种子信息时为连着的节点数，取到后（种子
-//! 文件读到后）为大小、要下的文件、保存位置与开始。磁力链接在这几步都可以改用 PikPak 云离线。
+//! 文件读到后）为大小、要下的文件、保存位置与开始。磁力链接在这几步都可以改用 PikPak 云离线。地址是网页时：yt-dlp
+//! 解析中只写请求经哪里走，组件没装时为安装与进度，解析出来后为时长、上传者、画质选项、保存位置与开始（见 web.rs）。
 
 use gpui_kit::{
     AnyElement, Context, Div, IntoElement, ParentElement as _, SharedString, Styled as _, div, px,
@@ -48,11 +49,19 @@ impl NewTask {
             Probing::Failed(failure) => self.failed_inspector(title, host, failure, cx),
             Probing::Ready(probe) => self.ready_inspector(title, host, probe, cx),
             Probing::File(info) => self.file_inspector(title, host, info, cx),
+            Probing::Resolving => ui::inspector(
+                title,
+                host,
+                self.reads_with_route(Vec::new()),
+                [self.cancel(Tone::Plain, cx)],
+            ),
+            Probing::NeedsWeb(state) => self.needs_web_inspector(title, host, state, cx),
+            Probing::Web(choice) => self.web_inspector(title, host, choice, cx),
         }
     }
 
     /// 退出新建页的按钮，独占底栏一行。
-    fn cancel(&self, tone: Tone, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn cancel(&self, tone: Tone, cx: &mut Context<Self>) -> AnyElement {
         ui::button(
             "cancel",
             "取消",
@@ -75,7 +84,10 @@ impl NewTask {
 
     /// 读数格 `cells`，后面接一格占满一行的「网络」（读到系统代理之后），代理用不了时下面写原因。
     /// 两样都没有时为 None。
-    fn reads_with_route(&self, cells: Vec<(SharedString, SharedString)>) -> Option<AnyElement> {
+    pub(super) fn reads_with_route(
+        &self,
+        cells: Vec<(SharedString, SharedString)>,
+    ) -> Option<AnyElement> {
         let (route, broken) = self.route().unzip();
         if cells.is_empty() && route.is_none() {
             return None;
@@ -423,7 +435,7 @@ impl NewTask {
     }
 
     /// 「保存到」一组：现在的保存位置与更改。
-    fn folder_group(&self, cx: &mut Context<Self>) -> Div {
+    pub(super) fn folder_group(&self, cx: &mut Context<Self>) -> Div {
         group(
             "保存到",
             [div()
@@ -640,7 +652,7 @@ fn file_row(at: usize, path: &str, size: u64, wanted: bool) -> gpui_kit::Statefu
 }
 
 /// 带小标题的一组。
-fn group(title: &'static str, children: impl IntoIterator<Item = AnyElement>) -> Div {
+pub(super) fn group(title: &'static str, children: impl IntoIterator<Item = AnyElement>) -> Div {
     div()
         .flex()
         .flex_col()

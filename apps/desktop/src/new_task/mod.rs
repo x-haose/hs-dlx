@@ -7,6 +7,7 @@
 
 mod figure;
 mod inspector;
+mod web;
 
 use self::figure::{FIGURE_HEIGHT, FIGURE_WIDTH};
 
@@ -108,6 +109,12 @@ enum Probing {
     Metadata(MetadataProgress),
     /// 种子信息到手，在选要下的文件
     Torrent(Box<TorrentChoice>),
+    /// 地址是网页，yt-dlp 在解析
+    Resolving,
+    /// 地址是网页，要解析得先装网页视频的组件：组件此刻的状态
+    NeedsWeb(hs_dlx_app::WebState),
+    /// 网页解析出了视频，在选画质
+    Web(Box<web::WebChoice>),
 }
 
 /// 种子的来源。
@@ -230,6 +237,8 @@ pub struct NewTask {
     _metadata: Task<()>,
     /// 探测中逐帧重画表盘，探测有了结果即停
     _frames: Task<()>,
+    /// 等网页视频的组件装好（见 [`Probing::NeedsWeb`]）
+    _web: Task<()>,
 }
 
 impl EventEmitter<NewTaskEvent> for NewTask {}
@@ -300,6 +309,7 @@ impl NewTask {
             _probe: Task::ready(()),
             _metadata: Task::ready(()),
             _frames: Task::ready(()),
+            _web: Task::ready(()),
         };
         match (torrent, probe) {
             (Some(source), _) => view.fetch_torrent(source, cx),
@@ -437,14 +447,11 @@ impl NewTask {
             let (probing, not_page) = match handle.await {
                 Ok(Ok(Resource::Playlist(probe))) => (Probing::Ready(probe), false),
                 Ok(Ok(Resource::File(info))) => (Probing::File(Box::new(info)), false),
-                // 与 HLS 取到网页时同类：多为登录页或错误页，补上 Cookie 等请求头可能就对了；也可能是有视频的网页
-                Ok(Ok(Resource::Page { content_type })) => (
-                    Probing::Failed(Failure {
-                        kind: FailureKind::Malformed,
-                        message: format!("地址回的是网页（{content_type}），不是视频流或文件"),
-                    }),
-                    true,
-                ),
+                // 网页：交给 yt-dlp 解析（见 web.rs），没有专门的解析器时再在网页引擎里看
+                Ok(Ok(Resource::Page { .. })) => {
+                    let _closed = this.update(cx, |this, cx| this.resolve_page(first, cx));
+                    return;
+                }
                 Ok(Err(error)) => (Probing::Failed(Failure::of(&error)), not_a_playlist(&error)),
                 Err(join) => (
                     Probing::Failed(Failure {
@@ -549,8 +556,10 @@ impl NewTask {
             Probing::Running => Phase::Probing,
             Probing::Failed(_) if self.page_check == PageCheck::Opening => Phase::Probing,
             Probing::Failed(_) => Phase::Failed,
-            Probing::Metadata(_) => Phase::Probing,
-            Probing::Ready(_) | Probing::File(_) | Probing::Torrent(_) => Phase::Ready,
+            Probing::Metadata(_) | Probing::Resolving | Probing::NeedsWeb(_) => Phase::Probing,
+            Probing::Ready(_) | Probing::File(_) | Probing::Torrent(_) | Probing::Web(_) => {
+                Phase::Ready
+            }
         }
     }
 
@@ -561,11 +570,14 @@ impl NewTask {
 
     /// 新建页自己有焦点时的按键：↑ ← 换到码率高一档（外一环），↓ → 换到低一档，回车开始，Esc 关闭。
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        // 开始了就不能取消，也不再换档
+        // 开始了就不能取消，也不再换档（网页视频为换画质）
         if !self.focus.is_focused(window) || self.creating {
             return;
         }
+        let web = matches!(self.probing, Probing::Web(_));
         match event.keystroke.key.as_str() {
+            "up" | "left" if web => self.step_choice(-1, cx),
+            "down" | "right" if web => self.step_choice(1, cx),
             "up" | "left" => self.step_variant(-1, cx),
             "down" | "right" => self.step_variant(1, cx),
             "enter" => self.start(window, cx),
@@ -681,9 +693,25 @@ impl NewTask {
                     wanted,
                 }
             }
-            Probing::Running | Probing::Failed(_) | Probing::Metadata(_) => return,
+            Probing::Web(choice) => {
+                let option = choice.choice();
+                DraftKind::Web {
+                    title: choice.resolved.info.title.clone(),
+                    extractor: choice.resolved.info.extractor.clone(),
+                    video_id: choice.resolved.info.id.clone(),
+                    video: option.video.clone(),
+                    audio: option.audio.clone(),
+                    container: option.container,
+                    ext: option.ext.clone(),
+                }
+            }
+            Probing::Running
+            | Probing::Failed(_)
+            | Probing::Metadata(_)
+            | Probing::Resolving
+            | Probing::NeedsWeb(_) => return,
         };
-        // 磁力链接与种子文件没有请求头
+        // 磁力链接与种子文件没有请求头；网页视频只带 Cookie（别的请求头 yt-dlp 自己定）
         let headers = if self.is_torrent() {
             Vec::new()
         } else {
@@ -691,6 +719,10 @@ impl NewTask {
                 .headers
                 .update(cx, |editor, cx| editor.confirm(window, cx))
             {
+                Some(headers) if matches!(kind, DraftKind::Web { .. }) => headers
+                    .into_iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+                    .collect(),
                 Some(headers) => headers,
                 None => return,
             }

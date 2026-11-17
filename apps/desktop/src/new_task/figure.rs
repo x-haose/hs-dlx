@@ -154,6 +154,13 @@ impl NewTask {
             Probing::Ready(probe) => self.rings_figure(probe, cx).into_any_element(),
             Probing::File(info) => file_dial(info).into_any_element(),
             Probing::Torrent(choice) => torrent_dial(choice).into_any_element(),
+            Probing::Web(choice) => super::web::web_dial(choice).into_any_element(),
+            Probing::Resolving => self
+                .probing_dial("解析中", "yt-dlp 在解析网页".to_owned(), cx)
+                .into_any_element(),
+            Probing::NeedsWeb(_) => self
+                .probing_dial("网页视频", "要先装网页视频的组件".to_owned(), cx)
+                .into_any_element(),
             Probing::Failed(failure) if self.page_check != PageCheck::Opening => {
                 failed_dial(failure).into_any_element()
             }
@@ -307,7 +314,19 @@ impl NewTask {
             Probing::File(_) | Probing::Torrent(_) => {
                 return Some(ui::caption("回车开始").into_any_element());
             }
-            Probing::Running | Probing::Failed(_) | Probing::Metadata(_) => return None,
+            Probing::Web(choice) => {
+                let text = if choice.resolved.choices.len() > 1 {
+                    "↑ ↓ 换一档 · 回车开始"
+                } else {
+                    "回车开始"
+                };
+                return Some(ui::caption(text).into_any_element());
+            }
+            Probing::Running
+            | Probing::Failed(_)
+            | Probing::Metadata(_)
+            | Probing::Resolving
+            | Probing::NeedsWeb(_) => return None,
         };
         let text = if probe.master.as_ref().is_some_and(|m| m.variants.len() > 1) {
             "↑ ↓ 换一档 · 回车开始"
