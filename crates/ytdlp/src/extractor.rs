@@ -27,6 +27,8 @@ const REPLY_LIMIT: usize = 64 << 20;
 const STALL: Duration = Duration::from_secs(5 * 60);
 /// 进程退出后等读标准错误的任务读完最多多久：管道里剩下的很快读完。
 const STDERR_WAIT: Duration = Duration::from_secs(1);
+/// 杀了进程后等它退出最多多久：SIGKILL 与 taskkill /F 之后进程即时退出，系统忙时也在一两秒内。
+const STOP_WAIT: Duration = Duration::from_secs(5);
 
 /// 发往网站的一个 Cookie（Netscape cookies.txt 的各列）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,17 +112,36 @@ struct Worker {
     next_id: u64,
 }
 
-impl Drop for Worker {
-    fn drop(&mut self) {
+impl Worker {
+    /// 杀掉进程与它起的子进程，等它退出（至多 [`STOP_WAIT`]）：之后它打开的文件已关上（Windows 上才删得掉）。
+    async fn stop(mut self) {
         if let Some(pid) = self.child.id() {
-            kill_tree(pid);
+            // 杀不到（已经退出了）或杀的命令起不来时，下面等不到退出，释放时再杀一次（连同 kill_on_drop）
+            let _killed = tokio::process::Command::from(killer(pid)).status().await;
+            let _exited = tokio::time::timeout(STOP_WAIT, self.child.wait()).await;
         }
     }
 }
 
-/// 杀掉进程 `pid` 与它起的子进程：Unix 上它是自己进程组的组长（见 [`Extractor::spawn`]），杀整个组；Windows 上按进程
-/// 树杀。进程已经退出时杀不到，不算失败。
-fn kill_tree(pid: u32) {
+impl Drop for Worker {
+    /// 没经 [`Worker::stop`] 释放（解析的句柄被丢弃）时：在运行时里不等结果地起杀进程的命令（tokio 回收它），不在运行时里
+    /// 时等它跑完。
+    fn drop(&mut self) {
+        let Some(pid) = self.child.id() else {
+            return;
+        };
+        // 杀不到（已经退出了）或杀的命令起不来都不影响：本进程随 Child 的释放（kill_on_drop）照样杀掉
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let _spawned = tokio::process::Command::from(killer(pid)).spawn();
+        } else {
+            let _done = killer(pid).status();
+        }
+    }
+}
+
+/// 杀掉进程 `pid` 与它起的子进程的命令：Unix 上它是自己进程组的组长（见 [`Extractor::spawn`]），杀整个组；Windows 上
+/// 按进程树杀。进程已经退出时杀不到，不算失败。
+fn killer(pid: u32) -> std::process::Command {
     #[cfg(unix)]
     let mut killer = {
         let mut killer = std::process::Command::new("kill");
@@ -139,8 +160,7 @@ fn kill_tree(pid: u32) {
         killer
     };
     killer.stdout(Stdio::null()).stderr(Stdio::null());
-    // 杀不到（已经退出了）或杀的命令起不来都不影响：本进程随 Child 的释放（kill_on_drop）照样杀掉
-    let _done = killer.status();
+    killer
 }
 
 pub struct Extractor {
@@ -199,14 +219,23 @@ impl Extractor {
         });
         let id = worker.next_id;
         worker.next_id += 1;
-        let exchange = exchange(&mut worker, line.to_string());
-        let reply = tokio::select! {
-            reply = tokio::time::timeout(self.timeout, exchange) => match reply {
-                Ok(reply) => reply,
-                // 丢下 worker 即杀掉进程
-                Err(_) => return Err(ExtractError::TimedOut(self.timeout.as_secs())),
-            },
-            () = cancel.cancelled() => return Err(ExtractError::Cancelled),
+        let replied = {
+            let exchange = exchange(&mut worker, line.to_string());
+            tokio::select! {
+                reply = tokio::time::timeout(self.timeout, exchange) => Some(reply),
+                () = cancel.cancelled() => None,
+            }
+        };
+        let reply = match replied {
+            Some(Ok(reply)) => reply,
+            Some(Err(_elapsed)) => {
+                worker.stop().await;
+                return Err(ExtractError::TimedOut(self.timeout.as_secs()));
+            }
+            None => {
+                worker.stop().await;
+                return Err(ExtractError::Cancelled);
+            }
         };
         let reply = match reply {
             Ok(reply) => reply,
@@ -345,38 +374,44 @@ impl Extractor {
                 &worker,
             )));
         }
-        loop {
+        let result = loop {
             let mut reply = String::new();
             let mut limited = (&mut worker.stdout).take(REPLY_LIMIT as u64);
             let read = limited.read_line(&mut reply);
             let read = tokio::select! {
                 read = tokio::time::timeout(STALL, read) => match read {
                     Ok(read) => read,
-                    Err(_) => return Err(ExtractError::TimedOut(STALL.as_secs())),
+                    Err(_) => break Err(ExtractError::TimedOut(STALL.as_secs())),
                 },
-                () = cancel.cancelled() => return Err(ExtractError::Cancelled),
+                () = cancel.cancelled() => break Err(ExtractError::Cancelled),
             };
             match read {
                 Ok(0) | Err(_) => {
                     let _read = tokio::time::timeout(STDERR_WAIT, &mut worker.reading).await;
-                    return Err(ExtractError::Crashed(with_stderr("进程退出了", &worker)));
+                    break Err(ExtractError::Crashed(with_stderr("进程退出了", &worker)));
                 }
                 Ok(_) => {}
             }
-            let parsed: DownloadReply = serde_json::from_str(&reply).map_err(|error| {
-                ExtractError::Crashed(with_stderr(&format!("回应认不出：{error}"), &worker))
-            })?;
-            match parsed {
-                DownloadReply::Progress { progress: now } => {
+            match serde_json::from_str::<DownloadReply>(&reply) {
+                Ok(DownloadReply::Progress { progress: now }) => {
                     progress(
                         now.bytes.unwrap_or(0.0).max(0.0) as u64,
                         now.total.map(|t| t.max(0.0) as u64),
                     );
                 }
-                DownloadReply::Ok { .. } => return Ok(()),
-                DownloadReply::Error { error } => return Err(error.into_error()),
+                Ok(DownloadReply::Ok { .. }) => break Ok(()),
+                Ok(DownloadReply::Error { error }) => break Err(error.into_error()),
+                Err(error) => {
+                    break Err(ExtractError::Crashed(with_stderr(
+                        &format!("回应认不出：{error}"),
+                        &worker,
+                    )));
+                }
             }
-        }
+        };
+        // 下完、出错、取消都等进程退出：之后 `.part` 已关上，接着下或删任务目录都不撞上它
+        worker.stop().await;
+        result
     }
 }
 

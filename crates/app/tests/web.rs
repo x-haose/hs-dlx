@@ -292,6 +292,30 @@ fn a_single_format_becomes_the_output() {
     assert!(!folder.join("两路.ts.hsdl").exists());
 }
 
+/// 只要一路、要转封装（交回 yt-dlp 下的 HLS 写出的是 TS）：下完转封装成 MP4。
+#[test]
+fn a_single_format_is_repacked_when_asked() {
+    let dir = test_dir("repack");
+    let root = dir.join("components");
+    lay_out(&root);
+    let (service, mut events) = with_events(&dir, root);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let base = runtime.block_on(start_page());
+    let folder = dir.join("out");
+    let draft = web_draft(
+        &base,
+        folder.clone(),
+        Some(key("0")),
+        None,
+        Container::Mp4,
+        "mp4",
+    );
+    let task = runtime.block_on(service.create(draft, 1)).unwrap().unwrap();
+    assert_eq!(runtime.block_on(ended(&mut events, task.id)), Status::Done);
+    let output = std::fs::read(folder.join("两路.mp4")).unwrap();
+    assert_eq!(&output[4..8], b"ftyp");
+}
+
 /// 视频与另配的音频：各下一路再合并成 MP4（视频取第一路的、音频取第二路的）。
 #[test]
 fn video_and_audio_are_fetched_apart_and_merged() {
@@ -451,4 +475,80 @@ fn web_extensions_other_than_letters_and_digits_are_refused() {
         let refused = runtime.block_on(service.create(draft, 1)).unwrap();
         assert!(matches!(refused, Err(Error::InvalidInput(_))), "{ext}");
     }
+}
+
+/// 改用 MKV：停着的、合并成 MP4 的任务容器与输出的扩展名随之改；只有一路的不合并，拒绝。
+#[test]
+fn a_stopped_merging_task_switches_to_matroska() {
+    let dir = test_dir("matroska");
+    let root = dir.join("components");
+    lay_out(&root);
+    let (service, mut events) = with_events(&dir, root);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    // 连不上：以网络失败停下
+    let base = Url::parse("http://127.0.0.1:9/").unwrap();
+    let mut ids = Vec::new();
+    for (video, audio, container, ext) in [
+        (Some(key("0")), Some(key("1")), Container::Mp4, "mp4"),
+        (Some(key("0")), None, Container::Original, "ts"),
+    ] {
+        let draft = web_draft(&base, dir.join("out"), video, audio, container, ext);
+        let task = runtime.block_on(service.create(draft, 1)).unwrap().unwrap();
+        assert!(matches!(
+            runtime.block_on(ended(&mut events, task.id)),
+            Status::Failed(_)
+        ));
+        ids.push(task.id);
+    }
+    let switched = service.switch_web_to_matroska(ids[0]).unwrap();
+    let web = switched.spec.web().unwrap();
+    assert_eq!(web.container, Container::Matroska);
+    assert_eq!(web.path, dir.join("out").join("两路.mkv"));
+    assert_eq!(service.task(ids[0]).unwrap().spec, switched.spec);
+    assert!(matches!(
+        service.switch_web_to_matroska(ids[1]),
+        Err(Error::InvalidInput(_))
+    ));
+}
+
+/// 停着的任务已下的：下完的一路按文件，没下完的按 yt-dlp 的 `.part`；不是网页视频任务的报错。
+#[test]
+fn a_stopped_task_reports_what_it_has_saved() {
+    let dir = test_dir("saved");
+    let root = dir.join("components");
+    lay_out(&root);
+    let (service, mut events) = with_events(&dir, root);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let base = Url::parse("http://127.0.0.1:9/").unwrap();
+    let draft = web_draft(
+        &base,
+        dir.join("out"),
+        Some(key("0")),
+        Some(key("1")),
+        Container::Mp4,
+        "mp4",
+    );
+    let task = runtime.block_on(service.create(draft, 1)).unwrap().unwrap();
+    assert!(matches!(
+        runtime.block_on(ended(&mut events, task.id)),
+        Status::Failed(_)
+    ));
+    let work_dir = task.work_dir.clone().unwrap();
+    assert_eq!(
+        runtime
+            .block_on(service.inspect_web(task.id))
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    std::fs::create_dir_all(&work_dir).unwrap();
+    std::fs::write(work_dir.join("video.ts"), vec![0; 100]).unwrap();
+    std::fs::write(work_dir.join("audio.ts.part"), vec![0; 30]).unwrap();
+    assert_eq!(
+        runtime
+            .block_on(service.inspect_web(task.id))
+            .unwrap()
+            .unwrap(),
+        130
+    );
 }

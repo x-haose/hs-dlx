@@ -104,6 +104,15 @@ struct Lane<'a> {
 }
 
 impl Lane<'_> {
+    /// 给用户看的名字。
+    fn label(&self) -> &'static str {
+        match self.streams {
+            Streams::Video => "视频",
+            Streams::Audio => "音频",
+            Streams::All => "唯一",
+        }
+    }
+
     /// 这一路下完的文件：`<路>.<扩展名>`（扩展名新建时校验过，只有字母与数字；没有时为 `bin`）。在即这一路下完了：
     /// 核心与 yt-dlp 都是写完才装上。
     fn file(&self, work_dir: &Path) -> PathBuf {
@@ -213,9 +222,9 @@ impl Shared {
         let output = &spec.path;
         let lanes = lanes(spec);
         let files: Vec<PathBuf> = lanes.iter().map(|lane| lane.file(&work_dir)).collect();
-        // 一路时直接换上它，两路时合并进任务目录里的 `merged.<输出的扩展名>` 再换上
+        // 一路且保持原样时直接换上它，别的合并（或转封装）进任务目录里的 `merged.<输出的扩展名>` 再换上
         let source = match files.as_slice() {
-            [only] => only.clone(),
+            [only] if spec.container == Container::Original => only.clone(),
             _ => {
                 let ext = output
                     .extension()
@@ -244,13 +253,21 @@ impl Shared {
             cookies: cookies(&task.spec.url, &task.spec.headers),
             generic: true,
         };
+        // 系统代理按网页地址定下一个，解析与下载都走它：直链与出口绑定，而格式地址的主机可能在系统代理的例外里
+        let proxy = match proxy {
+            Proxy::System => hs_m3u8_core::system_proxy()
+                .map_err(|error| Stop::core(&error))?
+                .and_then(|system| system.proxy_for(&task.spec.url).cloned())
+                .map_or(Proxy::Direct, Proxy::Url),
+            Proxy::Direct | Proxy::Url(_) => proxy.clone(),
+        };
         let ctx = Ctx {
             id: task.id,
             spec,
             request: &request,
             work_dir: &work_dir,
             extractor,
-            proxy,
+            proxy: &proxy,
             cancel,
             leftovers,
         };
@@ -258,7 +275,7 @@ impl Shared {
         // 合并出的还在（上次合并完、换上前中断）时不再合并
         if !exists(&source).await? {
             self.fetch_lanes(ctx, &lanes, &files).await?;
-            if files.len() > 1 {
+            if source != files[0] {
                 resolution = self.merge(ctx, &lanes, &files, &source).await?;
             }
         }
@@ -522,7 +539,7 @@ impl Shared {
         }
     }
 
-    /// 把各路下完的 `files` 合并成任务目录里的 `merged`，返回画面的宽高（没有视频时为 None）。合并进度至多每
+    /// 把各路下完的 `files` 合并（一路时转封装）成任务目录里的 `merged`，返回画面的宽高（没有视频时为 None）。合并进度至多每
     /// [`PROGRESS_INTERVAL`] 报一次。
     async fn merge(
         &self,
@@ -566,8 +583,9 @@ impl Shared {
                 streams: lane.streams,
             })
             .collect();
-        // 核心合并完会取消传给它的令牌：给它子令牌，任务自己的不受影响
-        let report = hs_m3u8_core::merge_files(
+        // 核心合并完会取消传给它的令牌：给它子令牌，任务自己的不受影响。失败或取消时核心删掉它写的临时文件，`merged`
+        // 要么是完整的、要么不在
+        let report = match hs_m3u8_core::merge_files(
             inputs,
             merged.to_path_buf(),
             container,
@@ -575,8 +593,23 @@ impl Shared {
             progress,
         )
         .await
-        // 失败或取消时核心删掉它写的临时文件，`merged` 要么是完整的、要么不在
-        .map_err(|error| Stop::core(&error))?;
+        {
+            Ok(report) => report,
+            Err(error) => {
+                let Some(index) = broken_input(&error) else {
+                    return Err(Stop::core(&error));
+                };
+                // 这一路下坏了（截断、内容损坏）：删掉，继续时只重下它
+                remove(&files[index]).await?;
+                return Err(Stop::failed(
+                    FailureKind::Integrity,
+                    format!(
+                        "{}那一路下坏了，已删掉，继续时重下：{error}",
+                        lanes[index].label()
+                    ),
+                ));
+            }
+        };
         Ok(report.streams.iter().find_map(|stream| match stream.shape {
             hs_m3u8_core::remux::Shape::Video { width, height, .. } => Some((width, height)),
             hs_m3u8_core::remux::Shape::Audio { .. } => None,
@@ -608,6 +641,51 @@ impl Shared {
                 cause: Box::new(cause),
             })
     }
+}
+
+/// 停着的网页视频任务 `spec` 在任务目录 `work_dir` 里已下的字节：下完的各路按文件，没下完的自己下的按核心记着的
+/// （[`hs_m3u8_core::Engine::inspect`]），交回 yt-dlp 下的按它的 `.part`。任务目录不在时为 0。
+pub(super) async fn saved_web(
+    engine: &hs_m3u8_core::Engine,
+    spec: &WebSpec,
+    work_dir: &Path,
+) -> Result<u64, crate::Error> {
+    let io = |path: &Path| {
+        let path = path.to_path_buf();
+        move |cause| crate::Error::Io {
+            action: "读取",
+            path,
+            cause,
+        }
+    };
+    let size = |path: PathBuf| async move {
+        match tokio::fs::metadata(&path).await {
+            Ok(metadata) => Ok(Some(metadata.len())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(cause) => Err(io(&path)(cause)),
+        }
+    };
+    let mut total = 0;
+    for lane in lanes(spec) {
+        let file = lane.file(work_dir);
+        if let Some(bytes) = size(file.clone()).await? {
+            total += bytes;
+            continue;
+        }
+        let part_dir = work_dir.join(format!("{}.hsdl", lane.role));
+        let saved = match engine.inspect(&part_dir).await? {
+            Some(hs_m3u8_core::Saved::File(saved)) => Some(saved.bytes),
+            Some(hs_m3u8_core::Saved::Hls(saved)) => Some(saved.bytes),
+            None => None,
+        };
+        let mut part = file.into_os_string();
+        part.push(".part");
+        total += match saved {
+            Some(bytes) => bytes,
+            None => size(PathBuf::from(part)).await?.unwrap_or(0),
+        };
+    }
+    Ok(total)
 }
 
 /// 删掉网页视频任务的任务目录 `work_dir`（没有时什么也不做）。
@@ -658,6 +736,30 @@ fn find<'a>(info: &'a Info, key: &FormatKey) -> Result<&'a Format, Stop> {
             ),
         )
     })
+}
+
+/// 合并失败是不是第几路的文件读不出（打不开、读到一半出错、没有能写出的包）：下坏了，重下可能就好。格式不收、缺了
+/// 要的流的不算：重下也一样。
+fn broken_input(error: &hs_m3u8_core::Error) -> Option<usize> {
+    use hs_m3u8_core::remux::{Error as Remux, Origin};
+    let hs_m3u8_core::Error::Remux(error) = error else {
+        return None;
+    };
+    match **error {
+        Remux::OpenInput {
+            at: Origin::Input(index),
+            ..
+        }
+        | Remux::Read {
+            at: Origin::Input(index),
+            ..
+        }
+        | Remux::EmptyInput {
+            at: Origin::Input(index),
+            ..
+        } => Some(index),
+        _ => None,
+    }
 }
 
 /// 自己下时这种失败多为直链过期、被拒或与出口绑定（换了代理）：重新解析换新的直链再下。

@@ -161,7 +161,7 @@ pub fn failure(kind: FailureKind) -> (String, &'static str) {
         ),
         FailureKind::Integrity => (
             "校验".into(),
-            "下完的文件与网盘上的不符，已删掉：继续时重下",
+            "下完的文件坏了或与网盘上的不符，已删掉：继续时重下",
         ),
         FailureKind::WebLogin => (
             "登录".into(),

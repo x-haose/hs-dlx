@@ -1129,6 +1129,28 @@ pub fn set_output(tx: &Transaction<'_>, id: TaskId, output: &OutputSpec) -> Resu
     Ok(())
 }
 
+/// 换掉网页视频任务合并后的容器与输出；新的输出路径与别的任务的输出或任务目录相同时报 [`Error::PathTaken`]，没有这个
+/// 网页视频任务时报 [`Error::NotFound`]。任务目录不变。
+pub fn set_web_output(
+    tx: &Transaction<'_>,
+    id: TaskId,
+    container: Container,
+    path: &Path,
+) -> Result<(), Error> {
+    let path_text = named_utf8(path)?;
+    if taken_except(tx, Some(id))?.contains(&naming::path_key(&path_text)) {
+        return Err(Error::PathTaken(path.into()));
+    }
+    if tx.execute(
+        "UPDATE task SET web_container = ?2, web_path = ?3 WHERE id = ?1 AND kind = 'web'",
+        params![id.0, container_code(container), path_text],
+    )? == 0
+    {
+        return Err(Error::NotFound(id));
+    }
+    Ok(())
+}
+
 /// 换掉任务的请求头；没有这个任务时报 [`Error::NotFound`]。
 pub fn set_headers(
     tx: &Transaction<'_>,

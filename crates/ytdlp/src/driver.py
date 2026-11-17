@@ -420,7 +420,8 @@ def download(yt_dlp: ModuleType, request: Mapping[str, object], deno: str, cache
     """用 yt-dlp 自己的下载器把请求里要的那个格式下到当前目录下的 `name`，进度逐行写进 `replies`，返回最后的回应。
 
     解析一次，在结果里按格式编号与属性找到要的那个（不当作格式选择式：`mp4`、`b` 之类的编号会被当成选择式），只把它
-    交给 yt-dlp 下载；不合并、不做修复（没有 ffmpeg 程序）；已有的 `.part` 接着下，已下完的不覆盖；缺了的片段不跳过。
+    交给 yt-dlp 下载；不合并、不做修复、HLS 与 DASH 用它自己的下载器（没有 ffmpeg 程序，HLS 写出的是各分片接起来的）；
+    已有的 `.part` 接着下，已下完的不覆盖；缺了的片段不跳过。
     输出写成相对当前目录的名字：yt-dlp 会展开输出模板里的 `$` 与 `~`，且没有转义的写法，目录可以含它们（由调用方
     切换过去），名字（应用给的 `<路>.<扩展名>`）不含它们与路径分隔符，含了是应用的缺陷，报错不下。
     """
@@ -453,6 +454,8 @@ def download(yt_dlp: ModuleType, request: Mapping[str, object], deno: str, cache
             "overwrites": False,
             "fixup": "never",
             "skip_unavailable_fragments": False,
+            # HLS 与 DASH 用 yt-dlp 自己的下载器：没有 ffmpeg 程序（直播另走 ffmpeg，应用不交直播过来）
+            "external_downloader": {"default": "native"},
         }
     )
     with yt_dlp.YoutubeDL(options) as ydl:

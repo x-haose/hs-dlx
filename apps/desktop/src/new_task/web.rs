@@ -147,6 +147,14 @@ impl NewTask {
             });
             return;
         }
+        // 网页直播要按直播录（续录、按时间切片），这一版的网页视频任务只下点播
+        if matches!(resolved.info.live, Live::Now | Live::Processing) {
+            self.probing = Probing::Failed(Failure {
+                kind: FailureKind::Unsupported,
+                message: "正在直播或直播刚结束、回放还在处理：这一版的网页视频只下点播，回放处理好后再粘贴".to_owned(),
+            });
+            return;
+        }
         // 没有格式时解析已报错（网站说的原因）；有格式而都下不了的是协议不支持（RTMP 等）或有 DRM
         if resolved.choices.is_empty() {
             let why = if resolved.info.has_drm {
@@ -284,9 +292,6 @@ impl NewTask {
         }
         if let Some(uploader) = &info.uploader {
             cells.push(("上传者".into(), uploader.clone().into()));
-        }
-        if info.live == Live::Now {
-            cells.push(("直播".into(), "正在直播，下到点下载那一刻为止".into()));
         }
         let mut body: Vec<AnyElement> = self.reads_with_route(cells).into_iter().collect();
         let rows = choice

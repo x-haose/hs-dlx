@@ -56,12 +56,13 @@ impl AudioCodec {
             return AudioCodec::Unknown;
         };
         let lower = codec.to_ascii_lowercase();
-        if lower.starts_with("mp4a") || lower == "aac" {
+        // mp4a.40.34 是 MP3 放进 MP4 的写法，先于别的 mp4a 判
+        if lower == "mp3" || lower == "mp4a.40.34" {
+            AudioCodec::Mp3
+        } else if lower.starts_with("mp4a") || lower == "aac" {
             AudioCodec::Aac
         } else if lower == "opus" {
             AudioCodec::Opus
-        } else if lower == "mp3" || lower == "mp4a.40.34" {
-            AudioCodec::Mp3
         } else if lower == "ac-3" || lower == "ac3" {
             AudioCodec::Ac3
         } else if lower == "ec-3" || lower == "eac3" {
@@ -104,13 +105,13 @@ pub fn route(format: &Format) -> Route {
     }
 }
 
-/// 合并后的容器。
+/// 输出的容器：两路时合并成它，一路时转封装成它（交回 yt-dlp 下的 HLS 写出的是各分片接起来的）或保持原样。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Container {
     Mp4,
     /// MP4 放不下的编码（Vorbis 等）
     Matroska,
-    /// 只有一路、不合并：保持原来的格式（扩展名见 [`Choice::ext`]）
+    /// 只有一路、不转封装：保持原来的格式（扩展名见 [`Choice::ext`]）
     Original,
 }
 
@@ -144,6 +145,8 @@ pub enum Preference {
 }
 
 /// `info` 的画质选项：每档清晰度一个（高的在前），最后是只要音频的（有可单独下的音频时）。没有能下的格式时为空。
+/// 要合并的（只有视频的格式配上另一条音轨）两路的编码都要是合并认得的（见 [`VideoCodec`]、[`AudioCodec`] 里有名字的），
+/// 认不出的不拿来合并：两路都下完了才会在合并时失败。
 pub fn choices(info: &Info, preference: Preference) -> Vec<Choice> {
     let usable: Vec<&Format> = info
         .formats
@@ -158,7 +161,24 @@ pub fn choices(info: &Info, preference: Preference) -> Vec<Choice> {
     let with_video: Vec<&Format> = usable
         .iter()
         .copied()
-        .filter(|format| format.video.maybe())
+        .filter(|format| {
+            format.video.maybe()
+                && (!matches!(format.audio, Track::Absent)
+                    || !matches!(
+                        VideoCodec::of(&format.video),
+                        VideoCodec::Other(_) | VideoCodec::Unknown
+                    ))
+        })
+        .collect();
+    let pairable: Vec<&Format> = audio_only
+        .iter()
+        .copied()
+        .filter(|format| {
+            !matches!(
+                AudioCodec::of(&format.audio),
+                AudioCodec::Other(_) | AudioCodec::Unknown
+            )
+        })
         .collect();
     let mut heights: Vec<Option<u32>> = with_video.iter().map(|format| format.height).collect();
     heights.sort_unstable_by(|a, b| b.cmp(a));
@@ -174,7 +194,7 @@ pub fn choices(info: &Info, preference: Preference) -> Vec<Choice> {
         let codec = VideoCodec::of(&best.video);
         // 视频本身就带音频（或没说）时不另配
         let paired = if matches!(best.audio, Track::Absent) {
-            best_audio(&audio_only, Some(&codec))
+            best_audio(&pairable, Some(&codec))
         } else {
             None
         };
@@ -274,9 +294,14 @@ fn choice_of(main: &Format, audio: Option<&Format>) -> Choice {
                 (Container::Matroska, "mkv".to_owned())
             }
         }
-        // 自己的 HLS 引擎写的是 MP4；yt-dlp 给 HLS 的扩展名可能是 `m3u8`
-        None if main.protocol == Protocol::Hls && route(main) == Route::Own => {
-            (Container::Original, "mp4".to_owned())
+        // 自己的 HLS 引擎写的是 MP4；yt-dlp 给 HLS 的扩展名可能是 `m3u8`。交回 yt-dlp 下的 HLS 写出的是各分片接起来的
+        // （多为 TS），下完再转封装成 MP4
+        None if main.protocol == Protocol::Hls => {
+            if route(main) == Route::Own {
+                (Container::Original, "mp4".to_owned())
+            } else {
+                (Container::Mp4, "mp4".to_owned())
+            }
         }
         None => (
             Container::Original,
@@ -487,6 +512,37 @@ mod tests {
         own.protocol = Protocol::Http;
         own.drm_maybe = true;
         assert_eq!(route(&own), Route::YtDlp);
+    }
+
+    #[test]
+    fn mp3_in_mp4_is_mp3_and_unknown_codecs_are_not_merged() {
+        assert_eq!(
+            AudioCodec::of(&Track::Codec("mp4a.40.34".into())),
+            AudioCodec::Mp3
+        );
+        assert_eq!(
+            AudioCodec::of(&Track::Codec("mp4a.40.2".into())),
+            AudioCodec::Aac
+        );
+        // 只有视频、编码认不出的不出选项；认不出的音频不拿去配（只要音频的照样给）
+        let odd_video = format("vp8", Some("vp8"), Some("none"), Some(720), 1.0);
+        let h264 = format("avc", Some("avc1"), Some("none"), Some(480), 1.0);
+        let odd_audio = format("dts", Some("none"), Some("dtsc"), None, 9.0);
+        let found = choices(&info(vec![odd_video, h264, odd_audio]), Preference::Quality);
+        let summary: Vec<_> = found
+            .iter()
+            .map(|c| {
+                (
+                    c.height,
+                    c.video.as_ref().map(|key| key.id.as_str()),
+                    c.audio.as_ref().map(|key| key.id.as_str()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [(Some(480), Some("avc"), None), (None, None, Some("dts"))]
+        );
     }
 
     #[test]

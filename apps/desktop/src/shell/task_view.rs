@@ -8,12 +8,13 @@ use gpui_kit::{
     SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Task, div,
     linear_color_stop, linear_gradient, px,
 };
+use hs_dlx_app::web::Container;
 use hs_dlx_app::{Check, TaskId};
 use hs_dlx_app::{Status, TorrentPhase};
 use hs_m3u8_core::bare_url;
 
 use super::look::{Look, look};
-use super::plan::{Action, Plan, stopped_plan};
+use super::plan::{Action, Instead, Plan, stopped_plan};
 use super::{Shell, live_view};
 use crate::signals::{Level, Signal};
 use crate::tasks::{Amount, Disk, FileAmount, Row, main_output, resume_label, saved_as};
@@ -328,12 +329,18 @@ impl Shell {
             .as_ref()
             .is_some_and(|(at, _)| *at == row.task.id);
         let headers = row.task.spec.torrent().is_none() && row.task.spec.cloud().is_none();
+        let instead = match (row.task.spec.hls(), row.task.spec.web()) {
+            (Some(_), _) => Instead::Hls,
+            (None, Some(web)) if web.container == Container::Mp4 => Instead::Matroska,
+            (None, _) => Instead::Nothing,
+        };
         stopped_plan(
             failure,
             row.recording(),
             row.task.write_only,
             headers,
             editing,
+            instead,
         )
     }
 
@@ -364,6 +371,11 @@ impl Shell {
                     "改存本地 HLS".to_owned(),
                     Some("已下的照样用".into()),
                 ),
+                Action::SwitchToMatroska => (
+                    "switch-mkv",
+                    "改用 MKV".to_owned(),
+                    Some("已下的照样用".into()),
+                ),
                 Action::Resume => (
                     "resume",
                     resume_label(failed, row.task.write_only).to_owned(),
@@ -384,6 +396,7 @@ impl Shell {
                 Action::EditHeaders => this.edit_headers(id, window, cx),
                 Action::WriteRecorded => this.write_recorded(id, cx),
                 Action::SwitchToHls => this.switch_to_hls(id, cx),
+                Action::SwitchToMatroska => this.switch_to_matroska(id, cx),
                 Action::Resume => this.resume(id, cx),
                 Action::OpenFolder => cx.open_with_system(&folder),
                 Action::LogIn => this.log_in_pikpak(window, cx),

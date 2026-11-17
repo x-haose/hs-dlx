@@ -947,6 +947,30 @@ impl Service {
         })
     }
 
+    /// 把停着的网页视频任务的输出容器从 MP4 改为 MKV（输出的扩展名随之改为 `.mkv`），任务目录不变，已下的各路照样用：
+    /// 用于合并或转封装时内容放不进 MP4（[`crate::FailureKind::Mp4Unsupported`]）之后再继续。已是 MKV 的不变；保持原样
+    /// 的（一路、不转封装）报 [`Error::InvalidInput`]。返回改后的任务。新路径已被别的任务占着时报 [`Error::PathTaken`]；拒绝的情形同
+    /// [`Service::set_headers`]。
+    pub fn switch_web_to_matroska(&self, id: TaskId) -> Result<Task, Error> {
+        self.shared.write(|tx| {
+            let mut task = self.shared.stopped(tx, id)?;
+            let Kind::Web(spec) = &mut task.spec.kind else {
+                return Err(Error::InvalidInput(format!("{id}不是网页视频任务")));
+            };
+            match spec.container {
+                crate::web::Container::Matroska => return Ok(task),
+                crate::web::Container::Original => {
+                    return Err(Error::InvalidInput(format!("{id}保持原样，不转封装")));
+                }
+                crate::web::Container::Mp4 => {}
+            }
+            spec.container = crate::web::Container::Matroska;
+            spec.path = spec.path.with_extension("mkv");
+            store::set_web_output(tx, id, spec.container, &spec.path)?;
+            Ok(task)
+        })
+    }
+
     /// 存储里的任务 `id`，停下了而状态还没补写进存储的按停下时的状态；没有时报 [`Error::NotFound`]。
     pub fn task(&self, id: TaskId) -> Result<Task, Error> {
         let mut store = lock(&self.shared.store);
@@ -974,6 +998,27 @@ impl Service {
                     after: INSPECT_TIMEOUT,
                 })?
                 .map_err(Error::from)
+        })
+    }
+
+    /// 停着的网页视频任务在任务目录里已下的字节（见 `web_task::saved_web`）：不在运行时显示已下了多少。不是网页视频任务
+    /// 时报 [`Error::InvalidInput`]；10 秒内读不完报 [`Error::TimedOut`]。返回的句柄在任何执行器上都可等待。
+    pub fn inspect_web(&self, id: TaskId) -> JoinHandle<Result<u64, Error>> {
+        let shared = self.shared.clone();
+        self.runtime().spawn(async move {
+            let task = shared.get(id)?;
+            let (Some(spec), Some(work_dir)) = (task.spec.web(), task.work_dir.as_deref()) else {
+                return Err(Error::InvalidInput(format!("{id}不是网页视频任务")));
+            };
+            tokio::time::timeout(
+                INSPECT_TIMEOUT,
+                web_task::saved_web(&shared.engine, spec, work_dir),
+            )
+            .await
+            .map_err(|_| Error::TimedOut {
+                action: format!("读{id}的任务目录"),
+                after: INSPECT_TIMEOUT,
+            })?
         })
     }
 

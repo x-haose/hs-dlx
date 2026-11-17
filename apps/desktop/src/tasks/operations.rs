@@ -169,8 +169,9 @@ impl Tasks {
             return;
         };
         let read = if web {
+            let handle = self.service.inspect_web(id);
             cx.background_executor()
-                .spawn(async move { Ok(Ok(Disk::Web)) })
+                .spawn(async move { handle.await.map(|result| result.map(Disk::Web)) })
         } else if cloud {
             // 只读存储，不碰磁盘
             let files = self.service.cloud_files(id).map(Disk::Cloud);
@@ -260,6 +261,29 @@ impl Tasks {
         started
     }
 
+    /// 网页视频合并时内容放不进 MP4，改用 MKV 再跑；退出中不改。改了并发起了再跑时为 true，没成的原因写进提示。
+    pub fn switch_to_matroska(&mut self, id: TaskId, cx: &mut Context<Self>) -> bool {
+        let title = self.title(id);
+        if self.quitting() {
+            self.tell(format!("正在退出，「{title}」没有改用 MKV"), cx);
+            return false;
+        }
+        if !self.row(id).is_some_and(Row::idle) {
+            return false;
+        }
+        match self.service.switch_web_to_matroska(id) {
+            Ok(task) => {
+                let row = self.row_mut(id).expect("上面刚找到这一行");
+                row.set_spec(task.spec);
+            }
+            Err(error) => {
+                self.tell(format!("「{title}」没能改用 MKV：{error}"), cx);
+                return false;
+            }
+        }
+        self.resume(id, cx)
+    }
+
     /// 内容放不进 MP4 时改存本地 HLS 再跑：直播只写出已录的，点播接着下；退出中不改。改了并发起了再跑时为 true，没成的
     /// 原因写进提示。
     pub fn switch_to_hls(&mut self, id: TaskId, cx: &mut Context<Self>) -> bool {
@@ -321,8 +345,7 @@ impl Tasks {
                 let done: u64 = files.iter().filter(|f| f.done).map(|f| f.size).sum();
                 (Some(0), None, (done > 0).then(|| format::bytes(done)))
             }
-            // 各路已下的要重新解析之后才知道
-            Disk::Web => (Some(0), None, None),
+            Disk::Web(bytes) => (Some(0), None, (*bytes > 0).then(|| format::bytes(*bytes))),
             Disk::Unread | Disk::Unreadable(_) => (None, None, None),
         };
         let label = resume_label(

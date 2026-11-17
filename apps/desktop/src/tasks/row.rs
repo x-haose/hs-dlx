@@ -32,8 +32,8 @@ pub enum Disk {
     Torrent(SavedTorrent),
     /// 云离线任务读到了：存储里记着的文件（列出文件之前为空）
     Cloud(Vec<CloudFile>),
-    /// 网页视频任务：不读任务目录（各路的大小要重新解析才知道），继续时接着下
-    Web,
+    /// 网页视频任务读到了：任务目录里已下的字节（各路合计；总量要重新解析才知道）
+    Web(u64),
 }
 
 /// 完成任务的输出此刻在不在：完成时与打开应用时在后台查一次，渲染时不碰文件系统。
@@ -248,7 +248,7 @@ impl Amount {
             Disk::Read(Some(Saved::File(_)) | None)
             | Disk::Torrent(_)
             | Disk::Cloud(_)
-            | Disk::Web => None,
+            | Disk::Web(_) => None,
             Disk::Unread | Disk::Unreadable(_) => row.progress.as_ref().map(from_progress),
         }
     }
@@ -284,10 +284,18 @@ impl FileAmount {
         }
     }
 
-    /// 网页视频任务的：只在运行中按这次运行的进度（下载时为各路合计，合并时为写了的）；停着的不知道。
+    /// 网页视频任务的：运行中按这次运行的进度（下载时为各路合计，合并时为写了的）；停着的按读到的任务目录（总量要重新
+    /// 解析才知道）。
     fn of_web(row: &Row) -> Option<FileAmount> {
         if row.task.status != Status::Running {
-            return None;
+            return match row.disk {
+                Disk::Web(bytes) => Some(FileAmount { bytes, total: None }),
+                Disk::Unread
+                | Disk::Unreadable(_)
+                | Disk::Read(_)
+                | Disk::Torrent(_)
+                | Disk::Cloud(_) => None,
+            };
         }
         match row.web_progress.as_ref()? {
             WebProgress::Fetching { bytes, total, .. } => Some(FileAmount {
@@ -331,7 +339,7 @@ impl FileAmount {
                 bytes: files.iter().filter(|f| f.done).map(|f| f.size).sum(),
                 total: Some(files.iter().filter(|f| !f.skipped).map(|f| f.size).sum()),
             }),
-            Disk::Cloud(_) | Disk::Read(_) | Disk::Torrent(_) | Disk::Web => None,
+            Disk::Cloud(_) | Disk::Read(_) | Disk::Torrent(_) | Disk::Web(_) => None,
             Disk::Unread | Disk::Unreadable(_) => {
                 row.cloud_progress.as_ref().and_then(from_progress)
             }
@@ -354,7 +362,7 @@ impl FileAmount {
             Disk::Read(Some(Saved::Hls(_)) | None)
             | Disk::Torrent(_)
             | Disk::Cloud(_)
-            | Disk::Web => None,
+            | Disk::Web(_) => None,
             Disk::Unread | Disk::Unreadable(_) => row.file_progress.as_ref().map(from_progress),
         }
     }
@@ -372,7 +380,7 @@ impl FileAmount {
                 bytes: saved.info.done,
                 total: Some(saved.info.wanted()),
             }),
-            Disk::Read(_) | Disk::Cloud(_) | Disk::Web => None,
+            Disk::Read(_) | Disk::Cloud(_) | Disk::Web(_) => None,
             Disk::Unread | Disk::Unreadable(_) => row.torrent_progress.as_ref().map(from_progress),
         }
     }
