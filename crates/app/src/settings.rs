@@ -26,6 +26,8 @@ pub struct Settings {
     pub web_channel: hs_dlx_ytdlp::Channel,
     /// 网页视频的画质选项按什么挑（见 [`crate::web::choices`]）
     pub web_preference: crate::web::Preference,
+    /// 解析网页视频时另从这个浏览器读登录后的 Cookie；None 为不读
+    pub web_browser: Option<hs_dlx_ytdlp::Browser>,
 }
 
 impl Default for Settings {
@@ -40,6 +42,7 @@ impl Default for Settings {
             torrent_proxy: None,
             web_channel: hs_dlx_ytdlp::Channel::Stable,
             web_preference: crate::web::Preference::Compatible,
+            web_browser: None,
         }
     }
 }

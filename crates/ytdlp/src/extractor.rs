@@ -14,6 +14,8 @@ use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, Buf
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Semaphore;
 
+use crate::Browser;
+
 use crate::components::{Installed, command, proxy_for};
 use crate::info::{FormatKey, Info, Track, Wire};
 
@@ -53,6 +55,8 @@ pub struct Request {
     pub cookies: Vec<Cookie>,
     /// 只有通用解析器认得的网址也解析；为假时这样的网址不发请求、直接报 [`ExtractError::Unsupported`]
     pub generic: bool,
+    /// 另从这个浏览器读 Cookie（与 `cookies` 合并）；读不出或没读全时报 [`ExtractError::Cookies`]，不发请求
+    pub browser: Option<Browser>,
 }
 
 /// 解析失败。
@@ -67,6 +71,9 @@ pub enum ExtractError {
     /// 要登录（或 Cookie 过期了）
     #[error("{0}")]
     Login(String),
+    /// 从浏览器读 Cookie 没读出或没读全（为说明，写了怎么办）：还没向网站发请求
+    #[error("{0}")]
+    Cookies(String),
     /// 请求太频繁（429）：过一阵再试
     #[error("{0}")]
     RateLimited(String),
@@ -295,6 +302,7 @@ impl Extractor {
             "proxy": proxy,
             "cookies": (!request.cookies.is_empty()).then(|| netscape(&request.cookies)),
             "generic": request.generic,
+            "browser": request.browser.map(Browser::code),
         });
         let id = worker.next_id;
         worker.next_id += 1;
@@ -342,7 +350,7 @@ impl Extractor {
         self.idle.lock().expect("锁里不会 panic").push_back(worker);
         match (parsed.ok, parsed.error) {
             (Some(wire), None) => Ok(wire.into_info()),
-            (None, Some(failure)) => Err(failure.into_error()),
+            (None, Some(failure)) => Err(failure.into_error(request.browser)),
             _ => Err(ExtractError::Crashed(
                 "回应里结果与失败不是恰好一个".to_owned(),
             )),
@@ -456,6 +464,7 @@ impl Extractor {
             "name": name.to_string_lossy(),
             "proxy": proxy,
             "cookies": (!request.cookies.is_empty()).then(|| netscape(&request.cookies)),
+            "browser": request.browser.map(Browser::code),
         });
         let sent = async {
             worker
@@ -496,7 +505,7 @@ impl Extractor {
                     );
                 }
                 Ok(DownloadReply::Ok { .. }) => break Ok(()),
-                Ok(DownloadReply::Error { error }) => break Err(error.into_error()),
+                Ok(DownloadReply::Error { error }) => break Err(error.into_error(request.browser)),
                 Err(error) => {
                     break Err(ExtractError::Crashed(with_stderr(
                         &format!("回应认不出：{error}"),
@@ -607,12 +616,18 @@ struct Reply {
 struct Failure {
     kind: String,
     message: String,
+    /// `cookies` 的原因（见驱动脚本的 `browser_cookies`）
+    reason: Option<String>,
 }
 
 impl Failure {
-    fn into_error(self) -> ExtractError {
+    /// `browser` 为请求里读 Cookie 的浏览器（`cookies` 的说明里写它的名字）。
+    fn into_error(self, browser: Option<Browser>) -> ExtractError {
         let message = self.message;
         match self.kind.as_str() {
+            "cookies" => {
+                ExtractError::Cookies(cookie_trouble(browser, self.reason.as_deref(), &message))
+            }
             "unsupported" => ExtractError::Unsupported(message),
             "geo" => ExtractError::Geo(message),
             "login" => ExtractError::Login(message),
@@ -625,6 +640,29 @@ impl Failure {
             _ => ExtractError::Other(message),
         }
     }
+}
+
+/// 从 `browser` 读 Cookie 没成的说明：原因 `reason`（见驱动脚本的 `browser_cookies`）与怎么办，后接 yt-dlp 的
+/// `detail`。
+fn cookie_trouble(browser: Option<Browser>, reason: Option<&str>, detail: &str) -> String {
+    let name = browser.map_or("浏览器", Browser::label);
+    let what = match reason {
+        Some("missing") => format!("没找到 {name} 的 Cookie：这台电脑上没装它，或没用它打开过网页"),
+        Some("denied") if browser == Some(Browser::Safari) => {
+            "读不了 Safari 的 Cookie：到「系统设置 → 隐私与安全性 → 完全磁盘访问权限」里打开 hs-dlx 后再试".to_owned()
+        }
+        Some("denied") => format!("系统不让读 {name} 的 Cookie"),
+        Some("encrypted") => format!(
+            "{name} 把 Cookie 加密成了只有它自己解得开的（Windows 上 Chrome 127 起），读不了：改用 Firefox 登录，在设置里选 Firefox"
+        ),
+        Some("locked") => format!("{name} 开着时它的 Cookie 文件被锁着：关掉 {name} 再试"),
+        Some("keychain") => format!(
+            "没拿到解开 {name} 的 Cookie 的钥匙：macOS 弹出钥匙串的授权时点「始终允许」后再试"
+        ),
+        Some("incomplete") => format!("{name} 的 Cookie 没读全"),
+        _ => format!("读不出 {name} 的 Cookie"),
+    };
+    format!("{what}（{detail}）")
 }
 
 /// `key` 写成驱动脚本 `key_of` 的样子。

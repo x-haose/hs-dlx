@@ -11,6 +11,8 @@ publish = false
 [dependencies]
 # 组件经核心下载，与任务共用代理、证书、重试与续传；PyPI 的接口经核心的 call 请求
 hs-m3u8-core.workspace = true
+# 找浏览器的数据目录（见 browser.rs）
+dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # 解开随应用带的 Python（tar 经 zstd 压缩）：纯 Rust 的解码器，不用编译 C 的 zstd

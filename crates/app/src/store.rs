@@ -644,9 +644,10 @@ fn rebuild_with_cloud(tx: &Transaction<'_>) -> Result<(), Error> {
 ///   （`web_path`）；有任务目录（各路各一个核心的任务目录在里面）。只属于网页视频的列在别的任务为 NULL。请求头只放
 ///   Cookie（解析与下载时带上）。
 /// - 失败的种类加 `web-login`、`web-geo`、`web-extract`、`web-gone`、`web-changed`、`web-denied`、`web-blocked`、
-///   `web-components`。其余约束不变，已有的行原样搬过来。
-/// - 设置加网页视频的 yt-dlp 渠道（`web_channel`：`stable`、`nightly`）与画质取向（`web_preference`：`compatible`、
-///   `quality`），没设过为稳定版、兼容优先。
+///   `web-cookies`、`web-components`。其余约束不变，已有的行原样搬过来。
+/// - 设置加网页视频的 yt-dlp 渠道（`web_channel`：`stable`、`nightly`）、画质取向（`web_preference`：`compatible`、
+///   `quality`）与读 Cookie 的浏览器（`web_browser`：yt-dlp 的浏览器名，NULL 为不读），没设过为稳定版、兼容优先、
+///   不读。
 fn rebuild_with_web(tx: &Transaction<'_>) -> Result<(), Error> {
     let counter = task_counter(tx)?;
     tx.execute_batch(
@@ -696,7 +697,7 @@ fn rebuild_with_web(tx: &Transaction<'_>) -> Result<(), Error> {
                                     'malformed', 'stalled', 'nothing-to-write', 'mp4-unsupported', 'unsupported',
                                     'unrecoverable', 'cloud-login', 'cloud-quota', 'cloud-failed', 'cloud-api',
                                     'integrity', 'web-login', 'web-geo', 'web-extract', 'web-gone',
-                                    'web-changed', 'web-denied', 'web-blocked', 'web-components',
+                                    'web-changed', 'web-denied', 'web-blocked', 'web-cookies', 'web-components',
                                     'other')
                      OR failure GLOB 'status:[0-9][0-9][0-9]')
             ),
@@ -751,7 +752,10 @@ fn rebuild_with_web(tx: &Transaction<'_>) -> Result<(), Error> {
         ALTER TABLE settings ADD COLUMN web_channel TEXT NOT NULL DEFAULT 'stable'
             CHECK (web_channel IN ('stable', 'nightly'));
         ALTER TABLE settings ADD COLUMN web_preference TEXT NOT NULL DEFAULT 'compatible'
-            CHECK (web_preference IN ('compatible', 'quality'));",
+            CHECK (web_preference IN ('compatible', 'quality'));
+        ALTER TABLE settings ADD COLUMN web_browser TEXT
+            CHECK (web_browser IN ('chrome', 'edge', 'firefox', 'safari', 'brave', 'chromium', 'opera', 'vivaldi',
+                                   'whale'));",
     )?;
     keep_task_counter(tx, counter)
 }
@@ -1963,6 +1967,7 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
         Option<String>,
         String,
         String,
+        Option<String>,
     );
     let (
         folder,
@@ -1976,9 +1981,10 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
         torrent_proxy,
         web_channel,
         web_preference,
+        web_browser,
     ): Columns = tx.query_row(
             "SELECT folder, proxy, theme, seed, seed_ratio_percent, seed_minutes, upload_limit, check_updates,
-                    torrent_proxy, web_channel, web_preference
+                    torrent_proxy, web_channel, web_preference, web_browser
              FROM settings WHERE id = 1",
             [],
             |row| {
@@ -1994,6 +2000,7 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
                     row.get(8)?,
                     row.get(9)?,
                     row.get(10)?,
+                    row.get(11)?,
                 ))
             },
         )?;
@@ -2048,7 +2055,25 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
             "quality" => crate::web::Preference::Quality,
             _ => return Err(Error::Corrupt("设置里的画质取向".to_owned())),
         },
+        web_browser: web_browser
+            .map(|code| {
+                hs_dlx_ytdlp::Browser::from_code(&code)
+                    .ok_or_else(|| Error::Corrupt("设置里读 Cookie 的浏览器".to_owned()))
+            })
+            .transpose()?,
     })
+}
+
+/// 记下解析网页视频时从哪个浏览器读 Cookie（None 为不读）。
+pub fn set_web_browser(
+    tx: &Transaction<'_>,
+    browser: Option<hs_dlx_ytdlp::Browser>,
+) -> Result<(), Error> {
+    tx.execute(
+        "UPDATE settings SET web_browser = ?1 WHERE id = 1",
+        [browser.map(hs_dlx_ytdlp::Browser::code)],
+    )?;
+    Ok(())
 }
 
 /// 记下网页视频的 yt-dlp 渠道。
@@ -3115,6 +3140,7 @@ mod tests {
             FailureKind::WebChanged,
             FailureKind::WebDenied,
             FailureKind::WebBlocked,
+            FailureKind::WebCookies,
             FailureKind::WebComponents,
         ] {
             let failure = Failure {

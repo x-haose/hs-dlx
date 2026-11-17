@@ -212,6 +212,10 @@ pub fn failure(kind: FailureKind) -> (String, &'static str) {
              走代理时也可以换个代理节点",
         ),
         FailureKind::WebGeo => ("地区".into(), "网站按地区限制：换个代理出口后继续"),
+        FailureKind::WebCookies => (
+            "Cookie".into(),
+            "设置里选的浏览器的登录信息没读出来，原因见错误信息：照它处理，或在设置的「网页视频」里换个浏览器后继续",
+        ),
         FailureKind::WebBlocked => (
             "拦截".into(),
             "网站拦下了请求：走代理时多为出口 IP 被风控（国内网站常拦境外出口），在设置里改直连或换个代理节点；直连时多为要\

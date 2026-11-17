@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hs_dlx_ytdlp::{
-    Bundle, Channel, Components, ExtractError, Extractor, Info, InstallProgress, Request, Sources,
-    Stage,
+    Browser, Bundle, Channel, Components, ExtractError, Extractor, Info, InstallProgress, Request,
+    Sources, Stage,
 };
 use hs_m3u8_core::{CancellationToken, Engine, Url};
 use tokio::sync::watch;
@@ -196,6 +196,16 @@ impl Service {
     }
 
     /// 记下网页视频的画质取向：之后的解析照它挑画质选项。
+    /// 记下解析时从哪个浏览器读 Cookie（None 为不读）：之后的解析与任务开始、继续照它。
+    pub fn set_web_browser(&self, browser: Option<Browser>) -> Result<(), Error> {
+        self.shared.write(|tx| store::set_web_browser(tx, browser))
+    }
+
+    /// 这台机器上有数据目录的浏览器（见 [`Browser::installed`]）。
+    pub fn web_browsers(&self) -> Vec<Browser> {
+        Browser::installed()
+    }
+
     pub fn set_web_preference(&self, preference: Preference) -> Result<(), Error> {
         self.shared
             .write(|tx| store::set_web_preference(tx, preference))
@@ -506,6 +516,7 @@ impl Service {
             cookies: super::web_task::cookies(&url, headers),
             url,
             generic: false,
+            browser: settings.web_browser,
         };
         let shared = self.shared.clone();
         Ok(AbortOnDropHandle::new(self.runtime().spawn(async move {

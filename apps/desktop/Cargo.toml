@@ -22,6 +22,7 @@ hs-dlx-webview = { path = "../../crates/webview" }
 hs-dlx-scene = { path = "../../crates/scene" }
 # 背景的每一帧交给 GPUI 时用它的帧类型；与 gpui-pre 用的同一版，不另编一份
 image = { version = "0.25.10", default-features = false }
+percent-encoding.workspace = true
 psl.workspace = true
 serde.workspace = true
 serde_json.workspace = true

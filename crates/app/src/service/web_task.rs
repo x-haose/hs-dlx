@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hs_dlx_ytdlp::{
-    Cookie, ExtractError, Extractor, Format, FormatKey, Info, Protocol, Request, Track,
+    Browser, Cookie, ExtractError, Extractor, Format, FormatKey, Info, Protocol, Request, Track,
 };
 use hs_m3u8_core::remux::{FileInput, Streams, WriteProgress};
 use hs_m3u8_core::{
@@ -174,11 +174,13 @@ struct Position {
 }
 
 impl Shared {
-    /// 开始网页视频任务 `task`（经代理 `proxy`）；解析组件没装好时报 [`crate::Error::WebNotReady`]。调用方须在运行时里。
+    /// 开始网页视频任务 `task`（经代理 `proxy`，解析时另从 `browser` 读 Cookie）；解析组件没装好时报
+    /// [`crate::Error::WebNotReady`]。调用方须在运行时里。
     pub(super) fn launch_web(
         self: &Arc<Self>,
         task: &Task,
         proxy: Proxy,
+        browser: Option<Browser>,
     ) -> Result<WebRun, crate::Error> {
         let extractor = lock(&self.web.extractor)
             .clone()
@@ -189,7 +191,7 @@ impl Shared {
         let done = tokio::spawn(async move {
             let leftovers = Mutex::new(Vec::new());
             let outcome = match shared
-                .run_web(&task, &extractor, &proxy, &token, &leftovers)
+                .run_web(&task, &extractor, &proxy, browser, &token, &leftovers)
                 .await
             {
                 Ok(finished) => Outcome::Finished(finished),
@@ -213,6 +215,7 @@ impl Shared {
         task: &Task,
         extractor: &Extractor,
         proxy: &Proxy,
+        browser: Option<Browser>,
         cancel: &CancellationToken,
         leftovers: &Mutex<Vec<Leftover>>,
     ) -> Result<Finished, Stop> {
@@ -254,6 +257,7 @@ impl Shared {
             url: task.spec.url.clone(),
             cookies: cookies(&task.spec.url, &task.spec.headers),
             generic: true,
+            browser,
         };
         // 系统代理按网页地址定下一个，解析与下载都走它：直链与出口绑定，而格式地址的主机可能在系统代理的例外里
         let proxy = match proxy {

@@ -100,6 +100,9 @@ pub enum FailureKind {
     /// 网页视频：解析时网站拦下了这个出口（网页或接口回 403、412：多为出口 IP 被风控，如 B 站对境外代理）。换直连或
     /// 别的出口、登录后再继续
     WebBlocked,
+    /// 网页视频：设置里选的浏览器的 Cookie 没读出或没读全（没装、系统不让读、钥匙串没给钥匙、Windows 上加密了等），还没
+    /// 向网站发请求。照说明处理或改选浏览器后再继续
+    WebCookies,
     /// 网页视频：解析组件没装好或坏了，重新安装后再继续
     WebComponents,
     /// 其余（任务目录正被别的任务或没做完的放弃占着、本机建不出 HTTP 客户端、不经暂停的取消）
@@ -209,6 +212,7 @@ impl FailureKind {
             ExtractError::Changed(_) => FailureKind::WebChanged,
             ExtractError::RateLimited(_) => FailureKind::Status(429),
             ExtractError::Blocked(_) => FailureKind::WebBlocked,
+            ExtractError::Cookies(_) => FailureKind::WebCookies,
             ExtractError::Network(_) | ExtractError::TimedOut(_) => FailureKind::Network,
             ExtractError::Broken(_) => FailureKind::WebComponents,
             ExtractError::Disk(_) => FailureKind::Disk,
@@ -281,6 +285,7 @@ impl FailureKind {
             | FailureKind::WebChanged
             | FailureKind::WebDenied
             | FailureKind::WebBlocked
+            | FailureKind::WebCookies
             | FailureKind::Other => true,
             FailureKind::WebGone
             | FailureKind::CloudApi
@@ -311,6 +316,7 @@ impl FailureKind {
             | FailureKind::WebBlocked
             | FailureKind::Other => true,
             FailureKind::Certificate
+            | FailureKind::WebCookies
             | FailureKind::WebGeo
             | FailureKind::WebExtract
             | FailureKind::WebGone
@@ -369,6 +375,7 @@ impl FailureKind {
             FailureKind::WebChanged => "web-changed".into(),
             FailureKind::WebDenied => "web-denied".into(),
             FailureKind::WebBlocked => "web-blocked".into(),
+            FailureKind::WebCookies => "web-cookies".into(),
             FailureKind::WebComponents => "web-components".into(),
             FailureKind::Other => "other".into(),
         }
@@ -401,6 +408,7 @@ impl FailureKind {
             "web-changed" => FailureKind::WebChanged,
             "web-denied" => FailureKind::WebDenied,
             "web-blocked" => FailureKind::WebBlocked,
+            "web-cookies" => FailureKind::WebCookies,
             "web-components" => FailureKind::WebComponents,
             "other" => FailureKind::Other,
             _ => FailureKind::Status(code.strip_prefix("status:")?.parse().ok()?),
@@ -438,6 +446,7 @@ pub(crate) fn every() -> Vec<FailureKind> {
         FailureKind::WebChanged,
         FailureKind::WebDenied,
         FailureKind::WebBlocked,
+        FailureKind::WebCookies,
         FailureKind::WebComponents,
         FailureKind::Other,
     ];
@@ -468,6 +477,7 @@ pub(crate) fn every() -> Vec<FailureKind> {
             | FailureKind::WebChanged
             | FailureKind::WebDenied
             | FailureKind::WebBlocked
+            | FailureKind::WebCookies
             | FailureKind::WebComponents
             | FailureKind::Other => {}
         }

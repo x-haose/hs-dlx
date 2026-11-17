@@ -656,6 +656,20 @@ impl Service {
         Ok(())
     }
 
+    /// 认出 `host:port` 上的代理（见 [`crate::ProxyProtocol`]），返回存进设置的地址；不存。返回的句柄在任何执行器上都
+    /// 可等待，释放它即取消。最多十几秒（HTTP 代理要先连上外面的地址才回）。
+    pub fn identify_proxy(
+        &self,
+        host: String,
+        port: u16,
+        login: Option<crate::ProxyLogin>,
+        wanted: crate::ProxyWanted,
+    ) -> AbortOnDropHandle<Result<Url, crate::ProxyProbeError>> {
+        AbortOnDropHandle::new(self.runtime().spawn(async move {
+            crate::proxy_probe::identify(&host, port, login.as_ref(), wanted).await
+        }))
+    }
+
     /// 记下要不要自动检查更新。
     pub fn set_check_updates(&self, check: bool) -> Result<(), Error> {
         self.shared.write(|tx| store::set_check_updates(tx, check))
@@ -1979,8 +1993,8 @@ impl Shared {
                 Launched::Cloud(self.launch_cloud(tx, task, proxy)?)
             }
             Kind::Web(_) => {
-                let proxy = store::settings(tx)?.proxy;
-                Launched::Web(self.launch_web(task, proxy)?)
+                let settings = store::settings(tx)?;
+                Launched::Web(self.launch_web(task, settings.proxy, settings.web_browser)?)
             }
         })
     }

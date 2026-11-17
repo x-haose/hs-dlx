@@ -1,6 +1,5 @@
 //! 「下载」一组：新建任务默认保存到哪、请求经哪个代理。
 
-use gpui_kit::component::input::Input;
 use gpui_kit::{Context, Div, ParentElement as _, PathPromptOptions, Styled as _, div, px};
 use hs_m3u8_core::{Proxy, Url};
 
@@ -9,11 +8,8 @@ use crate::route::Route;
 use crate::ui::{self, Tone};
 use crate::web_route::WebRoute;
 
-/// 指定代理时输入框里的示例。
-pub(super) const PROXY_EXAMPLE: &str = "socks5://127.0.0.1:1080";
-
 impl SettingsView {
-    /// 选了一种方式：跟随系统、直连即存，存进了才选中；指定代理要填了地址再存。
+    /// 选了一种方式：跟随系统、直连即存，存进了才选中；指定代理要填了端口、核对过再存。
     fn pick(&mut self, mode: Mode, cx: &mut Context<Self>) {
         self.proxy_error = None;
         match mode {
@@ -24,13 +20,9 @@ impl SettingsView {
         cx.notify();
     }
 
-    /// 存输入框里的代理地址。
-    pub(super) fn save_custom(&mut self, cx: &mut Context<Self>) {
-        let text = self.address.read(cx).value().trim().to_owned();
-        match Url::parse(&text) {
-            Ok(url) => self.save(Proxy::Url(url), cx),
-            Err(_) => self.proxy_error = Some(format!("不是代理地址，应形如 {PROXY_EXAMPLE}")),
-        }
+    /// 存核对过的代理地址 `url`。
+    pub(super) fn save_custom(&mut self, url: Url, cx: &mut Context<Self>) {
+        self.save(Proxy::Url(url), cx);
         cx.notify();
     }
 
@@ -82,17 +74,14 @@ impl SettingsView {
 
     pub(super) fn render_proxy(&self, cx: &mut Context<Self>) -> Div {
         // 选了指定代理、还没存进地址，或改了地址还没保存：写明此刻照旧按什么走
-        let typed = self.address.read(cx).value().trim().to_owned();
+        let edited = self.address.read(cx).edited();
         let unsaved = match (self.mode, &self.proxy) {
             (Mode::Custom, Proxy::System) => Some("保存之前照旧跟随系统".to_owned()),
             (Mode::Custom, Proxy::Direct) => Some("保存之前照旧直连".to_owned()),
-            // 按解析后的比，写法不同而地址相同（如末尾的斜杠）不算改了
-            (Mode::Custom, Proxy::Url(url)) if Url::parse(&typed).ok().as_ref() != Some(url) => {
-                Some(format!(
-                    "改的地址还没保存，照旧经 {}",
-                    hs_m3u8_core::bare_url(url)
-                ))
-            }
+            (Mode::Custom, Proxy::Url(url)) if edited => Some(format!(
+                "改的还没保存，照旧经 {}",
+                hs_m3u8_core::bare_url(url)
+            )),
             _ => None,
         };
         let chip = |id: &'static str, label: &'static str, mode: Mode, cx: &mut Context<Self>| {
@@ -116,27 +105,7 @@ impl SettingsView {
                     .flex()
                     .flex_col()
                     .gap(px(8.))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .child(
-                                ui::input_frame()
-                                    .flex_1()
-                                    .px(px(6.))
-                                    .child(Input::new(&self.address).appearance(false)),
-                            )
-                            .child(ui::button(
-                                "save-proxy",
-                                "保存",
-                                Tone::Glow,
-                                cx.listener(|this, _, _, cx| this.save_custom(cx)),
-                            )),
-                    )
-                    .child(ui::caption(
-                        "http、https、socks4、socks4a、socks5 或 socks5h 开头，可带用户名与密码",
-                    ))
+                    .child(self.address.clone())
                     .children(unsaved.map(ui::caption)),
             ),
         };

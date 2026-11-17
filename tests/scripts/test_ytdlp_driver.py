@@ -11,7 +11,7 @@ import sys
 import threading
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import pytest
 
@@ -20,6 +20,15 @@ import driver
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
     from types import ModuleType
+
+
+class Warns(Protocol):
+    """yt-dlp 读浏览器 Cookie 时给的日志里用到的部分。"""
+
+    def warning(self, message: str, *, only_once: bool = False) -> None:
+        """记一条警告。"""
+        ...
+
 
 # yt-dlp 装在开发环境的 site-packages 里：驱动脚本按目录导入
 SITE = str(Path(importlib.import_module("yt_dlp").__file__ or "").parent.parent)
@@ -142,6 +151,32 @@ def test_an_unexpected_error_is_answered_and_the_next_request_still_runs(
     assert error["kind"] == "other"
     assert "TypeError" in str(error["message"])
     assert "ok" in replies[1]
+
+
+def test_cookies_the_browser_cannot_give_fail_before_the_page_is_asked(
+    site: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 这台机器上（HOME 指到空目录）没有 Firefox 的 Cookie：说没找到
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    request = {"id": REQUEST_ID, "url": f"{site}/video.html", "proxy": "", "browser": "firefox", "generic": True}
+    [reply] = serve([request], tmp_path)
+    error = driver.mapping(reply["error"]) or {}
+    assert (error["kind"], error["reason"]) == ("cookies", "missing")
+
+    # 读出来了但有的解不开（macOS 钥匙串没给钥匙时 yt-dlp 只警告、跳过）：没读全不算读到
+    cookies = importlib.import_module("yt_dlp.cookies")
+
+    def keyless(_browser: str, _profile: str | None, logger: Warns, **_options: object) -> object:
+        logger.warning("cannot decrypt v10 cookies: no key found", only_once=True)
+        return cookies.YoutubeDLCookieJar()
+
+    monkeypatch.setattr(cookies, "extract_cookies_from_browser", keyless)
+    [reply] = serve([{**request, "browser": "chrome"}], tmp_path)
+    error = driver.mapping(reply["error"]) or {}
+    assert (error["kind"], error["reason"]) == ("cookies", "keychain")
+    assert "no key found" in str(error["message"])
 
 
 def test_lone_surrogates_and_nan_still_make_valid_json() -> None:

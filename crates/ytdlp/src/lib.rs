@@ -3,6 +3,7 @@
 //! 任务、存储与界面。
 
 mod archive;
+mod browser;
 mod bundle;
 mod components;
 mod extractor;
@@ -10,6 +11,7 @@ mod info;
 
 use std::path::Path;
 
+pub use crate::browser::Browser;
 pub use crate::bundle::{Bundle, Bundled};
 pub use crate::components::{Channel, Components, InstallProgress, Installed, Sources, Stage};
 pub use crate::extractor::{Cookie, ExtractError, Extractor, Request, WORKERS};

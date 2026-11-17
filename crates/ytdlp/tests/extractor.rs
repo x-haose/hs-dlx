@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use axum::response::{Html, IntoResponse as _, Response};
 use axum::routing::get;
-use hs_dlx_ytdlp::{Cookie, ExtractError, Extractor, Installed, Protocol, Request, Track};
+use hs_dlx_ytdlp::{Browser, Cookie, ExtractError, Extractor, Installed, Protocol, Request, Track};
 use hs_m3u8_core::{CancellationToken, Proxy, Url};
 use tokio::sync::Notify;
 
@@ -92,6 +92,7 @@ fn request(base: &Url, path: &str) -> Request {
         url: base.join(path).unwrap(),
         cookies: Vec::new(),
         generic: true,
+        browser: None,
     }
 }
 
@@ -143,6 +144,7 @@ async fn only_the_generic_extractor_knowing_a_url_is_unsupported_unless_asked() 
                 url,
                 cookies: Vec::new(),
                 generic: false,
+                browser: None,
             },
             &Proxy::Direct,
             &CancellationToken::new(),
@@ -150,6 +152,76 @@ async fn only_the_generic_extractor_knowing_a_url_is_unsupported_unless_asked() 
         .await
         .unwrap_err();
     assert!(matches!(error, ExtractError::Unsupported(_)), "{error}");
+}
+
+/// 找浏览器的数据目录与开发环境里的 yt-dlp 找 Cookie 的地方一致：yt-dlp 升级后改了位置时这里报出。
+#[test]
+fn browser_data_dirs_follow_yt_dlp() {
+    let (installed, _cache) = installed("browser-dirs");
+    let script = "\
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from yt_dlp import cookies
+dirs = {name: [cookies._get_chromium_based_browser_settings(name)['browser_dir']]
+        for name in cookies.CHROMIUM_BASED_BROWSERS}
+dirs['firefox'] = list(cookies._firefox_browser_dirs())
+print(json.dumps(dirs))
+";
+    let out = std::process::Command::new(&installed.python)
+        .arg("-I")
+        .arg("-c")
+        .arg(script)
+        .arg(&installed.site)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let expected: std::collections::HashMap<String, Vec<PathBuf>> =
+        serde_json::from_slice(&out.stdout).unwrap();
+    for browser in Browser::ALL {
+        let ours = browser.data_dirs();
+        match expected.get(browser.code()) {
+            Some(theirs) => assert_eq!(&ours, theirs, "{}", browser.label()),
+            None => assert_eq!(browser, Browser::Safari),
+        }
+    }
+    assert_eq!(
+        expected.len(),
+        Browser::ALL.len() - 1,
+        "yt-dlp 认的浏览器变了"
+    );
+}
+
+/// 要从浏览器读 Cookie 而读不出：不向网站发请求，报读 Cookie 失败，说明里写浏览器的名字与原因。用 Whale：这台机器
+/// 与 CI 上都没有它的数据目录，不读任何真的浏览器数据。
+#[tokio::test(flavor = "multi_thread")]
+async fn cookies_a_browser_cannot_give_fail_before_any_request() {
+    let (installed, cache) = installed("cookies");
+    let extractor = Extractor::new(installed, cache, Duration::from_secs(60));
+    // 没有服务器：要是发了请求会报网络错误
+    let url = Url::parse("http://127.0.0.1:9/video").unwrap();
+    let error = extractor
+        .extract(
+            &Request {
+                url,
+                cookies: Vec::new(),
+                generic: true,
+                browser: Some(Browser::Whale),
+            },
+            &Proxy::Direct,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    match error {
+        ExtractError::Cookies(message) => {
+            assert!(message.starts_with("没找到 Whale 的 Cookie"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 /// 超时测试的时限（秒）：要比起进程、导入 yt-dlp 再发出请求（测试并行、机器忙时几秒）长，超时才落在挂着的请求上。

@@ -8,6 +8,7 @@ mod failure;
 mod naming;
 mod netcheck;
 mod preference;
+mod proxy_probe;
 mod public_trackers;
 mod service;
 mod settings;
@@ -28,6 +29,7 @@ pub use hs_dlx_ytdlp as ytdlp;
 pub use naming::{file_name, task_title, title_of};
 pub use netcheck::{NetCheck, NetItem, NetworkReport};
 pub use preference::StoredPreference;
+pub use proxy_probe::{ProxyLogin, ProxyProbeError, ProxyProtocol, ProxyWanted};
 pub use service::{
     CloudPhase, CloudProgress, Downloaded, Event, Events, MetadataFetch, MetadataHandle,
     PikPakLogin, Resolved, Service, UpdateDownload, WebConfig, WebProgress, WebState,

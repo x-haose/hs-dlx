@@ -1,9 +1,9 @@
-//! 「网页视频」一组：yt-dlp 的组件（安装、版本与更新）、更新走的渠道、画质的取向。
+//! 「网页视频」一组：yt-dlp 的组件（安装、版本与更新）、更新走的渠道、画质的取向、从哪个浏览器读登录信息。
 
 use gpui_kit::{Context, Div, ParentElement as _, Styled as _, Task, div, px};
 use hs_dlx_app::WebState;
 use hs_dlx_app::web::Preference;
-use hs_dlx_app::ytdlp::Channel;
+use hs_dlx_app::ytdlp::{Browser, Channel};
 
 use super::{SettingsView, row};
 use crate::format;
@@ -15,6 +15,10 @@ pub(super) struct WebSettings {
     pub state: WebState,
     pub channel: Channel,
     pub preference: Preference,
+    /// 解析时从这个浏览器读 Cookie；None 为不读
+    pub browser: Option<Browser>,
+    /// 这台机器上有的浏览器（打开设置页时找）
+    pub browsers: Vec<Browser>,
     /// 查到的：有新版时为它，已是最新为 None；没查过时整个为 None，没查成为原因
     pub latest: Option<Result<Option<String>, String>>,
     /// 在查新版：释放即取消
@@ -254,6 +258,59 @@ impl SettingsView {
                 .child(ui::caption(
                     "稳定版约每月一版；网站改版后的修复先到每日构建",
                 )),
+        )
+    }
+
+    fn pick_browser(&mut self, browser: Option<Browser>, cx: &mut Context<Self>) {
+        match self.tasks.read(cx).service().set_web_browser(browser) {
+            Ok(()) => {
+                self.web.browser = browser;
+                self.web.error = None;
+            }
+            Err(error) => self.web.error = Some(error.to_string()),
+        }
+        cx.notify();
+    }
+
+    /// 登录信息一行：不读，或这台机器上有的浏览器之一（存着的不在其中时也列出）。
+    pub(super) fn render_web_browser(&self, cx: &mut Context<Self>) -> Div {
+        let mut choices: Vec<Option<Browser>> = vec![None];
+        choices.extend(self.web.browsers.iter().copied().map(Some));
+        if let Some(saved) = self.web.browser
+            && !self.web.browsers.contains(&saved)
+        {
+            choices.push(Some(saved));
+        }
+        let chips = choices.into_iter().map(|choice| {
+            let (id, label) = match choice {
+                None => ("web-browser-none".to_owned(), "不读"),
+                Some(browser) => (format!("web-browser-{}", browser.code()), browser.label()),
+            };
+            ui::chip(
+                id,
+                label,
+                self.web.browser == choice,
+                cx.listener(move |this, _, _, cx| this.pick_browser(choice, cx)),
+            )
+        });
+        let platform = if cfg!(target_os = "macos") {
+            "Chrome、Edge 等第一次读时系统弹钥匙串的授权，点「始终允许」；Safari 要在「系统设置 → 隐私与安全性 → 完全磁盘访问权限」里打开 hs-dlx"
+        } else if cfg!(windows) {
+            "Windows 上 Chrome、Edge 等把 Cookie 加密成了只有它们自己解得开的，读得了的是 Firefox"
+        } else {
+            "Chrome 等的 Cookie 用系统的密钥环解开"
+        };
+        row(
+            "登录信息",
+            Some(
+                "解析时从这个浏览器读你登录后的 Cookie，每次现读；用账号下载 YouTube 可能被暂时或永久封号",
+            ),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .child(div().flex().flex_wrap().gap(px(8.)).children(chips))
+                .child(ui::caption(platform)),
         )
     }
 

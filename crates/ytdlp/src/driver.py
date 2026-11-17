@@ -37,7 +37,7 @@ import traceback
 from typing import TYPE_CHECKING, Any, Protocol, TextIO, cast
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sized
     from types import ModuleType
 
 # yt-dlp 的解析结果：任意结构的 JSON 式字典
@@ -75,6 +75,15 @@ class CookieJar(Protocol):
 
     def get_cookie_header(self, url: str) -> str | None:
         """发往 `url` 的请求该带的 Cookie 请求头；没有时为 None。"""
+        ...
+
+
+class WithCookies(Protocol):
+    """YoutubeDL 里用到 Cookie 罐的部分。"""
+
+    @property
+    def cookiejar(self) -> Sized:
+        """Cookie 罐：第一次取时读 Cookie（含从浏览器读），读不出时抛 yt-dlp 的错误。"""
         ...
 
 
@@ -301,13 +310,15 @@ def said(message: str) -> str:
 
 
 def params(request: Mapping[str, object], quickjs: str, cache: str, logger: Logger) -> Info:
-    """一次解析或下载给 YoutubeDL 的参数，代理（空串为直连）与 Cookie 取自 `request`。
+    """一次解析或下载给 YoutubeDL 的参数，代理（空串为直连）、Cookie 与读 Cookie 的浏览器取自 `request`。
 
     只解析不下载；播放列表只列条目（至多 `PLAYLIST_LIMIT` 条），带视频的播放列表网址取视频；格式全要（应用自己从
     `formats` 里选）；视频没有格式时照网站说的原因抛出（yt-dlp 的默认，`classify` 按原因归类）；代理只照应用给的；
-    Cookie 只在内存里；QuickJS-NG 解 YouTube 的 JavaScript 挑战；缓存放在应用的目录；不查自己是不是太旧。
+    Cookie 只在内存里；`browser`（yt-dlp 的浏览器名）为 Some 时另从它读 Cookie，与给的合并；QuickJS-NG 解 YouTube 的
+    JavaScript 挑战；缓存放在应用的目录；不查自己是不是太旧。
     """
     cookies = text(request.get("cookies"))
+    browser = text(request.get("browser"))
     return {
         "quiet": True,
         "logger": logger,
@@ -318,10 +329,58 @@ def params(request: Mapping[str, object], quickjs: str, cache: str, logger: Logg
         "proxy": text(request.get("proxy")) or "",
         "socket_timeout": SOCKET_TIMEOUT,
         "cookiefile": io.StringIO(cookies) if cookies is not None else None,
+        "cookiesfrombrowser": (browser,) if browser else None,
         "js_runtimes": {"quickjs": {"path": quickjs}},
         "cachedir": cache,
         "warn_when_outdated": False,
     }
+
+
+def browser_cookies(yt_dlp: ModuleType, ydl: WithCookies, browser: str | None, logger: Logger) -> Info | None:
+    """`ydl` 要从浏览器读 Cookie 时先读：读不出或读时有警告时为归了类的失败，否则为 None。
+
+    yt-dlp 读一次后留着。读时的警告（钥匙串没给钥匙、有的解不开等）说明没读全，算失败，`reason` 写原因。
+
+    原因：`missing`（没找到这个浏览器的 Cookie 文件）、`denied`（系统不让读，macOS 上 Safari 要完全磁盘访问权限）、
+    `encrypted`（Windows 上的 Chrome 等加密成了只有它自己解得开的，DPAPI 解不开）、`locked`（浏览器开着、Windows 上
+    文件被锁）、`keychain`（macOS 钥匙串没给解开的钥匙）、`incomplete`（其余读时的警告）、`other`。
+    """
+    if not browser:
+        return None
+    before = len(logger.warnings)
+    try:
+        # 第一次取 cookiejar 时读，读出的留在上面，解析与下载都用它
+        len(ydl.cookiejar)
+    except yt_dlp.utils.YoutubeDLError as error:
+        return {"error": {"kind": "cookies", **cookie_failure(error)}}
+    warned = logger.warnings[before:]
+    if not warned:
+        return None
+    reason = "keychain" if any("no key found" in warning for warning in warned) else "incomplete"
+    return {"error": {"kind": "cookies", "reason": reason, "message": clean("；".join(warned))}}
+
+
+def cookie_failure(error: BaseException) -> dict[str, str]:
+    """读浏览器的 Cookie 抛出的失败的原因与说明。
+
+    yt-dlp 把读时抛的（找不到文件、没有权限、它自己报的 DownloadError）包成 CookieLoadError（原来的在
+    `__context__`），报错时再包成 DownloadError（CookieLoadError 在 `exc_info`）。
+    """
+    cause = unwrapped(error)
+    if "CookieLoadError" in lineage(cause) and cause.__context__ is not None:
+        cause = cause.__context__
+    message = clean(f"{type(cause).__name__}：{cause}")
+    if isinstance(cause, FileNotFoundError):
+        reason = "missing"
+    elif "DPAPI" in str(cause):
+        reason = "encrypted"
+    elif "Could not copy" in str(cause):
+        reason = "locked"
+    elif isinstance(cause, PermissionError):
+        reason = "denied"
+    else:
+        reason = "other"
+    return {"reason": reason, "message": message}
 
 
 def matched(url: str) -> str:
@@ -341,6 +400,9 @@ def extract(yt_dlp: ModuleType, request: Mapping[str, object], quickjs: str, cac
     logger = Logger()
     options = params(request, quickjs, cache, logger)
     with yt_dlp.YoutubeDL(options) as ydl:
+        failed = browser_cookies(yt_dlp, ydl, text(request.get("browser")), logger)
+        if failed is not None:
+            return failed
         try:
             info = ydl.extract_info(url, download=False)
         except yt_dlp.utils.YoutubeDLError as error:
@@ -489,6 +551,9 @@ def download(yt_dlp: ModuleType, request: Mapping[str, object], quickjs: str, ca
 
     options["format"] = select
     with yt_dlp.YoutubeDL(options) as ydl:
+        failed = browser_cookies(yt_dlp, ydl, text(request.get("browser")), logger)
+        if failed is not None:
+            return failed
         try:
             ydl.extract_info(text(request.get("url")) or "", download=True)
         except yt_dlp.utils.YoutubeDLError as error:
