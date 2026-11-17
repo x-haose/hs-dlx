@@ -1,5 +1,6 @@
-//! 任务失败的种类：把核心的错误翻译成界面要分开处理的几类，随失败的状态存进存储。
+//! 任务失败的种类：把核心的错误与网页视频的解析错误翻译成界面要分开处理的几类，随失败的状态存进存储。
 
+use hs_dlx_ytdlp::ExtractError;
 use hs_m3u8_core::remux::Error as RemuxError;
 use hs_m3u8_core::{
     Error as CoreError, FetchFailure, HttpErrorKind, RefreshReason, StallReason, Unsupported,
@@ -19,6 +20,14 @@ impl Failure {
     pub fn of(error: &CoreError) -> Failure {
         Failure {
             kind: FailureKind::of(error),
+            message: error.to_string(),
+        }
+    }
+
+    /// 网页视频解析（或交回 yt-dlp 下载）报的错误。
+    pub fn of_extract(error: &ExtractError) -> Failure {
+        Failure {
+            kind: FailureKind::of_extract(error),
             message: error.to_string(),
         }
     }
@@ -80,8 +89,11 @@ pub enum FailureKind {
     WebGeo,
     /// 网页视频：网页解析不了，多为网站改版了、yt-dlp 要更新，更新后再继续
     WebExtract,
-    /// 网页视频：网站说视频不可用了（删了、转为私密等），或选中的画质已经没有了：只能放弃或另建
+    /// 网页视频：网站说视频不可用了（删了、转为私密等），或网页现在是另一个视频：只能放弃或另建
     WebGone,
+    /// 网页视频：网站这次给的格式里认不出选中的画质（没了、编号移位、内容重新编码过）。网站有时少给一些格式，再试可能
+    /// 就有；一直认不出只能放弃后重新新建
+    WebChanged,
     /// 网页视频：解析组件没装好或坏了，重新安装后再继续
     WebComponents,
     /// 其余（任务目录正被别的任务或没做完的放弃占着、本机建不出 HTTP 客户端、不经暂停的取消）
@@ -182,6 +194,25 @@ impl FailureKind {
         }
     }
 
+    /// 网页视频解析（或交回 yt-dlp 下载）报的错误。取消算其余：任务里的取消即暂停，由调用方先分出去。
+    pub fn of_extract(error: &ExtractError) -> FailureKind {
+        match error {
+            ExtractError::Login(_) => FailureKind::WebLogin,
+            ExtractError::Geo(_) => FailureKind::WebGeo,
+            ExtractError::Unavailable(_) => FailureKind::WebGone,
+            ExtractError::Changed(_) => FailureKind::WebChanged,
+            ExtractError::RateLimited(_) => FailureKind::Status(429),
+            ExtractError::Network(_) | ExtractError::TimedOut(_) => FailureKind::Network,
+            ExtractError::Broken(_) => FailureKind::WebComponents,
+            ExtractError::Disk(_) => FailureKind::Disk,
+            // 解析器认不出了、yt-dlp 内部出错：多为网站改版，要更新 yt-dlp
+            ExtractError::Unsupported(_) | ExtractError::Other(_) | ExtractError::Crashed(_) => {
+                FailureKind::WebExtract
+            }
+            ExtractError::Proxy(_) | ExtractError::Cancelled => FailureKind::Other,
+        }
+    }
+
     /// 合并（写 MP4、核对能否合并）时的错误。
     fn of_remux(error: &RemuxError) -> FailureKind {
         match error {
@@ -219,7 +250,7 @@ impl FailureKind {
 
     /// 用户处理了外面的情况（网络恢复、腾出空间、挪走挡路的文件、重新登录网盘、等网盘额度恢复）后再试，有没有可能
     /// 成功；不需要处理什么的暂时性故障（408、429、5xx、超时、停滞、云端下载失败、校验不符）同样算，网页视频的要登录、
-    /// 地区限制、解析失败、组件坏了（登录、换代理、更新或重装组件之后）也算。证书、内容不对、来源变了、放不进 MP4、没有
+    /// 地区限制、解析失败、组件坏了（登录、换代理、更新或重装组件之后）与认不出选中的画质（网站有时少给）也算。证书、内容不对、来源变了、放不进 MP4、没有
     /// 可写出的、不支持、网盘接口变了、网页视频没了与其余再试也一样的不算：它们要改请求头、换输出、改为续录、升级应用，
     /// 或只能放弃。核心的 `Error::retryable` 只说「什么都不改」时，这里多算了要用户先处理的。
     pub fn retry_helps(self) -> bool {
@@ -237,6 +268,7 @@ impl FailureKind {
             | FailureKind::WebGeo
             | FailureKind::WebExtract
             | FailureKind::WebComponents
+            | FailureKind::WebChanged
             | FailureKind::Other => true,
             FailureKind::WebGone
             | FailureKind::CloudApi
@@ -268,6 +300,7 @@ impl FailureKind {
             | FailureKind::WebGeo
             | FailureKind::WebExtract
             | FailureKind::WebGone
+            | FailureKind::WebChanged
             | FailureKind::WebComponents
             | FailureKind::CloudLogin
             | FailureKind::CloudQuota
@@ -319,6 +352,7 @@ impl FailureKind {
             FailureKind::WebGeo => "web-geo".into(),
             FailureKind::WebExtract => "web-extract".into(),
             FailureKind::WebGone => "web-gone".into(),
+            FailureKind::WebChanged => "web-changed".into(),
             FailureKind::WebComponents => "web-components".into(),
             FailureKind::Other => "other".into(),
         }
@@ -348,6 +382,7 @@ impl FailureKind {
             "web-geo" => FailureKind::WebGeo,
             "web-extract" => FailureKind::WebExtract,
             "web-gone" => FailureKind::WebGone,
+            "web-changed" => FailureKind::WebChanged,
             "web-components" => FailureKind::WebComponents,
             "other" => FailureKind::Other,
             _ => FailureKind::Status(code.strip_prefix("status:")?.parse().ok()?),
@@ -382,6 +417,7 @@ pub(crate) fn every() -> Vec<FailureKind> {
         FailureKind::WebGeo,
         FailureKind::WebExtract,
         FailureKind::WebGone,
+        FailureKind::WebChanged,
         FailureKind::WebComponents,
         FailureKind::Other,
     ];
@@ -409,6 +445,7 @@ pub(crate) fn every() -> Vec<FailureKind> {
             | FailureKind::WebGeo
             | FailureKind::WebExtract
             | FailureKind::WebGone
+            | FailureKind::WebChanged
             | FailureKind::WebComponents
             | FailureKind::Other => {}
         }

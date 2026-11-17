@@ -15,7 +15,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Semaphore;
 
 use crate::components::{Installed, command, proxy_for};
-use crate::info::{Info, Wire};
+use crate::info::{FormatKey, Info, Track, Wire};
 
 /// 同时最多几个解析进程：每个约占几十 MB 内存，一般一次只解析一个网址。
 pub const WORKERS: usize = 2;
@@ -74,6 +74,12 @@ pub enum ExtractError {
     /// 网站说视频不可用：私密、删了、未开播等
     #[error("{0}")]
     Unavailable(String),
+    /// 交回 yt-dlp 下载时，网站这次给的格式里没有要的那个（见 [`crate::FormatKey`]）
+    #[error("{0}")]
+    Changed(String),
+    /// 交回 yt-dlp 下载时写不了文件（磁盘满、没有权限）
+    #[error("{0}")]
+    Disk(String),
     /// 其余：多为网站改了、yt-dlp 要更新
     #[error("{0}")]
     Other(String),
@@ -295,14 +301,17 @@ impl Extractor {
 }
 
 impl Extractor {
-    /// 交回 yt-dlp 自己下：经 `proxy` 解析 `request` 的网页、用 yt-dlp 的下载器把格式 `format` 下到 `output`（自己的
-    /// 引擎下不了的：要模拟浏览器 TLS 指纹的、DASH 分片等），进度经 `progress`（已下的、总的或估算的字节）。另起一个
-    /// 进程，不占解析的名额；超过 5 分钟没有进度算卡住（报 [`ExtractError::TimedOut`]），取消或出错时连同子进程
-    /// 杀掉，留下的 `.part` 下次接着下。
+    /// 交回 yt-dlp 自己下：经 `proxy` 解析 `request` 的网页、用 yt-dlp 的下载器把 `format` 认出的格式下到 `output`
+    /// （自己的引擎下不了的：要模拟浏览器 TLS 指纹的、DASH 分片等），进度经 `progress`（已下的、总的或估算的字节）。
+    /// 另起一个进程，不占解析的名额；超过 5 分钟没有进度算卡住（报 [`ExtractError::TimedOut`]），取消或出错时连同
+    /// 子进程杀掉，留下的 `.part` 下次接着下；缺了的片段报错，不跳过；这次的格式里认不出 `format` 时报
+    /// [`ExtractError::Changed`]。
+    ///
+    /// `output` 的文件名只能由字母、数字、`.`、`-`、`_` 组成（yt-dlp 会展开输出模板里的 `$` 与 `~`），目录不限。
     pub async fn download(
         &self,
         request: &Request,
-        format: &str,
+        format: &FormatKey,
         output: &Path,
         proxy: &Proxy,
         progress: &(dyn Fn(u64, Option<u64>) + Sync),
@@ -311,11 +320,15 @@ impl Extractor {
         let proxy = proxy_for(proxy, &request.url)
             .map_err(|error| ExtractError::Proxy(error.to_string()))?
             .map_or_else(String::new, |proxy| proxy.to_string());
+        let (Some(dir), Some(name)) = (output.parent(), output.file_name()) else {
+            panic!("输出 {} 要有目录与文件名", output.display());
+        };
         let mut worker = self.spawn("download")?;
         let line = serde_json::json!({
             "url": request.url.as_str(),
-            "format": format,
-            "output": output.to_string_lossy(),
+            "format": key_wire(format),
+            "dir": dir.to_string_lossy(),
+            "name": name.to_string_lossy(),
             "proxy": proxy,
             "cookies": (!request.cookies.is_empty()).then(|| netscape(&request.cookies)),
         });
@@ -475,9 +488,31 @@ impl Failure {
             "rate_limited" => ExtractError::RateLimited(message),
             "network" => ExtractError::Network(message),
             "unavailable" => ExtractError::Unavailable(message),
+            "changed" => ExtractError::Changed(message),
+            "disk" => ExtractError::Disk(message),
             _ => ExtractError::Other(message),
         }
     }
+}
+
+/// `key` 写成驱动脚本 `key_of` 的样子。
+fn key_wire(key: &FormatKey) -> serde_json::Value {
+    fn track(track: &Track) -> Option<&str> {
+        match track {
+            Track::Absent => Some("none"),
+            Track::Unknown => None,
+            Track::Codec(codec) => Some(codec),
+        }
+    }
+    serde_json::json!({
+        "format_id": key.id,
+        "ext": key.ext,
+        "vcodec": track(&key.video),
+        "acodec": track(&key.audio),
+        "height": key.height,
+        "language": key.language,
+        "filesize": key.size,
+    })
 }
 
 #[cfg(test)]

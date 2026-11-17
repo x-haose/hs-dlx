@@ -11,7 +11,7 @@ use std::path::Path;
 
 pub use crate::components::{Channel, Components, InstallProgress, Installed, Sources, Stage};
 pub use crate::extractor::{Cookie, ExtractError, Extractor, Request, WORKERS};
-pub use crate::info::{Entry, Format, Info, Live, Protocol, Size, Track};
+pub use crate::info::{Entry, Format, FormatKey, Info, Live, Protocol, Size, Track};
 pub use crate::pins::{Archive, Pinned, Pins};
 
 #[derive(Debug, thiserror::Error)]

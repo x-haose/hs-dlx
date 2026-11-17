@@ -157,7 +157,11 @@ pub fn failure(kind: FailureKind) -> (String, &'static str) {
         ),
         FailureKind::WebGone => (
             "没了".into(),
-            "网站说视频不可用了，或选中的画质已经没有：只能放弃，或重新粘贴网页另建",
+            "网站说视频不可用了，或网页现在是另一个视频：只能放弃，或重新粘贴网页另建",
+        ),
+        FailureKind::WebChanged => (
+            "画质".into(),
+            "网站这次给的格式里认不出选中的画质：再试一次；一直这样就放弃后重新粘贴网页另建",
         ),
         FailureKind::WebComponents => (
             "组件".into(),

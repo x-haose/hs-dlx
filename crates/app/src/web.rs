@@ -1,6 +1,6 @@
 //! 网页视频（yt-dlp 解析出的）的画质选项：每档清晰度挑一个视频、配一条音轨，另有只要音频的；每一路定下由谁下载。
 
-use hs_dlx_ytdlp::{Format, Info, Protocol, Size, Track};
+use hs_dlx_ytdlp::{Format, FormatKey, Info, Protocol, Size, Track};
 
 /// 视频的编码。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,10 +117,10 @@ pub enum Container {
 /// 一个画质选项。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Choice {
-    /// 视频的格式编号；只要音频时为 None
-    pub video: Option<String>,
-    /// 另配的音频的格式编号；视频本身带音频、或没有可配的音频时为 None
-    pub audio: Option<String>,
+    /// 视频的格式；只要音频时为 None
+    pub video: Option<FormatKey>,
+    /// 另配的音频的格式；视频本身带音频、或没有可配的音频时为 None
+    pub audio: Option<FormatKey>,
     pub height: Option<u32>,
     pub fps: Option<f64>,
     pub video_codec: Option<VideoCodec>,
@@ -274,16 +274,20 @@ fn choice_of(main: &Format, audio: Option<&Format>) -> Choice {
                 (Container::Matroska, "mkv".to_owned())
             }
         }
+        // 自己的 HLS 引擎写的是 MP4；yt-dlp 给 HLS 的扩展名可能是 `m3u8`
+        None if main.protocol == Protocol::Hls && route(main) == Route::Own => {
+            (Container::Original, "mp4".to_owned())
+        }
         None => (
             Container::Original,
             main.ext.clone().unwrap_or_else(|| "bin".to_owned()),
         ),
     };
     Choice {
-        video: has_video.then(|| main.id.clone()),
+        video: has_video.then(|| main.key()),
         audio: match audio {
-            Some(audio) => Some(audio.id.clone()),
-            None if !has_video => Some(main.id.clone()),
+            Some(audio) => Some(audio.key()),
+            None if !has_video => Some(main.key()),
             None => None,
         },
         height: main.height,
@@ -405,8 +409,8 @@ mod tests {
             .map(|c| {
                 (
                     c.height,
-                    c.video.as_deref(),
-                    c.audio.as_deref(),
+                    c.video.as_ref().map(|key| key.id.as_str()),
+                    c.audio.as_ref().map(|key| key.id.as_str()),
                     c.container,
                 )
             })
@@ -434,9 +438,15 @@ mod tests {
     #[test]
     fn quality_choices_take_the_highest_bitrate_and_pair_opus() {
         let found = choices(&info(youtube()), Preference::Quality);
-        assert_eq!(found[0].video.as_deref(), Some("248"));
+        assert_eq!(
+            found[0].video.as_ref().map(|key| key.id.as_str()),
+            Some("248")
+        );
         assert_eq!(found[0].video_codec, Some(VideoCodec::Vp9));
-        assert_eq!(found[0].audio.as_deref(), Some("251"));
+        assert_eq!(
+            found[0].audio.as_ref().map(|key| key.id.as_str()),
+            Some("251")
+        );
         assert_eq!(found[0].container, Container::Mp4);
         assert_eq!(found[0].ext, "mp4");
     }
@@ -450,7 +460,10 @@ mod tests {
         formats.push(dub);
         formats[0].language_preference = Some(10);
         let found = choices(&info(formats), Preference::Compatible);
-        assert_eq!(found[0].audio.as_deref(), Some("140"));
+        assert_eq!(
+            found[0].audio.as_ref().map(|key| key.id.as_str()),
+            Some("140")
+        );
     }
 
     #[test]
@@ -483,7 +496,10 @@ mod tests {
         let fast = format("http", Some("avc1"), Some("none"), Some(480), 100.0);
         let vorbis = format("v", Some("none"), Some("vorbis"), None, 128.0);
         let found = choices(&info(vec![slow, fast, vorbis]), Preference::Quality);
-        assert_eq!(found[0].video.as_deref(), Some("http"));
+        assert_eq!(
+            found[0].video.as_ref().map(|key| key.id.as_str()),
+            Some("http")
+        );
         assert_eq!(found[0].container, Container::Matroska);
         assert_eq!(found[0].ext, "mkv");
     }

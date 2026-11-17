@@ -77,9 +77,9 @@ pub enum DraftKind {
         /// 解析器与视频编号（见 [`crate::ytdlp::Info`]）
         extractor: String,
         video_id: String,
-        /// 选中的画质（[`crate::web::Choice`] 里的）：视频与另配的音频的格式编号、合并后的容器与扩展名
-        video: Option<String>,
-        audio: Option<String>,
+        /// 选中的画质（[`crate::web::Choice`] 里的）：视频与另配的音频的格式、合并后的容器与扩展名
+        video: Option<hs_dlx_ytdlp::FormatKey>,
+        audio: Option<hs_dlx_ytdlp::FormatKey>,
         container: crate::web::Container,
         ext: String,
     },
@@ -162,10 +162,10 @@ pub struct WebSpec {
     pub extractor: String,
     /// 视频在这个网站上的编号
     pub video_id: String,
-    /// 视频的格式编号；只要音频时为 None
-    pub video: Option<String>,
-    /// 另配的音频（或只要音频时那一路）的格式编号；视频自带音频时为 None。`video` 与 `audio` 至少有一个
-    pub audio: Option<String>,
+    /// 视频的格式（重新解析后按它认出同一个）；只要音频时为 None
+    pub video: Option<hs_dlx_ytdlp::FormatKey>,
+    /// 另配的音频（或只要音频时那一路）的格式；视频自带音频时为 None。`video` 与 `audio` 至少有一个
+    pub audio: Option<hs_dlx_ytdlp::FormatKey>,
     pub container: crate::web::Container,
     /// 输出：以文件名结尾的绝对路径
     pub path: PathBuf,

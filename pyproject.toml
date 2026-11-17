@@ -53,8 +53,9 @@ ignore = [
 # 运行 PATH 里的 cargo（与 Makefile 一样），参数是写死的与 deny.toml 里的平台
 "scripts/hs_m3u8.py" = ["S603", "S607"]
 # yt-dlp 的驱动脚本：常驻解析时任何异常都要回给应用、进程接着服务（yt-dlp 只包住它认得的异常，网站改版后解析器
-# 抛的 TypeError 等直接冒上来），所以按请求兜住 Exception
-"crates/ytdlp/src/driver.py" = ["BLE001"]
+# 抛的 TypeError 等直接冒上来），所以按请求兜住 Exception；扩展名白名单只在 yt-dlp 的内部名字
+# `yt_dlp.utils._utils._UnsafeExtensionError` 下，用它而不抄一份（随 yt-dlp 的安全修复更新），自检核对它还在
+"crates/ytdlp/src/driver.py" = ["BLE001", "SLF001"]
 
 [tool.mypy]
 strict = true

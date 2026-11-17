@@ -5,7 +5,7 @@ use gpui_kit::{
     AnyElement, Context, Div, InteractiveElement as _, IntoElement, ParentElement as _,
     SharedString, StatefulInteractiveElement as _, Styled as _, div, px,
 };
-use hs_dlx_app::web::{AudioCodec, Choice, Container, VideoCodec};
+use hs_dlx_app::web::{AudioCodec, Choice, Container, Route, VideoCodec, route};
 use hs_dlx_app::ytdlp::{ExtractError, Live, Stage};
 use hs_dlx_app::{Failure, FailureKind, Resolved, WebState};
 
@@ -106,7 +106,7 @@ impl NewTask {
                     Ok(Ok(resolved)) => this.resolved(resolved, cx),
                     Ok(Err(ExtractError::Unsupported(_))) => this.not_resolvable(true, cx),
                     Ok(Err(error)) => {
-                        this.probing = Probing::Failed(failure_of(&error));
+                        this.probing = Probing::Failed(Failure::of_extract(&error));
                     }
                     Err(join) => {
                         this.probing = Probing::Failed(Failure {
@@ -144,16 +144,26 @@ impl NewTask {
             });
             return;
         }
+        // 没有格式时解析已报错（网站说的原因）；有格式而都下不了的是协议不支持（RTMP 等）或有 DRM
         if resolved.choices.is_empty() {
             let why = if resolved.info.has_drm {
-                "视频有 DRM".to_owned()
-            } else if resolved.info.warnings.is_empty() {
-                "网站没给出能下的格式".to_owned()
+                "有的格式有 DRM，其余的协议不支持".to_owned()
             } else {
-                resolved.info.warnings.join("；")
+                let protocols: Vec<&str> = resolved
+                    .info
+                    .formats
+                    .iter()
+                    .filter_map(|format| match route(format) {
+                        Route::Unsupported(reason) => Some(reason),
+                        Route::Own | Route::YtDlp => None,
+                    })
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                protocols.join("；")
             };
             self.probing = Probing::Failed(Failure {
-                kind: FailureKind::WebExtract,
+                kind: FailureKind::Unsupported,
                 message: format!("没有能下的格式：{why}"),
             });
             return;
@@ -424,27 +434,6 @@ fn codecs(option: &Choice) -> String {
         Container::Original => option.ext.to_uppercase(),
     };
     format!("{streams} · {container}")
-}
-
-/// 解析失败对应的任务失败（种类决定提示与能做的事）。
-fn failure_of(error: &ExtractError) -> Failure {
-    let kind = match error {
-        ExtractError::Login(_) => FailureKind::WebLogin,
-        ExtractError::Geo(_) => FailureKind::WebGeo,
-        ExtractError::Unavailable(_) => FailureKind::WebGone,
-        ExtractError::RateLimited(_) => FailureKind::Status(429),
-        ExtractError::Network(_) | ExtractError::TimedOut(_) => FailureKind::Network,
-        ExtractError::Broken(_) => FailureKind::WebComponents,
-        ExtractError::Unsupported(_)
-        | ExtractError::Other(_)
-        | ExtractError::Crashed(_)
-        | ExtractError::Proxy(_)
-        | ExtractError::Cancelled => FailureKind::WebExtract,
-    };
-    Failure {
-        kind,
-        message: error.to_string(),
-    }
 }
 
 /// 选中的行的底色。

@@ -1,5 +1,5 @@
-//! 网页视频任务：每次开始（含继续）都重新解析网页、按格式编号找到这次的地址（地址会过期、与出口绑定），各路（视频、
-//! 另配的音频）分别下到任务目录里，再合并（两路时）或改名（一路时）成输出。
+//! 网页视频任务：每次开始（含继续）都重新解析网页、按任务记着的格式（[`FormatKey`]）认出这次的地址（地址会过期、与
+//! 出口绑定），各路（视频、另配的音频）分别下到任务目录里，再合并（两路时）或改名（一路时）成输出。
 //!
 //! 任务目录（输出旁的 `<输出>.hsdl`）里：每一路下完的文件 `<路>.<扩展名>`（在即这一路下完了）与它的核心任务目录
 //! `<路>.hsdl`（续传用；交回 yt-dlp 下的那一路是 yt-dlp 的 `.part`），合并出的 `merged.<扩展名>`（core 先写临时文件、写完
@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use hs_dlx_ytdlp::{Cookie, ExtractError, Extractor, Format, Info, Protocol, Request};
+use hs_dlx_ytdlp::{Cookie, ExtractError, Extractor, Format, FormatKey, Info, Protocol, Request};
 use hs_m3u8_core::remux::{FileInput, Streams, WriteProgress};
 use hs_m3u8_core::{
     CancellationToken, FileOutputOptions, FileRequest, JobRequest, Leftover, OutputOptions, Proxy,
@@ -77,21 +77,10 @@ impl Stop {
     }
 
     fn extract(error: &ExtractError) -> Stop {
-        let kind = match error {
-            ExtractError::Cancelled => return Stop::Paused,
-            ExtractError::Login(_) => FailureKind::WebLogin,
-            ExtractError::Geo(_) => FailureKind::WebGeo,
-            ExtractError::Unavailable(_) => FailureKind::WebGone,
-            ExtractError::RateLimited(_) => FailureKind::Status(429),
-            ExtractError::Network(_) | ExtractError::TimedOut(_) => FailureKind::Network,
-            ExtractError::Broken(_) => FailureKind::WebComponents,
-            // 解析器认不出了、yt-dlp 内部出错：多为网站改版，要更新 yt-dlp
-            ExtractError::Unsupported(_) | ExtractError::Other(_) | ExtractError::Crashed(_) => {
-                FailureKind::WebExtract
-            }
-            ExtractError::Proxy(_) => FailureKind::Other,
-        };
-        Stop::failed(kind, error.to_string())
+        match error {
+            ExtractError::Cancelled => Stop::Paused,
+            error => Stop::Failed(Failure::of_extract(error)),
+        }
     }
 
     fn disk(path: &Path, error: &std::io::Error) -> Stop {
@@ -99,8 +88,9 @@ impl Stop {
     }
 }
 
-/// 一路：格式与它在任务目录里的名字。
+/// 一路：任务记着的格式、这次解析里认出的它与它在任务目录里的名字。
 struct Part<'a> {
+    key: &'a FormatKey,
     format: &'a Format,
     /// `video`、`audio`；只有一路时为 `media`
     role: &'static str,
@@ -270,7 +260,7 @@ impl Shared {
                 ctx.extractor
                     .download(
                         ctx.request,
-                        &format.id,
+                        part.key,
                         file,
                         ctx.proxy,
                         &|bytes, _total| {
@@ -566,9 +556,9 @@ impl Reporter {
     }
 }
 
-/// 照任务记着的格式编号在这次解析的 `info` 里找出各路；视频编号对不上（网页现在是别的视频）或格式没了时以视频没了
-/// 报出。
-fn parts<'a>(info: &'a Info, spec: &WebSpec) -> Result<Vec<Part<'a>>, Stop> {
+/// 照任务记着的格式在这次解析的 `info` 里认出各路；视频编号对不上（网页现在是别的视频）时以视频没了报出，认不出
+/// 选中的格式时以格式变了报出（不拿编号相同、属性不同的顶上）。
+fn parts<'a>(info: &'a Info, spec: &'a WebSpec) -> Result<Vec<Part<'a>>, Stop> {
     if info.id != spec.video_id {
         return Err(Stop::failed(
             FailureKind::WebGone,
@@ -578,31 +568,34 @@ fn parts<'a>(info: &'a Info, spec: &WebSpec) -> Result<Vec<Part<'a>>, Stop> {
             ),
         ));
     }
-    let find = |id: &str| {
-        info.formats
-            .iter()
-            .find(|format| format.id == id)
-            .ok_or_else(|| {
-                Stop::failed(
-                    FailureKind::WebGone,
-                    format!("选中的画质（格式 {id}）网站已经不给了：放弃后重新新建"),
-                )
-            })
+    let find = |key: &FormatKey| {
+        info.find(key).ok_or_else(|| {
+            Stop::failed(
+                FailureKind::WebChanged,
+                format!(
+                    "网站这次给的格式里认不出选中的画质（格式 {}）：再试一次；一直这样就放弃后重新新建",
+                    key.id
+                ),
+            )
+        })
     };
     Ok(match (&spec.video, &spec.audio) {
         (Some(video), Some(audio)) => vec![
             Part {
+                key: video,
                 format: find(video)?,
                 role: "video",
                 streams: Streams::Video,
             },
             Part {
+                key: audio,
                 format: find(audio)?,
                 role: "audio",
                 streams: Streams::Audio,
             },
         ],
         (Some(only), None) | (None, Some(only)) => vec![Part {
+            key: only,
             format: find(only)?,
             role: "media",
             streams: Streams::All,
@@ -611,9 +604,9 @@ fn parts<'a>(info: &'a Info, spec: &WebSpec) -> Result<Vec<Part<'a>>, Stop> {
     })
 }
 
-/// 一路下完的文件在任务目录里的位置。
+/// 一路下完的文件在任务目录里的位置：`<路>.<扩展名>`（扩展名新建时校验过，只有字母与数字；没有时为 `bin`）。
 fn part_file(work_dir: &Path, part: &Part<'_>) -> PathBuf {
-    let ext = part.format.ext.as_deref().unwrap_or("bin");
+    let ext = part.key.ext.as_deref().unwrap_or("bin");
     work_dir.join(format!("{}.{ext}", part.role))
 }
 

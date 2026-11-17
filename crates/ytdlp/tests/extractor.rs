@@ -222,7 +222,7 @@ async fn concurrent_extractions_share_the_workers() {
     }
 }
 
-/// 交回 yt-dlp 自己下：先解析出格式编号，再让 yt-dlp 把它下到给的路径，报进度。
+/// 交回 yt-dlp 自己下：先解析出格式，再让 yt-dlp 把认出的那个下到给的路径（目录里的 `$HOME` 原样），报进度。
 #[tokio::test(flavor = "multi_thread")]
 async fn yt_dlp_downloads_a_format_itself() {
     let (installed, cache) = installed("download");
@@ -233,12 +233,13 @@ async fn yt_dlp_downloads_a_format_itself() {
         .extract(&request, &Proxy::Direct, &CancellationToken::new())
         .await
         .unwrap();
-    let output = cache.join("下载").join("clip.mp4");
+    let output = cache.join("下载 $HOME 100%").join("clip.mp4");
+    std::fs::create_dir_all(output.parent().unwrap()).unwrap();
     let seen = std::sync::Mutex::new(Vec::new());
     extractor
         .download(
             &request,
-            &info.formats[0].id,
+            &info.formats[0].key(),
             &output,
             &Proxy::Direct,
             &|bytes, total| seen.lock().unwrap().push((bytes, total)),
@@ -248,12 +249,14 @@ async fn yt_dlp_downloads_a_format_itself() {
         .unwrap();
     assert_eq!(std::fs::read(&output).unwrap(), vec![0u8; 64]);
     assert!(!seen.into_inner().unwrap().is_empty(), "应有进度");
-    // 没有的格式：报失败，不留文件
+    // 认不出的格式（编号相同、扩展名不同）：报格式变了，不留文件
     let missing = cache.join("missing.mp4");
+    let mut other = info.formats[0].key();
+    other.ext = Some("webm".to_owned());
     let error = extractor
         .download(
             &request,
-            "no-such",
+            &other,
             &missing,
             &Proxy::Direct,
             &|_, _| {},
@@ -261,6 +264,6 @@ async fn yt_dlp_downloads_a_format_itself() {
         )
         .await
         .unwrap_err();
-    assert!(!matches!(error, ExtractError::Crashed(_)), "{error}");
+    assert!(matches!(error, ExtractError::Changed(_)), "{error}");
     assert!(!missing.exists());
 }

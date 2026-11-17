@@ -9,15 +9,17 @@
 - `selftest <site>`：导入 site 目录里的 yt-dlp 与 yt-dlp-ejs，标准输出打出 `{"yt_dlp": 规范化的版本}`。
 - `serve <site> <deno> <cache>`：常驻解析。标准输入每行一个请求，标准输出每行一个回应，一次只处理一个：
   - 请求 `{"id": 整数, "url": 网址, "proxy": 代理地址（空串为直连）, "cookies": Netscape 格式的 Cookie 或 null,
-    "generic": 只有通用解析器认得时也解析}`；`generic` 为假时只认得通用解析器的网址不发请求，直接回 `unsupported`
+    "generic": 只有通用解析器认得时也解析}`；`generic` 为假时只认得通用解析器的网址不发请求，直接回 `unsupported`；
+    视频没有格式时照网站说的原因（要登录、人机验证、限流、地区限制、不可用）回错误
   - 回应 `{"id": 同请求, "ok": 结果}` 或 `{"id": 同请求, "error": {"kind": 种类, "message": 说明}}`，种类见
     `classify`。yt-dlp 自己的输出都转到标准错误，标准输出只有回应（纯 ASCII 的 JSON）。
   - 结果见 `trimmed`。
 - `download <site> <deno> <cache>`：用 yt-dlp 自己的下载器下一个格式（要模拟浏览器 TLS 指纹的、DASH 分片等应用的引擎
-  下不了的）。标准输入的第一行为请求
-  `{"url": 网页地址, "format": 格式编号, "output": 输出文件的路径, "proxy", "cookies"}`；
-  标准输出先是若干行进度 `{"progress": {"bytes": 已下字节, "total": 总字节或估算，不知道时为 null}}`，最后一行为
-  `{"ok": {}}` 或 `{"error": ...}`（同 `serve`）。中断后再下同一输出时接着 `.part` 续传。
+  下不了的）。标准输入的第一行为请求 `{"url": 网页地址, "format": 要的格式（`key_of` 的各项）,
+  "dir": 输出所在的目录, "name": 输出的文件名, "proxy", "cookies"}`；标准输出先是若干行进度
+  `{"progress": {"bytes": 已下字节, "total": 总字节或估算，不知道时为 null}}`，最后一行为 `{"ok": {}}` 或
+  `{"error": ...}`（同 `serve`，格式编号找不到或属性对不上时种类为 `changed`）。中断后再下同一输出时接着 `.part` 续传；
+  缺了的片段不跳过，报错。读到标准输入的结尾（应用退出了）即退出。
 """
 
 from __future__ import annotations
@@ -26,7 +28,10 @@ import importlib
 import io
 import json
 import math
+import os
 import sys
+import threading
+import time
 import traceback
 from typing import TYPE_CHECKING, Any, Protocol, TextIO, cast
 
@@ -45,6 +50,12 @@ TOO_MANY_REQUESTS = 429
 PLAYLIST_LIMIT = 200
 # 意外异常的调用栈留多少字符
 TRACEBACK_TAIL = 2000
+# yt-dlp 白名单里它内部用的扩展名：不当作格式的扩展名（`part` 会与下载中的文件撞名）
+INTERNAL_EXTENSIONS = frozenset(
+    {"description", "json", "meta", "orig", "part", "temp", "uncut", "unknown_video", "ytdl"}
+)
+# 下载进度至多多久报一次（秒）
+PROGRESS_INTERVAL = 0.2
 # 用 yt-dlp 锁定版本的这两组依赖：默认的依赖与模拟浏览器 TLS 指纹的 curl-cffi
 PIN_EXTRAS = ("pin", "pin-curl-cffi")
 # 不装的：mutagen 只用于往文件里嵌封面（GPL）
@@ -91,6 +102,20 @@ def number(value: object) -> float | None:
     return result if math.isfinite(result) else None
 
 
+def safe_ext(value: object) -> str | None:
+    """格式的扩展名：只放行 yt-dlp 白名单里的，其余为 None。
+
+    白名单是 yt-dlp 为 CVE-2024-38519 定的（媒体与图片的，这里去掉它内部用的）。扩展名来自网站的数据，会拼进文件名：
+    不在白名单里的可能带路径分隔符或是可执行文件的扩展名。
+    """
+    ext = text(value)
+    if ext is None or not ext.isascii() or not ext.isalnum():
+        return None
+    utils = importlib.import_module("yt_dlp.utils._utils")
+    allowed: frozenset[str] = utils._UnsafeExtensionError.ALLOWED_EXTENSIONS
+    return ext if ext.lower() in allowed and ext.lower() not in INTERNAL_EXTENSIONS else None
+
+
 def format_of(fmt: Mapping[str, object], jar: CookieJar) -> Info:
     """一个格式里下载要用的。
 
@@ -105,7 +130,7 @@ def format_of(fmt: Mapping[str, object], jar: CookieJar) -> Info:
         "format_id": text(fmt.get("format_id")) or "",
         "url": url,
         "protocol": text(fmt.get("protocol")) or "",
-        "ext": text(fmt.get("ext")),
+        "ext": safe_ext(fmt.get("ext")),
         "vcodec": text(fmt.get("vcodec")),
         "acodec": text(fmt.get("acodec")),
         "width": number(fmt.get("width")),
@@ -192,49 +217,77 @@ def lineage(error: BaseException) -> set[str]:
     return {cls.__name__ for cls in type(error).__mro__}
 
 
-def classify(error: BaseException) -> tuple[str, str]:
-    """yt-dlp 的失败归类：种类与说明。
+def unwrapped(error: BaseException) -> BaseException:
+    """`error` 包着的原始异常。
 
-    种类：`unsupported`（没有专门的解析器认得这个网址）、`geo`（地区限制）、`login`（要登录或 Cookie）、
-    `rate_limited`（429）、`network`（连不上、超时、TLS）、`unavailable`（网站说视频不可用：私密、删了、未开播等）、
-    `other`（其余，多为网站改了、yt-dlp 要更新）。
+    DownloadError 包着解析器或下载器抛的（在 `exc_info` 里）；写文件失败时 yt-dlp 抛 UnavailableVideoError，引起它的
+    OSError 在 `__context__` 里。
     """
-    # DownloadError 包着解析器抛的原始异常
     original = error
     exc_info = items(getattr(error, "exc_info", None))
     if "DownloadError" in lineage(error) and len(exc_info) > 1 and isinstance(exc_info[1], BaseException):
         original = exc_info[1]
-    message = clean(str(getattr(original, "orig_msg", None) or original))
-    # ExtractorError 的 cause 是引起它的网络错误
+    if "UnavailableVideoError" in lineage(original) and isinstance(original.__context__, OSError):
+        original = original.__context__
+    return original
+
+
+def root_of(original: BaseException) -> BaseException:
+    """解析器的错误（ExtractorError）沿 `cause` 追到的、引起它的错误（如网络错误）；不是时为它本身。"""
     root = original
     while "ExtractorError" in lineage(root):
         cause: object = getattr(root, "cause", None)
         if not isinstance(cause, BaseException):
             break
         root = cause
+    return root
+
+
+def classify(error: BaseException) -> tuple[str, str]:
+    """yt-dlp 的失败归类：种类与说明。
+
+    种类：`unsupported`（没有专门的解析器认得这个网址）、`geo`（地区限制）、`login`（要登录或 Cookie）、
+    `rate_limited`（429）、`network`（连不上、超时、TLS；下载时服务器回的错误状态与没下完整）、`disk`（下载时写不了
+    文件）、`unavailable`（网站说视频不可用：私密、删了、未开播等）、`other`（其余，多为网站改了、yt-dlp 要更新）。
+    下载时（不经解析器）的错误状态多为直链过期或被拒（403、404 等），重新解析即换新的。
+    """
+    original = unwrapped(error)
+    message = clean(str(getattr(original, "orig_msg", None) or original))
+    names, causes = lineage(original), lineage(root_of(original))
     kind = "other"
-    if "UnsupportedError" in lineage(original):
+    if "UnsupportedError" in names:
         kind = "unsupported"
-    elif "GeoRestrictedError" in lineage(original):
+    elif "GeoRestrictedError" in names:
         kind = "geo"
-    elif "HTTPError" in lineage(root) and getattr(root, "status", None) == TOO_MANY_REQUESTS:
+    elif "HTTPError" in causes and getattr(root_of(original), "status", None) == TOO_MANY_REQUESTS:
         kind = "rate_limited"
-    elif "TransportError" in lineage(root):
+    elif "TransportError" in causes or names & {"HTTPError", "ContentTooShortError"}:
         kind = "network"
-    elif "ExtractorError" in lineage(original) and getattr(original, "expected", False) is True:
-        lowered = message.lower()
-        login = any(word in lowered for word in ("sign in", "log in", "login", "cookies"))
-        kind = "login" if login else "unavailable"
+    elif isinstance(original, OSError):
+        kind = "disk"
+    elif "ExtractorError" in names and getattr(original, "expected", False) is True:
+        kind = said(message)
     return kind, message
 
 
-def params(proxy: str, cookies: str | None, deno: str, cache: str, logger: Logger) -> Info:
-    """一次解析给 YoutubeDL 的参数。
+def said(message: str) -> str:
+    """网站自己说的不能播的原因的种类：限流、要登录（含人机验证）、其余为不可用。"""
+    lowered = message.lower()
+    if any(word in lowered for word in ("rate-limited", "try again later", "too many requests")):
+        return "rate_limited"
+    if any(word in lowered for word in ("sign in", "log in", "login", "cookies", "captcha", "not a bot")):
+        return "login"
+    return "unavailable"
 
-    只解析不下载；播放列表只列条目（至多 `PLAYLIST_LIMIT` 条），带视频的播放列表网址取视频；格式全要、没有格式也不
-    报错（应用自己从 `formats` 里选；没有能下的格式时应用看 `formats` 与 `warnings` 说明，不混进「视频不可用」）；代理
-    只照应用给的；Cookie 只在内存里；deno 解 YouTube 的 JavaScript 挑战；缓存放在应用的目录；不查自己是不是太旧。
+
+def params(request: Mapping[str, object], deno: str, cache: str, logger: Logger) -> Info:
+    """一次解析或下载给 YoutubeDL 的参数，代理（空串为直连）与 Cookie 取自 `request`。
+
+    只解析不下载；播放列表只列条目（至多 `PLAYLIST_LIMIT` 条），带视频的播放列表网址取视频；格式全要（应用自己从
+    `formats` 里选）；视频没有格式时照网站说的原因抛出（yt-dlp 的默认，`classify` 按原因归类）；代理只照应用给的；
+    Cookie 只在内存里；deno 解 YouTube 的 JavaScript 挑战；缓存放在应用的目录；不查自己是不是太旧。
     """
+    cookies = text(request.get("cookies"))
     return {
         "quiet": True,
         "logger": logger,
@@ -242,8 +295,7 @@ def params(proxy: str, cookies: str | None, deno: str, cache: str, logger: Logge
         "extract_flat": "in_playlist",
         "playlistend": PLAYLIST_LIMIT,
         "format": "all",
-        "ignore_no_formats_error": True,
-        "proxy": proxy,
+        "proxy": text(request.get("proxy")) or "",
         "socket_timeout": SOCKET_TIMEOUT,
         "cookiefile": io.StringIO(cookies) if cookies is not None else None,
         "js_runtimes": {"deno": {"path": deno}},
@@ -267,7 +319,7 @@ def extract(yt_dlp: ModuleType, request: Mapping[str, object], deno: str, cache:
     if request.get("generic") is not True and matched(url) == "Generic":
         return {"error": {"kind": "unsupported", "message": "没有专门认这个网址的解析器"}}
     logger = Logger()
-    options = params(text(request.get("proxy")) or "", text(request.get("cookies")), deno, cache, logger)
+    options = params(request, deno, cache, logger)
     with yt_dlp.YoutubeDL(options) as ydl:
         try:
             info = ydl.extract_info(url, download=False)
@@ -342,55 +394,112 @@ def pick(files: Mapping[str, object]) -> dict[str, str]:
     return chosen
 
 
-def download(yt_dlp: ModuleType, request: Mapping[str, object], deno: str, cache: str, replies: TextIO) -> Info:
-    """用 yt-dlp 自己的下载器下请求里的一个格式到 `output`，进度逐行写进 `replies`，返回最后的回应。
+def key_of(fmt: Mapping[str, object]) -> Info:
+    """认出一个格式用的属性（与应用的 `FormatKey` 一一对应）：格式编号、扩展名、视频与音频编码、高度、语言、确切大小。
 
-    只下这一个格式、不合并、不做修复（没有 ffmpeg 程序）；已有的 `.part` 接着下，已下完的不覆盖。
+    格式编号可能是 yt-dlp 排序后加的序号（同名的格式加 `-0`、`-1`，如 YouTube 同一 itag 的多条配音），网站多给或少给一个
+    格式就移位，只比编号会认错。对 yt-dlp 的原始格式与 `format_of` 的结果算出的相同。
+    """
+    return {
+        "format_id": text(fmt.get("format_id")) or "",
+        "ext": safe_ext(fmt.get("ext")),
+        "vcodec": text(fmt.get("vcodec")),
+        "acodec": text(fmt.get("acodec")),
+        "height": number(fmt.get("height")),
+        "language": text(fmt.get("language")),
+        "filesize": number(fmt.get("filesize")),
+    }
+
+
+def same_format(fmt: Mapping[str, object], wanted: Mapping[str, object]) -> bool:
+    """`fmt` 是不是要的那个：`key_of` 的各项都与 `wanted` 里的相同（`wanted` 缺的项按 null 比）。"""
+    return all(wanted.get(key) == value for key, value in key_of(fmt).items())
+
+
+def download(yt_dlp: ModuleType, request: Mapping[str, object], deno: str, cache: str, replies: TextIO) -> Info:
+    """用 yt-dlp 自己的下载器把请求里要的那个格式下到当前目录下的 `name`，进度逐行写进 `replies`，返回最后的回应。
+
+    解析一次，在结果里按格式编号与属性找到要的那个（不当作格式选择式：`mp4`、`b` 之类的编号会被当成选择式），只把它
+    交给 yt-dlp 下载；不合并、不做修复（没有 ffmpeg 程序）；已有的 `.part` 接着下，已下完的不覆盖；缺了的片段不跳过。
+    输出写成相对当前目录的名字：yt-dlp 会展开输出模板里的 `$` 与 `~`，且没有转义的写法，目录可以含它们（由调用方
+    切换过去），名字（应用给的 `<路>.<扩展名>`）不含它们与路径分隔符，含了是应用的缺陷，报错不下。
     """
     logger = Logger()
-    output = text(request.get("output")) or ""
+    wanted = mapping(request.get("format")) or {}
+    name = text(request.get("name")) or ""
+    if not name or any(char in name for char in "$~/\\") or name in {".", ".."}:
+        return {"error": {"kind": "other", "message": f"输出的名字不能用：{name!r}"}}
+    last = [0.0]
 
     def hook(status: object) -> None:
         state = mapping(status) or {}
-        if state.get("status") != "downloading":
+        now = time.monotonic()
+        if state.get("status") != "downloading" or now - last[0] < PROGRESS_INTERVAL:
             return
+        last[0] = now
         total = number(state.get("total_bytes")) or number(state.get("total_bytes_estimate"))
         line = {"progress": {"bytes": number(state.get("downloaded_bytes")), "total": total}}
         replies.write(json.dumps(line, ensure_ascii=True, allow_nan=False) + "\n")
         replies.flush()
 
-    options = params(text(request.get("proxy")) or "", text(request.get("cookies")), deno, cache, logger)
+    options = params(request, deno, cache, logger)
     options.update(
         {
-            "format": text(request.get("format")) or "",
-            "ignore_no_formats_error": False,
             "extract_flat": False,
-            # 输出模板里的 % 是占位符的开头，路径里的要写成 %%
-            "outtmpl": {"default": output.replace("%", "%%")},
+            # 输出模板里百分号是占位符的开头，原样的写两个
+            "outtmpl": {"default": name.replace("%", "%%")},
             "progress_hooks": [hook],
             "continuedl": True,
             "overwrites": False,
             "fixup": "never",
+            "skip_unavailable_fragments": False,
         }
     )
     with yt_dlp.YoutubeDL(options) as ydl:
         try:
-            ydl.extract_info(text(request.get("url")) or "", download=True)
+            info = mapping(ydl.extract_info(text(request.get("url")) or "", download=False)) or {}
+            formats = [fmt for fmt in map(mapping, items(info.get("formats"))) if fmt is not None]
+            chosen = next((fmt for fmt in formats if same_format(fmt, wanted)), None)
+            if chosen is None:
+                return {"error": {"kind": "changed", "message": f"网站给的格式里没有要的 {wanted.get('format_id')}"}}
+            # 同 yt-dlp 选中格式后的做法：视频的信息合进这个格式，交给它下载这一个
+            selected = dict(info)
+            selected.update(chosen)
+            selected.pop("requested_formats", None)
+            ydl.process_info(selected)
         except yt_dlp.utils.YoutubeDLError as error:
             kind, message = classify(error)
             return {"error": {"kind": kind, "message": message}}
+    skipped = [warning for warning in logger.warnings if "Skipping fragment" in warning]
+    if skipped:
+        return {"error": {"kind": "network", "message": clean("；".join(skipped))}}
     return {"ok": {}}
 
 
-def selftest(site: str) -> None:
-    """导入 yt-dlp 与解 YouTube 的 JavaScript 挑战用的 yt-dlp-ejs，报出 yt-dlp 安装元数据里的版本。
+def watch_stdin() -> None:
+    """读到标准输入的结尾（应用退出了、管道断了）即退出整个进程：下载不留成没人管的进程。"""
 
-    版本按 PEP 440 规范化，与 PyPI 上的写法一致；`yt_dlp.version.__version__` 的写法不同（补零、不带 `.dev0`）。
+    def wait() -> None:
+        sys.stdin.read()
+        os._exit(1)
+
+    threading.Thread(target=wait, daemon=True).start()
+
+
+def selftest(site: str) -> None:
+    """导入 yt-dlp 与解 YouTube 的 JavaScript 挑战用的 yt-dlp-ejs，核对扩展名白名单还在，报出 yt-dlp 的版本。
+
+    版本取自安装元数据，按 PEP 440 规范化，与 PyPI 上的写法一致；`yt_dlp.version.__version__` 的写法不同（补零、
+    不带 `.dev0`）。
     """
     # site 目录要先加进 sys.path 才导入得到，所以按名字导入
     sys.path.insert(0, site)
     importlib.import_module("yt_dlp")
     importlib.import_module("yt_dlp_ejs")
+    # 白名单是 yt-dlp 的内部名字：新版改掉了就装不上，而不是装上后每次解析都出错
+    if safe_ext("mp4") != "mp4" or safe_ext("exe") is not None:
+        message = "yt-dlp 的扩展名白名单认不出"
+        raise RuntimeError(message)
     metadata = importlib.import_module("importlib.metadata")
     version = importlib.import_module("pip._vendor.packaging.version")
     found = metadata.distribution("yt-dlp").version
@@ -410,8 +519,10 @@ def main() -> None:
             replies = sys.stdout
             sys.stdout = sys.stderr
             sys.path.insert(0, site)
-            # 只读一行：应用写完请求不关管道
+            # 只读一行：应用写完请求不关管道，之后读到结尾即应用不在了
             request = mapping(json.loads(sys.stdin.readline())) or {}
+            watch_stdin()
+            os.chdir(text(request.get("dir")) or ".")
             try:
                 reply = download(importlib.import_module("yt_dlp"), request, deno, cache, replies)
             except Exception as error:

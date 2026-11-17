@@ -113,6 +113,44 @@ pub struct Format {
     pub impersonate: bool,
 }
 
+/// 认出一个格式用的属性：重新解析后按它找回同一个格式（与驱动脚本的 `key_of` 一一对应）。
+///
+/// 格式编号可能是 yt-dlp 排序后加的序号（同名的格式加 `-0`、`-1`，如 YouTube 同一 itag 的多条配音），网站多给或少给
+/// 一个格式就移位；扩展名、编码、高度、语言与确切的大小也都相同才算同一个。确切的大小还认出同一编号下重新编码过的内容
+/// （如上传者剪辑过）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormatKey {
+    pub id: String,
+    pub ext: Option<String>,
+    pub video: Track,
+    pub audio: Track,
+    pub height: Option<u32>,
+    pub language: Option<String>,
+    /// 确切的字节数；网站只给了估算或没给时为 None
+    pub size: Option<u64>,
+}
+
+impl Format {
+    pub fn key(&self) -> FormatKey {
+        FormatKey {
+            id: self.id.clone(),
+            ext: self.ext.clone(),
+            video: self.video.clone(),
+            audio: self.audio.clone(),
+            height: self.height,
+            language: self.language.clone(),
+            size: self.size.filter(|size| size.exact).map(|size| size.bytes),
+        }
+    }
+}
+
+impl Info {
+    /// `key` 认出的格式；没有时为 None。
+    pub fn find(&self, key: &FormatKey) -> Option<&Format> {
+        self.formats.iter().find(|format| format.key() == *key)
+    }
+}
+
 /// 格式的大小。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Size {

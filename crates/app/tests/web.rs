@@ -7,7 +7,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use hs_dlx_app::web::Container;
-use hs_dlx_app::ytdlp::{Archive, ExtractError, Pinned, Pins, Sources};
+use hs_dlx_app::ytdlp::{Archive, ExtractError, FormatKey, Pinned, Pins, Sources, Track};
 use hs_dlx_app::{
     Draft, DraftKind, Error, Event, FailureKind, Service, Status, Store, TaskId, TorrentNetwork,
     WebConfig, WebState,
@@ -160,11 +160,24 @@ async fn start_page() -> Url {
     base
 }
 
+/// 本地网页上编号为 `id` 的格式（通用解析器只给扩展名）。
+fn key(id: &str) -> FormatKey {
+    FormatKey {
+        id: id.to_owned(),
+        ext: Some("ts".to_owned()),
+        video: Track::Unknown,
+        audio: Track::Unknown,
+        height: None,
+        language: None,
+        size: None,
+    }
+}
+
 fn web_draft(
     base: &Url,
     folder: PathBuf,
-    video: Option<&str>,
-    audio: Option<&str>,
+    video: Option<FormatKey>,
+    audio: Option<FormatKey>,
     container: Container,
     ext: &str,
 ) -> Draft {
@@ -176,8 +189,8 @@ fn web_draft(
             title: "两路".to_owned(),
             extractor: "HTML5MediaEmbed".to_owned(),
             video_id: "page-1".to_owned(),
-            video: video.map(str::to_owned),
-            audio: audio.map(str::to_owned),
+            video,
+            audio,
             container,
             ext: ext.to_owned(),
         },
@@ -216,7 +229,7 @@ fn a_single_format_becomes_the_output() {
             web_draft(
                 &base,
                 folder.clone(),
-                Some("0"),
+                Some(key("0")),
                 None,
                 Container::Original,
                 "ts",
@@ -246,8 +259,8 @@ fn video_and_audio_are_fetched_apart_and_merged() {
             web_draft(
                 &base,
                 folder.clone(),
-                Some("0"),
-                Some("1"),
+                Some(key("0")),
+                Some(key("1")),
                 Container::Mp4,
                 "mp4",
             ),
@@ -263,35 +276,40 @@ fn video_and_audio_are_fetched_apart_and_merged() {
     assert!(!folder.join("两路.mp4.hsdl").exists());
 }
 
-/// 选中的格式网站已经不给了：以视频没了停下（再继续也一样）。
+/// 认不出选中的格式：编号没了，或编号还在、属性不同（编号移了位）：以格式变了停下，不拿别的格式顶上。
 #[test]
-fn a_format_that_is_gone_fails_the_task() {
-    let dir = test_dir("gone");
+fn a_format_not_recognized_fails_the_task_instead_of_taking_another() {
+    let dir = test_dir("changed");
     let root = dir.join("components");
     lay_out(&root);
     let (service, mut events) = with_events(&dir, root);
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let base = runtime.block_on(start_page());
-    let task = runtime
-        .block_on(service.create(
-            web_draft(
-                &base,
-                dir.join("out"),
-                Some("9"),
-                None,
-                Container::Original,
-                "ts",
-            ),
-            1,
-        ))
-        .unwrap()
-        .unwrap();
-    match runtime.block_on(ended(&mut events, task.id)) {
-        Status::Failed(failure) => {
-            assert_eq!(failure.kind, FailureKind::WebGone);
-            assert!(!failure.kind.retry_helps());
+    let mut shifted = key("0");
+    shifted.language = Some("ja".to_owned());
+    for (name, format) in [("gone", key("9")), ("shifted", shifted)] {
+        let task = runtime
+            .block_on(service.create(
+                web_draft(
+                    &base,
+                    dir.join(name),
+                    Some(format),
+                    None,
+                    Container::Original,
+                    "ts",
+                ),
+                1,
+            ))
+            .unwrap()
+            .unwrap();
+        match runtime.block_on(ended(&mut events, task.id)) {
+            Status::Failed(failure) => {
+                assert_eq!(failure.kind, FailureKind::WebChanged, "{name}");
+                assert!(failure.kind.retry_helps());
+            }
+            other => panic!("{name} 应以格式变了停下：{other:?}"),
         }
-        other => panic!("应以视频没了停下：{other:?}"),
+        assert!(!dir.join(name).join("两路.ts").exists());
     }
 }
 
@@ -306,7 +324,7 @@ fn web_tasks_take_only_cookies() {
     let mut draft = web_draft(
         &Url::parse("http://127.0.0.1:9/").unwrap(),
         dir.join("out"),
-        Some("0"),
+        Some(key("0")),
         None,
         Container::Original,
         "ts",
@@ -314,4 +332,29 @@ fn web_tasks_take_only_cookies() {
     draft.headers.push(("Referer".to_owned(), "x".to_owned()));
     let refused = runtime.block_on(service.create(draft, 1)).unwrap();
     assert!(matches!(refused, Err(Error::InvalidInput(_))));
+}
+
+/// 扩展名拼进文件名：输出的与各路的只能是字母与数字。
+#[test]
+fn web_extensions_other_than_letters_and_digits_are_refused() {
+    let dir = test_dir("ext");
+    let root = dir.join("components");
+    lay_out(&root);
+    let service = service(&dir, root);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let base = Url::parse("http://127.0.0.1:9/").unwrap();
+    let mut traversal = key("0");
+    traversal.ext = Some("../x".to_owned());
+    for (video, ext) in [(key("0"), "../ts"), (key("0"), ""), (traversal, "ts")] {
+        let draft = web_draft(
+            &base,
+            dir.join("out"),
+            Some(video),
+            None,
+            Container::Original,
+            ext,
+        );
+        let refused = runtime.block_on(service.create(draft, 1)).unwrap();
+        assert!(matches!(refused, Err(Error::InvalidInput(_))), "{ext}");
+    }
 }

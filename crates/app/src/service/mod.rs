@@ -1650,7 +1650,29 @@ impl Shared {
                 Some(info)
             }
             DraftKind::Hls { .. } | DraftKind::File { .. } => None,
-            DraftKind::Web { .. } => {
+            DraftKind::Web {
+                video, audio, ext, ..
+            } => {
+                // 扩展名拼进输出与任务目录里各路的文件名
+                let exts = [Some(ext.as_str())]
+                    .into_iter()
+                    .chain(
+                        [video, audio]
+                            .into_iter()
+                            .flatten()
+                            .map(|key| key.ext.as_deref()),
+                    )
+                    .flatten();
+                for ext in exts {
+                    if ext.is_empty()
+                        || ext.len() > 16
+                        || !ext.bytes().all(|b| b.is_ascii_alphanumeric())
+                    {
+                        return Err(Error::InvalidInput(format!(
+                            "扩展名只能是字母与数字：{ext:?}"
+                        )));
+                    }
+                }
                 // 只带 Cookie：解析与下载时按网页所在的域名带上；别的请求头 yt-dlp 自己定
                 if let Some((name, _)) = draft
                     .headers

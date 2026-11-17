@@ -19,6 +19,7 @@ use crate::{
     TorrentSpec, WebSpec, naming,
 };
 use hs_dlx_cloud::pikpak::Account;
+use hs_dlx_ytdlp::{FormatKey, Track};
 use std::num::NonZeroU32;
 
 /// 一次迁移：在给定的事务里把表结构升一个版本。
@@ -638,11 +639,11 @@ fn rebuild_with_cloud(tx: &Transaction<'_>) -> Result<(), Error> {
 }
 
 /// 第 12 版：网页视频任务（`kind` 为 `web`，yt-dlp 解析）。重建任务表（SQLite 改不了 CHECK）：
-/// - 网页视频的各列：解析器（`web_extractor`）、视频编号（`web_video_id`）、视频与另配的音频的格式编号（`web_video`、
-///   `web_audio`，至少一个）、合并后的容器（`web_container`：`mp4`、`matroska`，只有一路不合并时为 `original`）、输出
+/// - 网页视频的各列：解析器（`web_extractor`）、视频编号（`web_video_id`）、视频与另配的音频的格式（`web_video`、
+///   `web_audio`，至少一个；认出格式用的各项，写法见 `StoredFormat`）、合并后的容器（`web_container`：`mp4`、`matroska`，只有一路不合并时为 `original`）、输出
 ///   （`web_path`）；有任务目录（各路各一个核心的任务目录在里面）。只属于网页视频的列在别的任务为 NULL。请求头只放
 ///   Cookie（解析与下载时带上）。
-/// - 失败的种类加 `web-login`、`web-geo`、`web-extract`、`web-gone`、`web-components`。其余约束不变，已有的行原样搬过来。
+/// - 失败的种类加 `web-login`、`web-geo`、`web-extract`、`web-gone`、`web-changed`、`web-components`。其余约束不变，已有的行原样搬过来。
 /// - 设置加网页视频的 yt-dlp 渠道（`web_channel`：`stable`、`nightly`）与画质取向（`web_preference`：`compatible`、
 ///   `quality`），没设过为稳定版、兼容优先。
 fn rebuild_with_web(tx: &Transaction<'_>) -> Result<(), Error> {
@@ -694,7 +695,7 @@ fn rebuild_with_web(tx: &Transaction<'_>) -> Result<(), Error> {
                                     'malformed', 'stalled', 'nothing-to-write', 'mp4-unsupported', 'unsupported',
                                     'unrecoverable', 'cloud-login', 'cloud-quota', 'cloud-failed', 'cloud-api',
                                     'integrity', 'web-login', 'web-geo', 'web-extract', 'web-gone',
-                                    'web-components', 'other')
+                                    'web-changed', 'web-components', 'other')
                      OR failure GLOB 'status:[0-9][0-9][0-9]')
             ),
             created_at INTEGER NOT NULL,
@@ -977,8 +978,12 @@ pub fn insert(
             (
                 Some(web.extractor.as_str()),
                 Some(web.video_id.as_str()),
-                web.video.as_deref(),
-                web.audio.as_deref(),
+                web.video
+                    .as_ref()
+                    .map(|key| to_json(&StoredFormat::from(key))),
+                web.audio
+                    .as_ref()
+                    .map(|key| to_json(&StoredFormat::from(key))),
                 Some(container_code(web.container)),
                 Some(named_utf8(&web.path)?),
             )
@@ -1685,11 +1690,19 @@ impl Row {
                 if !named_absolute(&path) {
                     return Err(corrupt("网页视频的输出"));
                 }
+                let format = |text: Option<String>| {
+                    text.map(|text| {
+                        serde_json::from_str::<StoredFormat>(&text)
+                            .map(FormatKey::from)
+                            .map_err(|_| corrupt("网页视频的格式"))
+                    })
+                    .transpose()
+                };
                 Some(WebSpec {
                     extractor,
                     video_id,
-                    video: self.web_video,
-                    audio: self.web_audio,
+                    video: format(self.web_video)?,
+                    audio: format(self.web_audio)?,
                     container: parse_container(&container).ok_or_else(|| corrupt("容器"))?,
                     path,
                 })
@@ -2186,6 +2199,65 @@ fn output_columns(
 /// 表结构版本在 `user_version` 里的写法。
 fn schema_version(version: usize) -> i64 {
     i64::try_from(version).expect("迁移的项数远小于 i64 的上限")
+}
+
+/// 网页视频一路的格式在 `web_video`、`web_audio` 列里的写法（JSON）：认出它用的各项（见 [`FormatKey`]）。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredFormat {
+    id: String,
+    ext: Option<String>,
+    video: StoredTrack,
+    audio: StoredTrack,
+    height: Option<u32>,
+    language: Option<String>,
+    /// 确切的字节数
+    size: Option<u64>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StoredTrack {
+    Absent,
+    Unknown,
+    Codec(String),
+}
+
+impl From<&FormatKey> for StoredFormat {
+    fn from(key: &FormatKey) -> StoredFormat {
+        let track = |track: &Track| match track {
+            Track::Absent => StoredTrack::Absent,
+            Track::Unknown => StoredTrack::Unknown,
+            Track::Codec(codec) => StoredTrack::Codec(codec.clone()),
+        };
+        StoredFormat {
+            id: key.id.clone(),
+            ext: key.ext.clone(),
+            video: track(&key.video),
+            audio: track(&key.audio),
+            height: key.height,
+            language: key.language.clone(),
+            size: key.size,
+        }
+    }
+}
+
+impl From<StoredFormat> for FormatKey {
+    fn from(stored: StoredFormat) -> FormatKey {
+        let track = |track: StoredTrack| match track {
+            StoredTrack::Absent => Track::Absent,
+            StoredTrack::Unknown => Track::Unknown,
+            StoredTrack::Codec(codec) => Track::Codec(codec),
+        };
+        FormatKey {
+            id: stored.id,
+            ext: stored.ext,
+            video: track(stored.video),
+            audio: track(stored.audio),
+            height: stored.height,
+            language: stored.language,
+            size: stored.size,
+        }
+    }
 }
 
 fn to_json(value: &impl serde::Serialize) -> String {
@@ -2957,8 +3029,24 @@ mod tests {
             kind: Kind::Web(WebSpec {
                 extractor: "Youtube".into(),
                 video_id: "x".into(),
-                video: video.map(str::to_owned),
-                audio: audio.map(str::to_owned),
+                video: video.map(|id| FormatKey {
+                    id: id.to_owned(),
+                    ext: Some("mp4".into()),
+                    video: Track::Codec("avc1.640028".into()),
+                    audio: Track::Absent,
+                    height: Some(1080),
+                    language: None,
+                    size: Some(123),
+                }),
+                audio: audio.map(|id| FormatKey {
+                    id: id.to_owned(),
+                    ext: Some("m4a".into()),
+                    video: Track::Absent,
+                    audio: Track::Codec("mp4a.40.2".into()),
+                    height: None,
+                    language: Some("ja".into()),
+                    size: None,
+                }),
                 container: Container::Mp4,
                 path: m("节目.mp4"),
             }),
@@ -3000,6 +3088,7 @@ mod tests {
             FailureKind::WebGeo,
             FailureKind::WebExtract,
             FailureKind::WebGone,
+            FailureKind::WebChanged,
             FailureKind::WebComponents,
         ] {
             let failure = Failure {

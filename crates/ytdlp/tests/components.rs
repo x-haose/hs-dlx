@@ -144,17 +144,27 @@ fn release_json(base: &Url, requires: &[&str], files: &[(String, Vec<u8>)]) -> V
 /// 不该看它）与它锁定的依赖：certifi、yt-dlp-ejs；mutagen 锁定了但不该装（服务器上没有它，请求即失败）；brotlicffi
 /// 只给别的解释器。
 fn publish(server: &Server, base: &Url, version: &str) {
-    let (name, bytes) = wheel(
-        "yt_dlp",
-        version,
-        &[
-            ("yt_dlp/__init__.py".to_owned(), String::new()),
-            (
-                "yt_dlp/version.py".to_owned(),
-                "__version__ = 'not-the-pypi-spelling'\n".to_owned(),
-            ),
-        ],
-    );
+    publish_with(server, base, version, true);
+}
+
+/// 同 [`publish`]；`allowlist` 为假时包里没有驱动脚本自检要找的扩展名白名单（像改掉了内部名字的新版）。
+fn publish_with(server: &Server, base: &Url, version: &str, allowlist: bool) {
+    let mut files = vec![
+        ("yt_dlp/__init__.py".to_owned(), String::new()),
+        (
+            "yt_dlp/version.py".to_owned(),
+            "__version__ = 'not-the-pypi-spelling'\n".to_owned(),
+        ),
+    ];
+    if allowlist {
+        files.push(("yt_dlp/utils/__init__.py".to_owned(), String::new()));
+        files.push((
+            "yt_dlp/utils/_utils.py".to_owned(),
+            "class _UnsafeExtensionError(Exception):\n    ALLOWED_EXTENSIONS = frozenset({'mp4', 'm4a'})\n"
+                .to_owned(),
+        ));
+    }
+    let (name, bytes) = wheel("yt_dlp", version, &files);
     // 别的平台的包不该被挑中
     let foreign = format!("yt_dlp-{version}-cp27-cp27m-win32.whl");
     let requires = [
@@ -384,6 +394,19 @@ async fn updates_switch_only_after_the_new_version_passes() {
         .await
         .unwrap_err();
     assert!(matches!(missing, Error::Index(_)), "{missing}");
+    assert_eq!(components.installed().unwrap(), Some(first.clone()));
+    // 自检不过（扩展名白名单没了）：不换上
+    publish_with(&server, &base, "2026.10.24", false);
+    let refused = components
+        .update(
+            &Proxy::Direct,
+            "2026.10.24",
+            &|_| {},
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(refused, Error::SelfTest(_)), "{refused}");
     assert_eq!(components.installed().unwrap(), Some(first.clone()));
 
     for version in ["2026.10.26", "2026.11.16.232655.dev0"] {

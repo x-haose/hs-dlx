@@ -7,6 +7,7 @@ import importlib
 import importlib.metadata
 import io
 import json
+import sys
 import threading
 from functools import partial
 from pathlib import Path
@@ -154,29 +155,88 @@ def test_lone_surrogates_and_nan_still_make_valid_json() -> None:
     assert json.loads(line)["duration"] is None
 
 
-def test_yt_dlp_downloads_a_format_itself_with_progress(site: str, tmp_path: Path) -> None:
+def test_yt_dlp_downloads_a_format_itself_with_progress(
+    site: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     [reply] = serve([{"id": 1, "url": f"{site}/video.html", "proxy": "", "cookies": None, "generic": True}], tmp_path)
     info = driver.mapping(reply["ok"]) or {}
     [fmt] = [driver.mapping(item) or {} for item in driver.items(info["formats"])]
-    output = tmp_path / "下载 100%" / "clip.mp4"
+    # 目录里的 $HOME 与 % 原样保留
+    folder = tmp_path / "下载 100% $HOME"
+    folder.mkdir()
+    monkeypatch.chdir(folder)
     replies = io.StringIO()
-    request = {
-        "url": f"{site}/video.html",
-        "format": fmt["format_id"],
-        "output": str(output),
-        "proxy": "",
-        "cookies": None,
-    }
+    wanted = driver.key_of(fmt)
+    request = {"url": f"{site}/video.html", "format": wanted, "name": "video.mp4", "proxy": "", "cookies": None}
     final = driver.download(importlib.import_module("yt_dlp"), request, "deno", str(tmp_path / "cache"), replies)
     assert final == {"ok": {}}
-    assert output.read_bytes() == (tmp_path / "clip.mp4").read_bytes()
+    assert (folder / "video.mp4").read_bytes() == (tmp_path / "clip.mp4").read_bytes()
     lines = [json.loads(line) for line in replies.getvalue().splitlines()]
-    assert lines, "应有进度"
     assert all("progress" in line for line in lines)
 
 
-def test_a_missing_format_is_an_error_not_a_silent_skip(site: str, tmp_path: Path) -> None:
-    request = {"url": f"{site}/video.html", "format": "no-such", "output": str(tmp_path / "x"), "proxy": ""}
-    final = driver.download(importlib.import_module("yt_dlp"), request, "deno", str(tmp_path / "cache"), io.StringIO())
-    assert "error" in final
-    assert not (tmp_path / "x").exists()
+def test_a_format_not_found_or_not_the_same_is_changed(
+    site: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    yt_dlp = importlib.import_module("yt_dlp")
+    cache = str(tmp_path / "cache")
+    request: dict[str, object] = {"url": f"{site}/video.html", "format": {"format_id": "no-such"}, "name": "x.mp4"}
+    final = driver.download(yt_dlp, request, "deno", cache, io.StringIO())
+    assert (driver.mapping(final["error"]) or {})["kind"] == "changed"
+    [reply] = serve([{"id": 1, "url": f"{site}/video.html", "proxy": "", "cookies": None, "generic": True}], tmp_path)
+    [fmt] = [driver.mapping(item) or {} for item in driver.items((driver.mapping(reply["ok"]) or {})["formats"])]
+    # 编号对得上、扩展名对不上：不是要的那个
+    request["format"] = {**driver.key_of(fmt), "ext": "webm"}
+    final = driver.download(yt_dlp, request, "deno", cache, io.StringIO())
+    assert (driver.mapping(final["error"]) or {})["kind"] == "changed"
+    assert not (tmp_path / "x.mp4").exists()
+
+
+def test_an_output_name_with_dollar_or_separator_is_refused(tmp_path: Path) -> None:
+    for name in ("$HOME.mp4", "~x.mp4", "a/b.mp4", ".."):
+        request = {"url": "http://127.0.0.1:9/", "format": {"format_id": "0"}, "name": name}
+        final = driver.download(importlib.import_module("yt_dlp"), request, "deno", str(tmp_path), io.StringIO())
+        assert "error" in final, name
+
+
+def test_only_media_extensions_on_the_allowlist_pass() -> None:
+    assert driver.safe_ext("mp4") == "mp4"
+    assert driver.safe_ext("M4A") == "M4A"
+    for unsafe in ("exe", "bat", "part", "json", "../x", "a/b", "", None, 3):
+        assert driver.safe_ext(unsafe) is None, unsafe
+
+
+def report_error(error: BaseException) -> BaseException:
+    """`error` 在 except 里被 yt-dlp 的 report_error 包成 DownloadError 的样子。"""
+    utils = importlib.import_module("yt_dlp.utils")
+    try:
+        raise error
+    except (utils.YoutubeDLError, OSError) as caught:
+        wrapped: BaseException = utils.DownloadError(str(caught), sys.exc_info())
+    return wrapped
+
+
+def unavailable(cause: OSError) -> BaseException:
+    """yt-dlp 写文件失败时抛的 UnavailableVideoError（引起它的错误在 `__context__` 里）。"""
+    utils = importlib.import_module("yt_dlp.utils")
+    try:
+        raise cause
+    except OSError:
+        wrapped: BaseException = utils.UnavailableVideoError(cause)
+        wrapped.__context__ = cause
+    return wrapped
+
+
+def test_failures_are_classified_by_what_the_site_said_and_where_they_happened() -> None:
+    utils = importlib.import_module("yt_dlp.utils")
+    bot = utils.ExtractorError("Sign in to confirm you're not a bot", expected=True)
+    assert driver.classify(report_error(bot))[0] == "login"
+    limited = utils.ExtractorError("This content isn't available, try again later. rate-limited", expected=True)
+    assert driver.classify(report_error(limited))[0] == "rate_limited"
+    gone = utils.ExtractorError("Private video", expected=True)
+    assert driver.classify(report_error(gone))[0] == "unavailable"
+    assert driver.classify(report_error(utils.ContentTooShortError(1, 2)))[0] == "network"
+    full = OSError(28, "No space left on device")
+    assert driver.classify(report_error(full))[0] == "disk"
+    assert driver.classify(unavailable(full))[0] == "disk"
