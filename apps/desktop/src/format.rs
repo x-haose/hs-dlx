@@ -7,6 +7,8 @@ use hs_dlx_app::FailureKind;
 use hs_dlx_app::ytdlp::{InstallProgress, Stage};
 use hs_m3u8_core::VariantInfo;
 
+use crate::ui::Step;
+
 /// 在运行的任务数 `running` 与合计速度 `speed`（字节每秒）：「2 个进行中 · ↓ 18.4 MB/s」；没有在运行的任务时为 None。
 pub fn activity(running: usize, speed: f64) -> Option<String> {
     (running > 0).then(|| format!("{running} 个进行中 · ↓ {}/s", bytes(speed as u64)))
@@ -86,21 +88,57 @@ pub fn path(path: &Path, home: Option<&Path>) -> String {
     }
 }
 
-/// 网页视频组件安装到哪一步与这一步的字节进度，如「下载 Python · 12 MB / 30 MB」。
+/// 网页视频组件安装的这一步在做什么，下载的带字节进度，如「下载 Python · 12 MB / 30 MB（40%）」；还没收到字节时为
+/// 「正在连接」。
 pub fn web_install(progress: &InstallProgress) -> String {
-    let stage = match progress.stage {
-        Stage::Waiting => "等在解析的解析完",
-        Stage::Python => "下载 Python",
-        Stage::Deno => "下载 deno",
-        Stage::YtDlp => "下载 yt-dlp",
-        Stage::Checking => "检查装好的组件",
+    let (doing, downloading) = match progress.stage {
+        Stage::Preparing => ("准备", false),
+        Stage::Waiting => ("等在解析的解析完", false),
+        Stage::Python => ("下载 Python", true),
+        Stage::PythonUnpacking => ("核对、解开 Python", false),
+        Stage::Deno => ("下载 deno", true),
+        Stage::DenoUnpacking => ("核对、解开 deno", false),
+        Stage::Resolving => ("查 yt-dlp 的版本与依赖", false),
+        Stage::YtDlp => ("下载 yt-dlp 与依赖", true),
+        Stage::Setup => ("安装 yt-dlp", false),
+        Stage::Checking => ("检查装好的组件", false),
     };
     let amount = match progress.total {
-        Some(total) => format!(" · {} / {}", bytes(progress.bytes), bytes(total)),
+        Some(0) => String::new(),
+        Some(total) => format!(
+            " · {} / {}（{}%）",
+            bytes(progress.bytes),
+            bytes(total),
+            progress.bytes.min(total) * 100 / total
+        ),
         None if progress.bytes > 0 => format!(" · {}", bytes(progress.bytes)),
-        None => String::new(),
+        None if downloading => " · 正在连接…".to_owned(),
+        None => "…".to_owned(),
     };
-    format!("{stage}{amount}")
+    format!("{doing}{amount}")
+}
+
+/// 网页视频组件安装的几步（Python、deno、yt-dlp、检查）各到了哪里：这一步之前的做完了、之后的还没做。
+pub fn web_install_steps(progress: &InstallProgress) -> Vec<(gpui_kit::SharedString, Step)> {
+    let at = match progress.stage {
+        Stage::Preparing | Stage::Waiting => None,
+        Stage::Python | Stage::PythonUnpacking => Some(0),
+        Stage::Deno | Stage::DenoUnpacking => Some(1),
+        Stage::Resolving | Stage::YtDlp | Stage::Setup => Some(2),
+        Stage::Checking => Some(3),
+    };
+    ["Python", "deno", "yt-dlp", "检查"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, label)| {
+            let step = match at {
+                Some(at) if index < at => Step::Done,
+                Some(at) if index == at => Step::Now,
+                Some(_) | None => Step::Waiting,
+            };
+            (label.into(), step)
+        })
+        .collect()
 }
 
 /// 一类失败的简写与说明：简写（状态码或种类）是表盘圆盘里的大字；说明写这类失败多半是怎么回事，任务页写在检查面板，
@@ -204,6 +242,33 @@ pub fn ratio(uploaded: u64, wanted: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn web_install_says_what_it_is_doing_and_where_it_is() {
+        let at = |stage, bytes, total| InstallProgress {
+            stage,
+            bytes,
+            total,
+        };
+        assert_eq!(
+            web_install(&at(Stage::Python, 0, None)),
+            "下载 Python · 正在连接…"
+        );
+        assert_eq!(
+            web_install(&at(Stage::Python, 3 << 20, Some(12 << 20))),
+            format!(
+                "下载 Python · {} / {}（25%）",
+                bytes(3 << 20),
+                bytes(12 << 20)
+            )
+        );
+        assert_eq!(web_install(&at(Stage::Setup, 0, None)), "安装 yt-dlp…");
+        let marks: Vec<Step> = web_install_steps(&at(Stage::Resolving, 0, None))
+            .into_iter()
+            .map(|(_, step)| step)
+            .collect();
+        assert!(marks == [Step::Done, Step::Done, Step::Now, Step::Waiting]);
+    }
+
     use super::*;
 
     #[test]

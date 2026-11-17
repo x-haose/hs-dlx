@@ -193,6 +193,13 @@ impl Service {
             *installing = Some(cancel.clone());
             cancel
         };
+        // 一开始就显示在装：到第一个字节之前（连 GitHub、查 PyPI）也有好几秒
+        web.state
+            .send_replace(WebState::Installing(InstallProgress {
+                stage: Stage::Preparing,
+                bytes: 0,
+                total: None,
+            }));
         let shared = self.shared.clone();
         let _entered = self.runtime().enter();
         self.shared.tracker.spawn(async move {
@@ -317,6 +324,13 @@ impl Service {
             *installing = Some(cancel.clone());
             cancel
         };
+        // 一开始就显示在装：到第一个字节之前（连 GitHub、查 PyPI）也有好几秒
+        web.state
+            .send_replace(WebState::Installing(InstallProgress {
+                stage: Stage::Preparing,
+                bytes: 0,
+                total: None,
+            }));
         let shared = self.shared.clone();
         let _entered = self.runtime().enter();
         self.shared.tracker.spawn(async move {

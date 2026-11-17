@@ -89,12 +89,24 @@ enum Package {
 /// 安装进行到哪一步。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
+    /// 开始了、还没到下面任一步（清理临时目录、写驱动脚本）
+    Preparing,
     /// 等在解析的解析完（重装前：在用的组件换不下）
     Waiting,
+    /// 下载 Python 的包
     Python,
+    /// 核对、解开 Python 的包
+    PythonUnpacking,
+    /// 下载 deno 的包
     Deno,
-    /// 下载 yt-dlp 与依赖的 wheel 并装上
+    /// 核对、解开 deno 的包
+    DenoUnpacking,
+    /// 查 PyPI 上 yt-dlp 的版本与它锁定的依赖、挑合本机的包
+    Resolving,
+    /// 下载 yt-dlp 与依赖的 wheel
     YtDlp,
+    /// 用 pip 把 wheel 装进临时目录
+    Setup,
     /// 自检
     Checking,
 }
@@ -227,7 +239,14 @@ impl Components {
         }
         let version = match self.state() {
             Ok(Some(state)) => state.yt_dlp,
-            Ok(None) | Err(_) => self.latest(proxy, channel).await?,
+            Ok(None) | Err(_) => {
+                progress(InstallProgress {
+                    stage: Stage::Resolving,
+                    bytes: 0,
+                    total: None,
+                });
+                self.latest(proxy, channel).await?
+            }
         };
         self.install_yt_dlp(proxy, &version, progress, cancel).await
     }
@@ -360,7 +379,14 @@ impl Components {
         };
         let version = match wanted {
             Some(version) => version,
-            None => self.latest(proxy, channel).await?,
+            None => {
+                progress(InstallProgress {
+                    stage: Stage::Resolving,
+                    bytes: 0,
+                    total: None,
+                });
+                self.latest(proxy, channel).await?
+            }
         };
         self.install_yt_dlp(proxy, &version, progress, cancel).await
     }
@@ -631,9 +657,14 @@ impl Components {
         progress: &(dyn Fn(InstallProgress) + Sync),
         cancel: &CancellationToken,
     ) -> Result<(), Error> {
-        let (pinned, name, stage) = match package {
-            Package::Python => (&self.pins.python, "python", Stage::Python),
-            Package::Deno => (&self.pins.deno, "deno", Stage::Deno),
+        let (pinned, name, stage, unpacking) = match package {
+            Package::Python => (
+                &self.pins.python,
+                "python",
+                Stage::Python,
+                Stage::PythonUnpacking,
+            ),
+            Package::Deno => (&self.pins.deno, "deno", Stage::Deno, Stage::DenoUnpacking),
         };
         let target = self.root.join(format!("{name}-{}", pinned.version));
         if !again && executable(&self.root, name, pinned).is_file() {
@@ -643,6 +674,11 @@ impl Components {
             .root
             .join("downloads")
             .join(format!("{name}-{}", pinned.version));
+        progress(InstallProgress {
+            stage,
+            bytes: 0,
+            total: None,
+        });
         self.fetch(
             &pinned.url,
             &pinned.sha256,
@@ -658,6 +694,11 @@ impl Components {
             cancel,
         )
         .await?;
+        progress(InstallProgress {
+            stage: unpacking,
+            bytes: 0,
+            total: None,
+        });
         let staging = self.root.join("staging").join(name);
         tokio::fs::create_dir_all(&staging)
             .await
@@ -692,6 +733,13 @@ impl Components {
         {
             return Err(Error::Index(format!("版本号 {version:?} 认不出")));
         }
+        let at = |stage| {
+            progress(InstallProgress {
+                stage,
+                bytes: 0,
+                total: None,
+            });
+        };
         let report = |bytes, total| {
             progress(InstallProgress {
                 stage: Stage::YtDlp,
@@ -699,7 +747,7 @@ impl Components {
                 total,
             });
         };
-        report(0, None);
+        at(Stage::Resolving);
         let python = executable(&self.root, "python", &self.pins.python);
         let driver = self.driver_path();
         // yt-dlp 这个版本与它锁定的依赖，各自在 PyPI 上的文件
@@ -736,6 +784,7 @@ impl Components {
             .collect::<Result<_, _>>()?;
         // 逐个下载，进度按字节合计
         let total: u64 = chosen.iter().map(|file| file.size).sum();
+        report(0, Some(total));
         let wheels = self.root.join("downloads").join("wheels");
         let mut done = 0;
         let mut paths = Vec::new();
@@ -759,7 +808,7 @@ impl Components {
             done += file.size;
             paths.push(path);
         }
-        report(total, Some(total));
+        at(Stage::Setup);
         let staging = self.root.join("staging").join("yt-dlp");
         let mut pip = command(&python);
         pip.args(pip_args(&staging)).args(&paths);

@@ -233,6 +233,7 @@ impl NewTask {
         let mut foot = Vec::new();
         match state {
             WebState::Installing(progress) => {
+                body.push(ui::steps(format::web_install_steps(progress)).into_any_element());
                 body.push(ui::note(format::web_install(progress), false).into_any_element());
             }
             WebState::Failed(reason) => {
