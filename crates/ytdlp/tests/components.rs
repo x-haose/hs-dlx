@@ -358,7 +358,8 @@ async fn a_package_that_does_not_match_its_pin_is_refused() {
     assert_eq!(components.installed().unwrap(), None);
 }
 
-/// 上次下好了没用完的包：内容对得上直接用（不再请求），对不上删掉重下；解开了一半、缺了可执行文件的目录重装。
+/// 上次下好了没用完的包：内容对得上直接用（不再请求），对不上删掉重下；解开了一半、缺了可执行文件的目录重装；
+/// 不是这次锁定版本的包与续传目录（应用升级前留下的）删掉。
 #[tokio::test(flavor = "multi_thread")]
 async fn leftovers_from_an_interrupted_install_are_checked_not_trusted() {
     let root = test_dir("leftovers");
@@ -367,14 +368,42 @@ async fn leftovers_from_an_interrupted_install_are_checked_not_trusted() {
     std::fs::write(root.join("downloads/python-3.13.18-20261110"), &python).unwrap();
     std::fs::write(root.join("downloads/deno-2.9.8"), b"half").unwrap();
     std::fs::create_dir_all(root.join("deno-2.9.8")).unwrap();
+    std::fs::write(root.join("downloads/python-3.13.17-20261001"), b"old").unwrap();
+    std::fs::create_dir_all(root.join("downloads/python-3.13.hsdl")).unwrap();
     let components = components(&root, pins(&base, &python, &deno), &base);
     install(&components, Channel::Stable).await.unwrap();
     assert_eq!(server.hits("python.tar.gz"), 0);
     assert_eq!(server.hits("deno.zip"), 1);
     assert!(root.join("deno-2.9.8/deno").is_file());
+    assert!(!root.join("downloads/python-3.13.17-20261001").exists());
+    assert!(!root.join("downloads/python-3.13.hsdl").exists());
 }
 
-/// 更新：装进另一个目录、自检过了才换成当前的，上一个留着，更早的删掉；每日构建的版本号带 `.dev0`（元数据也这样
+/// 重装：在用的 Python、deno 与 yt-dlp 删掉重下（内容坏了而路径还在，安装会当作装好了），yt-dlp 照记着的版本。
+#[tokio::test(flavor = "multi_thread")]
+async fn repairing_downloads_everything_again() {
+    let root = test_dir("repair");
+    let (server, base, python, deno) = start(&["2026.10.26"]).await;
+    let components = components(&root, pins(&base, &python, &deno), &base);
+    let first = install(&components, Channel::Stable).await.unwrap();
+    std::fs::write(&first.deno, b"broken").unwrap();
+    assert_eq!(install(&components, Channel::Stable).await.unwrap(), first);
+    let repaired = components
+        .repair(
+            &Proxy::Direct,
+            Channel::Stable,
+            &|_| {},
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(repaired, first);
+    assert_ne!(std::fs::read(&repaired.deno).unwrap(), b"broken");
+    assert_eq!(server.hits("python.tar.gz"), 2);
+    assert_eq!(server.hits("deno.zip"), 2);
+}
+
+/// 更新：装进另一个目录、自检过了才换成当前的，上一个留着，更早的到清理时删掉（更新时不删）；每日构建的版本号带 `.dev0`（元数据也这样
 /// 写）；要装的版本 PyPI 上没有时报出、在用的不变。
 #[tokio::test(flavor = "multi_thread")]
 async fn updates_switch_only_after_the_new_version_passes() {
@@ -418,6 +447,8 @@ async fn updates_switch_only_after_the_new_version_passes() {
         assert_eq!(updated.version, version);
         assert_eq!(components.installed().unwrap(), Some(updated));
     }
+    assert!(root.join("yt-dlp-2026.10.21").exists(), "更新时不删");
+    components.sweep().await;
     assert!(root.join("yt-dlp-2026.10.26").exists(), "上一个留着");
     assert!(!root.join("yt-dlp-2026.10.21").exists(), "更早的删掉");
 }

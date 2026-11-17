@@ -5,7 +5,8 @@
 //!
 //! 目录布局（`root` 下）：
 //! - `python-<版本>/`、`deno-<版本>/`：解开的组件包；不是锁定版本的在装好之后删掉
-//! - `yt-dlp-<版本>/`：pip 的 `--target` 目录；保留当前的与上一个
+//! - `yt-dlp-<版本>/`：pip 的 `--target` 目录；保留当前的与上一个，更早的在安装后与应用启动时（[`Components::sweep`]）
+//!   删掉：更新时不删，换版本前起的解析进程可能还在用
 //! - `state.json`：当前与上一个 yt-dlp 版本、装它时的 Python 版本；先写临时文件、落盘再改名
 //! - `downloads/`：下载中与下好了的组件包、wheel 与核心的任务目录（续传用），用过即删
 //! - `staging/`：解包与 pip 安装的临时目录，每次安装前清空
@@ -192,6 +193,49 @@ impl Components {
         if let Ok(Some(installed)) = self.installed() {
             return Ok(installed);
         }
+        self.install_missing(proxy, channel, progress, cancel).await
+    }
+
+    /// 重装：删掉在用的 Python、deno 与 yt-dlp（文件被杀毒软件隔离或坏了、进程起不来），再照 [`Components::install`]
+    /// 装上（yt-dlp 照状态文件记着的版本）。用着它们的解析进程之后起不来，重装完换新的。
+    pub async fn repair(
+        &self,
+        proxy: &Proxy,
+        channel: Channel,
+        progress: &(dyn Fn(InstallProgress) + Sync),
+        cancel: &CancellationToken,
+    ) -> Result<Installed, Error> {
+        let _busy = self.busy.lock().await;
+        let mut dirs = vec![
+            self.root
+                .join(format!("python-{}", self.pins.python.version)),
+            self.root.join(format!("deno-{}", self.pins.deno.version)),
+        ];
+        // 坏了的状态文件由安装重写
+        if let Ok(Some(state)) = self.state() {
+            dirs.push(self.root.join(format!("yt-dlp-{}", state.yt_dlp)));
+        }
+        for dir in &dirs {
+            remove_dir(dir).await?;
+        }
+        self.install_missing(proxy, channel, progress, cancel).await
+    }
+
+    /// 删掉不再用的：锁定版本以外的 Python 与 deno、当前与上一个以外的 yt-dlp、旧的驱动脚本。更新之后用旧版本的
+    /// 解析进程可能还在跑（换版本前开始的任务），在没有任务运行时（应用启动时）调用。
+    pub async fn sweep(&self) {
+        let _busy = self.busy.lock().await;
+        self.sweep_unlocked().await;
+    }
+
+    /// [`Components::install`] 拿到锁、核对过没装全之后的部分。
+    async fn install_missing(
+        &self,
+        proxy: &Proxy,
+        channel: Channel,
+        progress: &(dyn Fn(InstallProgress) + Sync),
+        cancel: &CancellationToken,
+    ) -> Result<Installed, Error> {
         self.prepare().await?;
         self.ensure(
             &self.pins.python,
@@ -223,7 +267,7 @@ impl Components {
         let installed = self
             .install_yt_dlp(proxy, &version, progress, cancel)
             .await?;
-        self.sweep().await;
+        self.sweep_unlocked().await;
         Ok(installed)
     }
 
@@ -242,11 +286,7 @@ impl Components {
             return Ok(current);
         }
         self.prepare().await?;
-        let installed = self
-            .install_yt_dlp(proxy, version, progress, cancel)
-            .await?;
-        self.sweep().await;
-        Ok(installed)
+        self.install_yt_dlp(proxy, version, progress, cancel).await
     }
 
     /// `channel` 上最新的 yt-dlp 版本（经 `proxy` 查 PyPI）。
@@ -307,15 +347,43 @@ impl Components {
         }
     }
 
-    /// 建好目录、清空上次没装完留下的临时目录、写出驱动脚本。
+    /// 建好目录、清空上次没装完留下的临时目录、删掉 `downloads/` 里不是这次锁定版本的组件包（与续传目录：应用升级换了
+    /// 锁定版本，旧的不再用得上）、写出驱动脚本。
     async fn prepare(&self) -> Result<(), Error> {
         let staging = self.root.join("staging");
-        match tokio::fs::remove_dir_all(&staging).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(Error::disk(&staging, &error)),
+        remove_dir(&staging).await?;
+        let downloads = self.root.join("downloads");
+        let current: Vec<String> = [("python", &self.pins.python), ("deno", &self.pins.deno)]
+            .iter()
+            .map(|(name, pinned)| format!("{name}-{}", pinned.version))
+            .collect();
+        let listed = match tokio::fs::read_dir(&downloads).await {
+            Ok(entries) => Some(entries),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(Error::disk(&downloads, &error)),
+        };
+        if let Some(mut entries) = listed {
+            while let Some(entry) = entries
+                .next_entry()
+                .await
+                .map_err(|error| Error::disk(&downloads, &error))?
+            {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let kept = name == "wheels"
+                    || current
+                        .iter()
+                        .any(|package| name == *package || name == format!("{package}.hsdl"));
+                if !kept {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        remove_dir(&path).await?;
+                    } else {
+                        remove(&path).await?;
+                    }
+                }
+            }
         }
-        for dir in [&staging, &self.root.join("downloads").join("wheels")] {
+        for dir in [&staging, &downloads.join("wheels")] {
             tokio::fs::create_dir_all(dir)
                 .await
                 .map_err(|error| Error::disk(dir, &error))?;
@@ -348,7 +416,10 @@ impl Components {
         let mut source = Source::new(url);
         source.http.proxy = proxy.clone();
         let mut output = FileOutputOptions::new(path.to_path_buf());
-        output.work_dir = Some(path.with_extension("hsdl"));
+        // 整个名字后加 `.hsdl`：`with_extension` 会截掉版本号里最后一个点之后的部分，换了版本还撞上同一个目录
+        let mut work_dir = path.as_os_str().to_owned();
+        work_dir.push(".hsdl");
+        output.work_dir = Some(PathBuf::from(work_dir));
         let mut request = FileRequest::new(source, output);
         // GitHub、PyPI 的下载经重定向到每次签名不同的地址：以内容的哈希担保，换了地址也续传
         request.identity = Some(format!("sha256:{sha256}"));
@@ -589,7 +660,7 @@ impl Components {
     }
 
     /// 删掉不再用的：不是锁定版本的 Python、deno，不是当前与上一个的 yt-dlp，旧的驱动脚本。删不掉的留着，下次再删。
-    async fn sweep(&self) {
+    async fn sweep_unlocked(&self) {
         let Ok(Some(state)) = self.state() else {
             return;
         };
@@ -644,6 +715,15 @@ async fn checked(path: &Path, sha256: &str) -> Result<Result<(), String>, Error>
     })
     .await
     .expect("算哈希不会 panic，运行时关闭时本任务也一起丢弃")
+}
+
+/// 删掉目录 `path`（不在时什么也不做）。
+async fn remove_dir(path: &Path) -> Result<(), Error> {
+    match tokio::fs::remove_dir_all(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::disk(path, &error)),
+    }
 }
 
 async fn remove(path: &Path) -> Result<(), Error> {

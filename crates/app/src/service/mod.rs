@@ -394,6 +394,15 @@ impl Service {
             shared,
             runtime: Some(runtime),
         };
+        // 上次更新 yt-dlp 换下来的旧版本：这时没有任务在用
+        {
+            let _entered = service.runtime().enter();
+            let shared = service.shared.clone();
+            service
+                .shared
+                .tracker
+                .spawn(async move { shared.web.sweep().await });
+        }
         // 上次退出时还在做种的接着做；开始不了的与做种中途开始不了的一样，以做种停了报出、记为不再做种（可再点做种）
         {
             let _entered = service.runtime().enter();
@@ -1040,14 +1049,8 @@ impl Service {
             if task.spec.torrent().is_some() || task.spec.cloud().is_some() {
                 return Err(Error::InvalidInput(format!("{id}没有请求头")));
             }
-            if task.spec.web().is_some()
-                && let Some((name, _)) = headers
-                    .iter()
-                    .find(|(name, _)| !name.eq_ignore_ascii_case("cookie"))
-            {
-                return Err(Error::InvalidInput(format!(
-                    "网页视频只带 Cookie，不带 {name}"
-                )));
+            if task.spec.web().is_some() {
+                web_task::check_headers(&headers)?;
             }
             store::set_headers(tx, id, &headers)
         })
@@ -1626,6 +1629,10 @@ impl Shared {
     }
 
     async fn create(self: &Arc<Self>, draft: Draft, created_at: i64) -> Result<Task, Error> {
+        // 与换请求头时同样校验：网页视频的 Cookie 写进交给 yt-dlp 的 cookies.txt，不经核心
+        for (name, value) in &draft.headers {
+            check_option_header(name, value).map_err(Error::InvalidInput)?;
+        }
         if !draft.folder.is_absolute() {
             return Err(Error::InvalidInput(format!(
                 "保存目录不是绝对路径：{}",
@@ -1673,16 +1680,7 @@ impl Shared {
                         )));
                     }
                 }
-                // 只带 Cookie：解析与下载时按网页所在的域名带上；别的请求头 yt-dlp 自己定
-                if let Some((name, _)) = draft
-                    .headers
-                    .iter()
-                    .find(|(name, _)| !name.eq_ignore_ascii_case("cookie"))
-                {
-                    return Err(Error::InvalidInput(format!(
-                        "网页视频只带 Cookie，不带 {name}"
-                    )));
-                }
+                web_task::check_headers(&draft.headers)?;
                 None
             }
             DraftKind::Cloud { provider } => {
@@ -2078,7 +2076,13 @@ impl Shared {
 
     /// 任务 `id` 停下了：把 `ending` 写进存储（写不进时记为待补写），去掉运行登记 `guard`，发出 [`Event::Ended`]。
     fn conclude(&self, id: TaskId, ending: Ending, leftovers: Vec<Leftover>, guard: RunningGuard) {
-        let saved = self.write(|tx| save_ending(tx, id, &ending));
+        let saved = self.save(id, &ending);
+        self.announce(id, ending, leftovers, guard, saved);
+    }
+
+    /// 把任务 `id` 的结束状态 `ending` 写进存储；写不进时记为待补写，报出原因。
+    fn save(&self, id: TaskId, ending: &Ending) -> Result<(), Error> {
+        let saved = self.write(|tx| save_ending(tx, id, ending));
         if let Err(error) = &saved {
             // 违反约束的结束状态永远写不进：留着待补写会让之后的每次写入都失败
             assert!(
@@ -2087,6 +2091,18 @@ impl Shared {
             );
             lock(&self.unsaved).insert(id, ending.clone());
         }
+        saved
+    }
+
+    /// [`Shared::conclude`] 写进存储之后的一半：去掉运行登记 `guard`，发出 [`Event::Ended`]（`saved` 为写进存储的结果）。
+    fn announce(
+        &self,
+        id: TaskId,
+        ending: Ending,
+        leftovers: Vec<Leftover>,
+        guard: RunningGuard,
+        saved: Result<(), Error>,
+    ) {
         drop(guard);
         let Ending {
             status,
@@ -2271,8 +2287,11 @@ impl Shared {
     }
 
     /// 网页视频任务的 [`Shared::track`]。
+    /// 网页视频任务的 [`Shared::track`]：完成且写进了存储之后才删任务目录（里面有换上输出的标记，见
+    /// `web_task::placed`）：写进之前中断的，下次开始时据它认出输出是自己的。
     fn track_web(self: &Arc<Self>, task: &Task, run: web_task::WebRun) {
         let id = task.id;
+        let work_dir = task.work_dir.clone();
         let guard = self.register(id, Control::Web(run.cancel.clone()));
         let shared = self.clone();
         self.tracker.spawn(async move {
@@ -2288,7 +2307,19 @@ impl Shared {
                 resume: None,
                 seeding: None,
             };
-            shared.conclude(id, ending, leftovers, guard);
+            let saved = shared.save(id, &ending);
+            if saved.is_ok()
+                && ending.status == Status::Done
+                && let Some(work_dir) = work_dir
+                && let Err(error) = web_task::remove_work_dir(&work_dir).await
+            {
+                // 输出已写好，留下的目录不影响结果；接收端随界面关闭而丢弃时没有谁要
+                let _closed = shared.events.send(Event::Orphaned {
+                    paths: vec![work_dir],
+                    reason: error.to_string(),
+                });
+            }
+            shared.announce(id, ending, leftovers, guard, saved);
         });
     }
 }

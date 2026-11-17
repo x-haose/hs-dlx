@@ -6,7 +6,7 @@ use gpui_kit::{
     SharedString, StatefulInteractiveElement as _, Styled as _, div, px,
 };
 use hs_dlx_app::web::{AudioCodec, Choice, Container, Route, VideoCodec, route};
-use hs_dlx_app::ytdlp::{ExtractError, Live, Stage};
+use hs_dlx_app::ytdlp::{ExtractError, Live};
 use hs_dlx_app::{Failure, FailureKind, Resolved, WebState};
 
 use super::{NewTask, NewTaskEvent, Probing};
@@ -36,7 +36,10 @@ impl NewTask {
         match state {
             WebState::Ready(_) | WebState::UpdateFailed { .. } => self.resolve(cx),
             WebState::Unavailable => self.not_resolvable(first, cx),
-            WebState::Missing | WebState::Installing(_) | WebState::Failed(_) => {
+            WebState::Missing
+            | WebState::Installing(_)
+            | WebState::Failed(_)
+            | WebState::Broken(_) => {
                 self.probing = Probing::NeedsWeb(state);
                 self.watch_web(cx);
                 cx.notify();
@@ -214,25 +217,15 @@ impl NewTask {
         let mut foot = Vec::new();
         match state {
             WebState::Installing(progress) => {
-                let stage = match progress.stage {
-                    Stage::Python => "下载 Python",
-                    Stage::Deno => "下载 deno",
-                    Stage::YtDlp => "下载 yt-dlp",
-                    Stage::Checking => "检查装好的组件",
-                };
-                let amount = match progress.total {
-                    Some(total) => format!(
-                        " · {} / {}",
-                        format::bytes(progress.bytes),
-                        format::bytes(total)
-                    ),
-                    None if progress.bytes > 0 => format!(" · {}", format::bytes(progress.bytes)),
-                    None => String::new(),
-                };
-                body.push(ui::note(format!("{stage}{amount}"), false).into_any_element());
+                body.push(ui::note(format::web_install(progress), false).into_any_element());
             }
             WebState::Failed(reason) => {
                 body.push(ui::note(format!("上次没装成：{reason}"), true).into_any_element());
+            }
+            WebState::Broken(reason) => {
+                body.push(
+                    ui::note(format!("组件运行不了，要重装：{reason}"), true).into_any_element(),
+                );
             }
             WebState::Missing
             | WebState::Ready(_)
@@ -243,7 +236,11 @@ impl NewTask {
             foot.push(
                 ui::primary(
                     "install-web",
-                    "安装网页视频组件",
+                    if matches!(state, WebState::Broken(_)) {
+                        "重装网页视频组件"
+                    } else {
+                        "安装网页视频组件"
+                    },
                     None,
                     Solid::Glow,
                     true,

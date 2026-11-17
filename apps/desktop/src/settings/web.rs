@@ -3,7 +3,7 @@
 use gpui_kit::{Context, Div, ParentElement as _, Styled as _, Task, div, px};
 use hs_dlx_app::WebState;
 use hs_dlx_app::web::Preference;
-use hs_dlx_app::ytdlp::{Channel, Stage};
+use hs_dlx_app::ytdlp::Channel;
 
 use super::{SettingsView, row};
 use crate::format;
@@ -132,22 +132,14 @@ impl SettingsView {
                 ))
             }
             WebState::Installing(progress) => {
-                let stage = match progress.stage {
-                    Stage::Python => "下载 Python",
-                    Stage::Deno => "下载 deno",
-                    Stage::YtDlp => "下载 yt-dlp",
-                    Stage::Checking => "检查装好的组件",
-                };
-                let amount = match progress.total {
-                    Some(total) => format!(
-                        " · {} / {}",
-                        format::bytes(progress.bytes),
-                        format::bytes(total)
-                    ),
-                    None => String::new(),
-                };
-                line.child(ui::field(format!("{stage}{amount}")).flex_1())
+                line.child(ui::field(format::web_install(progress)).flex_1())
             }
+            WebState::Broken(_) => line.child(ui::field("运行不了").flex_1()).child(ui::button(
+                "web-install",
+                "重装",
+                Tone::Plain,
+                cx.listener(|this, _, _, cx| this.install_web(cx)),
+            )),
             WebState::Ready(version) | WebState::UpdateFailed { version, .. } => {
                 let line = line.child(ui::field(format!("yt-dlp {version}")).flex_1());
                 match (&self.web.latest, &self.web.checking) {
@@ -169,10 +161,18 @@ impl SettingsView {
                         cx.listener(|this, _, _, cx| this.check_web(cx)),
                     )),
                 }
+                // 文件坏了而进程还起得来时解析报错，没有别的办法认出：由用户重装
+                .child(ui::button(
+                    "web-reinstall",
+                    "重装",
+                    Tone::Ghost,
+                    cx.listener(|this, _, _, cx| this.install_web(cx)),
+                ))
             }
         };
         let failed = match (&self.web.state, &self.web.latest) {
             (WebState::Failed(reason), _) => Some(format!("上次没装成：{reason}")),
+            (WebState::Broken(reason), _) => Some(format!("组件运行不了，要重装：{reason}")),
             (WebState::UpdateFailed { reason, .. }, _) => Some(format!("上次更新没成：{reason}")),
             (_, Some(Err(reason))) => Some(format!("没查成：{reason}")),
             _ => None,

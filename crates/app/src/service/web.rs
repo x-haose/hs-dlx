@@ -46,8 +46,10 @@ pub enum WebState {
         version: String,
         reason: String,
     },
-    /// 没装成（可再装）：原因
+    /// 没装成（可再装，已下的接着用）：原因
     Failed(String),
+    /// 装好了而解析进程起不来（文件被杀毒软件隔离或坏了）：原因；要重装
+    Broken(String),
 }
 
 /// 一个网页地址解析出的视频与它的画质选项。
@@ -107,7 +109,22 @@ impl Web {
             WebState::Unavailable
             | WebState::Missing
             | WebState::Installing(_)
-            | WebState::Failed(_) => None,
+            | WebState::Failed(_)
+            | WebState::Broken(_) => None,
+        }
+    }
+
+    /// 解析进程起不来（组件的文件被隔离或坏了）：不再拿它解析，状态记为坏了（带上原因），由用户重装。在用它的任务
+    /// 照样以组件坏了停下。
+    pub(super) fn broken(&self, reason: String) {
+        *lock(&self.extractor) = None;
+        self.state.send_replace(WebState::Broken(reason));
+    }
+
+    /// 删掉不再用的组件（见 [`Components::sweep`]）；本平台没有组件时什么也不做。
+    pub(super) async fn sweep(&self) {
+        if let Some(components) = &self.components {
+            components.sweep().await;
         }
     }
 
@@ -208,8 +225,9 @@ impl Service {
         self.shared.web.state.subscribe()
     }
 
-    /// 安装网页视频的组件（经设置里的代理），进度与结果见 [`Service::web_state`]；已装好或正在装时什么也不做。本平台没有
-    /// 组件时报 [`Error::WebUnavailable`]，读不出设置时报错。
+    /// 安装网页视频的组件（经设置里的代理），进度与结果见 [`Service::web_state`]：没装、没装成时安装（已下的接着用）；
+    /// 坏了或装好了时重装（见 [`Components::repair`]），在用的解析进程随之换成新的；正在装时什么也不做。本平台没有组件时报
+    /// [`Error::WebUnavailable`]，读不出设置时报错。
     pub fn install_web(&self) -> Result<(), Error> {
         let web = &self.shared.web;
         if web.components.is_none() {
@@ -217,9 +235,10 @@ impl Service {
         }
         let settings = self.settings()?;
         let (proxy, channel) = (settings.proxy, settings.web_channel);
+        let repair = !matches!(*web.state.borrow(), WebState::Missing | WebState::Failed(_));
         let cancel = {
             let mut installing = lock(&web.installing);
-            if installing.is_some() || web.version().is_some() {
+            if installing.is_some() {
                 return Ok(());
             }
             let cancel = CancellationToken::new();
@@ -232,16 +251,14 @@ impl Service {
             let web = &shared.web;
             let components = web.components.as_ref().expect("上面核对过有组件");
             let state = web.state.clone();
-            let installed = components
-                .install(
-                    &proxy,
-                    channel,
-                    &|progress| {
-                        state.send_replace(WebState::Installing(progress));
-                    },
-                    &cancel,
-                )
-                .await;
+            let report = |progress| {
+                state.send_replace(WebState::Installing(progress));
+            };
+            let installed = if repair {
+                components.repair(&proxy, channel, &report, &cancel).await
+            } else {
+                components.install(&proxy, channel, &report, &cancel).await
+            };
             let next = match installed {
                 Ok(installed) => {
                     let version = installed.version.clone();
@@ -284,11 +301,17 @@ impl Service {
             cookies,
             generic: false,
         };
+        let shared = self.shared.clone();
         Ok(AbortOnDropHandle::new(self.runtime().spawn(async move {
             // 句柄释放时任务被丢弃，解析进程随 Worker 的释放杀掉
             let info = extractor
                 .extract(&request, &proxy, &CancellationToken::new())
-                .await?;
+                .await
+                .inspect_err(|error| {
+                    if let ExtractError::Broken(reason) = error {
+                        shared.web.broken(reason.clone());
+                    }
+                })?;
             let choices = choices(&info, preference);
             Ok(Resolved { info, choices })
         })))

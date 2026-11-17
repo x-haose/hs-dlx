@@ -5,6 +5,8 @@
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hs_dlx_app::web::Container;
 use hs_dlx_app::ytdlp::{Archive, ExtractError, FormatKey, Pinned, Pins, Sources, Track};
@@ -115,6 +117,34 @@ fn installed_components_are_ready_and_resolve_through_the_driver() {
     );
 }
 
+/// 解析进程起不来（Python 还在而运行不了：被隔离、没了执行权限）：报组件坏了，状态随之记为坏了、不再拿它解析
+/// （要重装）。
+#[test]
+fn components_that_cannot_start_are_marked_broken() {
+    let dir = test_dir("broken");
+    let root = dir.join("components");
+    lay_out(&root);
+    let python = root.join("python-test/python/bin/python3");
+    std::fs::remove_file(&python).unwrap();
+    std::fs::write(&python, b"").unwrap();
+    let service = service(&dir, root);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let handle = service
+        .resolve(
+            Url::parse("https://www.youtube.com/watch?v=x").unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+    let result = runtime.block_on(handle).unwrap();
+    assert!(matches!(result, Err(ExtractError::Broken(_))), "{result:?}");
+    assert!(matches!(*service.web_state().borrow(), WebState::Broken(_)));
+    let refused = service.resolve(
+        Url::parse("https://www.youtube.com/watch?v=x").unwrap(),
+        Vec::new(),
+    );
+    assert!(matches!(refused, Err(Error::WebNotReady)));
+}
+
 #[test]
 fn resolving_before_the_components_are_installed_is_refused() {
     let dir = test_dir("missing");
@@ -138,13 +168,22 @@ fn samples() -> (Vec<u8>, Vec<u8>) {
 
 /// 本地网页 `/page`：`<video>` 里两个 `<source>`（`/a.ts`、`/b.ts`）。
 async fn start_page() -> Url {
+    start_page_refusing(0).await.0
+}
+
+/// 同 [`start_page`]，`/a.ts` 的前 `refusals` 次请求回 403（直链过期的样子）；另给网页被请求的次数。
+async fn start_page_refusing(refusals: usize) -> (Url, Arc<AtomicUsize>) {
+    use axum::http::StatusCode;
     use axum::response::{Html, IntoResponse as _};
     use axum::routing::get;
     let (a, b) = samples();
+    let (pages, refused) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let seen = pages.clone();
     let app = axum::Router::new()
         .route(
             "/page",
-            get(|| async {
+            get(move || async move {
+                seen.fetch_add(1, Ordering::SeqCst);
                 Html(
                     "<html><head><title>两路</title></head><body><video>\
                      <source src=\"/a.ts\" type=\"video/mp2t\"><source src=\"/b.ts\" type=\"video/mp2t\">\
@@ -152,12 +191,21 @@ async fn start_page() -> Url {
                 )
             }),
         )
-        .route("/a.ts", get(move || async move { a.clone().into_response() }))
+        .route(
+            "/a.ts",
+            get(move || async move {
+                if refused.fetch_add(1, Ordering::SeqCst) < refusals {
+                    StatusCode::FORBIDDEN.into_response()
+                } else {
+                    a.clone().into_response()
+                }
+            }),
+        )
         .route("/b.ts", get(move || async move { b.clone().into_response() }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    base
+    (base, pages)
 }
 
 /// 本地网页上编号为 `id` 的格式（通用解析器只给扩展名）。
@@ -276,6 +324,45 @@ fn video_and_audio_are_fetched_apart_and_merged() {
     assert!(!folder.join("两路.mp4.hsdl").exists());
 }
 
+/// 直链被拒（过期、与出口绑定）：重新解析换新的再下，不以 403 停下；一直被拒时照 403 停下。
+#[test]
+fn a_refused_link_is_resolved_again() {
+    let dir = test_dir("relink");
+    let root = dir.join("components");
+    lay_out(&root);
+    let (service, mut events) = with_events(&dir, root);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    for (name, refusals, pages) in [("once", 1, 2), ("always", usize::MAX, 4)] {
+        let (base, seen) = runtime.block_on(start_page_refusing(refusals));
+        let folder = dir.join(name);
+        let task = runtime
+            .block_on(service.create(
+                web_draft(
+                    &base,
+                    folder.clone(),
+                    Some(key("0")),
+                    None,
+                    Container::Original,
+                    "ts",
+                ),
+                1,
+            ))
+            .unwrap()
+            .unwrap();
+        let status = runtime.block_on(ended(&mut events, task.id));
+        assert_eq!(seen.load(Ordering::SeqCst), pages, "{name}");
+        match (name, status) {
+            ("once", Status::Done) => {
+                assert_eq!(std::fs::read(folder.join("两路.ts")).unwrap(), samples().0);
+            }
+            ("always", Status::Failed(failure)) => {
+                assert_eq!(failure.kind, FailureKind::Status(403));
+            }
+            (name, other) => panic!("{name}：{other:?}"),
+        }
+    }
+}
+
 /// 认不出选中的格式：编号没了，或编号还在、属性不同（编号移了位）：以格式变了停下，不拿别的格式顶上。
 #[test]
 fn a_format_not_recognized_fails_the_task_instead_of_taking_another() {
@@ -329,8 +416,15 @@ fn web_tasks_take_only_cookies() {
         Container::Original,
         "ts",
     );
+    let mut tabbed = draft.clone();
     draft.headers.push(("Referer".to_owned(), "x".to_owned()));
     let refused = runtime.block_on(service.create(draft, 1)).unwrap();
+    assert!(matches!(refused, Err(Error::InvalidInput(_))));
+    // Cookie 的值同换请求头时一样校验（制表符会让 cookies.txt 错列）
+    tabbed
+        .headers
+        .push(("Cookie".to_owned(), "a=b\tc".to_owned()));
+    let refused = runtime.block_on(service.create(tabbed, 1)).unwrap();
     assert!(matches!(refused, Err(Error::InvalidInput(_))));
 }
 

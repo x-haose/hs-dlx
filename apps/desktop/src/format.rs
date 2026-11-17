@@ -4,6 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use hs_dlx_app::FailureKind;
+use hs_dlx_app::ytdlp::{InstallProgress, Stage};
 use hs_m3u8_core::VariantInfo;
 
 /// 在运行的任务数 `running` 与合计速度 `speed`（字节每秒）：「2 个进行中 · ↓ 18.4 MB/s」；没有在运行的任务时为 None。
@@ -87,6 +88,22 @@ pub fn path(path: &Path, home: Option<&Path>) -> String {
 
 /// 一类失败的简写与说明：简写（状态码或种类）是表盘圆盘里的大字；说明写这类失败多半是怎么回事，任务页写在检查面板，
 /// 新建页写在圆盘里。完整的错误另外列出。
+/// 网页视频组件安装到哪一步与这一步的字节进度，如「下载 Python · 12 MB / 30 MB」。
+pub fn web_install(progress: &InstallProgress) -> String {
+    let stage = match progress.stage {
+        Stage::Python => "下载 Python",
+        Stage::Deno => "下载 deno",
+        Stage::YtDlp => "下载 yt-dlp",
+        Stage::Checking => "检查装好的组件",
+    };
+    let amount = match progress.total {
+        Some(total) => format!(" · {} / {}", bytes(progress.bytes), bytes(total)),
+        None if progress.bytes > 0 => format!(" · {}", bytes(progress.bytes)),
+        None => String::new(),
+    };
+    format!("{stage}{amount}")
+}
+
 pub fn failure(kind: FailureKind) -> (String, &'static str) {
     match kind {
         FailureKind::Status(code @ (401 | 403)) => (

@@ -49,6 +49,8 @@ psl = "2.1.253"
 # bundled：随应用编译 SQLite，不依赖系统里的版本
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 rustls = { version = "0.23.46", default-features = false, features = ["std"] }
+# 网页视频换上输出后中断：认出输出与任务目录里的源是不是同一个文件（硬链接），各平台一样
+same-file = "1.0.6"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.21"

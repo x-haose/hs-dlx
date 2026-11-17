@@ -727,9 +727,21 @@ impl NewTask {
                 None => return,
             }
         };
-        // 文件的地址也用原来的：重定向到的多为有时效的签名地址，续传时重新跟随
+        // 文件的地址也用原来的：重定向到的多为有时效的签名地址，续传时重新跟随。网页视频用解析器整理过的网页地址
+        // （短链接 youtu.be、b23.tv 换成视频页）：Cookie 按它的域名带，重新解析也不依赖短链接还在
+        let url = match &self.probing {
+            Probing::Web(choice) => choice
+                .resolved
+                .info
+                .page
+                .as_deref()
+                .and_then(|page| Url::parse(page).ok())
+                .filter(|page| matches!(page.scheme(), "http" | "https"))
+                .unwrap_or_else(|| self.url.clone()),
+            _ => self.url.clone(),
+        };
         let draft = Draft {
-            url: self.url.clone(),
+            url,
             headers,
             folder: self.folder.clone(),
             kind,
