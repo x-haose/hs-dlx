@@ -1,7 +1,10 @@
 //! 任务此刻在界面上的样子：中央圆盘的字与颜色、刻度、任务栏的小环与失败时的说明。
 
 use gpui_kit::Hsla;
-use hs_dlx_app::{CloudPhase, CloudProgress, Failure, Status, TorrentPhase, WebProgress};
+use hs_dlx_app::web::Container;
+use hs_dlx_app::{
+    CloudPhase, CloudProgress, Failure, FailureKind, Status, TorrentPhase, WebProgress,
+};
 use hs_m3u8_core::Stage;
 
 use crate::ring::Ticks;
@@ -121,7 +124,17 @@ fn stopped(row: &Row, why: Stopped<'_>) -> Look {
             }
         }
         Stopped::Failed(failure) => {
-            let (big, hint) = format::failure(failure.kind);
+            let (big, mut hint) = format::failure(failure.kind);
+            // 网页视频放不进 MP4：没有本地 HLS 可改
+            if failure.kind == FailureKind::Mp4Unsupported
+                && let Some(web) = row.task.spec.web()
+            {
+                hint = if web.container == Container::Original {
+                    "这一路的内容放不进 MP4：放弃后重新新建，选别的画质"
+                } else {
+                    "内容放不进 MP4：改用 MKV，已下的照样用"
+                };
+            }
             let line = kept.line;
             Look {
                 state: state("需要处理"),

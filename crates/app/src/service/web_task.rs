@@ -25,6 +25,8 @@ use crate::{Failure, FailureKind, Finished, Task, TaskId, WebSpec};
 
 /// 换上输出前在任务目录里写下的标记（见 [`placed`]）。
 const PLACING: &str = "placing";
+/// 任务目录里 `<路>.<它>`：这一路因合并时读不出删掉重下过（见 [`Shared::merge`]）。
+const REDONE: &str = "redone";
 /// 自己下时直链被拒或没了，重新解析换新的直链再下的次数。
 const RELINKS: usize = 3;
 
@@ -194,7 +196,7 @@ impl Shared {
                 Err(Stop::Paused) => Outcome::Paused,
                 Err(Stop::Failed(failure)) => {
                     if failure.kind == FailureKind::WebComponents {
-                        shared.web.broken(failure.message.clone());
+                        shared.web.broken(&extractor, failure.message.clone());
                     }
                     Outcome::Failed(failure)
                 }
@@ -335,7 +337,11 @@ impl Shared {
             let mut relinks = 0;
             loop {
                 let format = find(&info, lane.key)?;
-                if let Some(until) = format.available_at {
+                // 交回 yt-dlp 的那一路由它重新解析后自己等
+                if let Some(until) = format
+                    .available_at
+                    .filter(|_| route(format) != Route::YtDlp)
+                {
                     self.web_progress(ctx.id, WebProgress::Waiting { until });
                     wait_until(until, ctx.cancel).await?;
                 }
@@ -363,7 +369,13 @@ impl Shared {
                         received += read;
                         break;
                     }
-                    Err(Stop::Failed(failure)) if relinks < RELINKS && relinkable(failure.kind) => {
+                    Err(Stop::Failed(failure)) if relinkable(failure.kind) => {
+                        if relinks == RELINKS {
+                            return Err(Stop::failed(
+                                FailureKind::WebDenied,
+                                format!("换了 {RELINKS} 次下载地址仍被拒：{}", failure.message),
+                            ));
+                        }
                         relinks += 1;
                         info = self.resolve_web(ctx).await?;
                     }
@@ -599,7 +611,20 @@ impl Shared {
                 let Some(index) = broken_input(&error) else {
                     return Err(Stop::core(&error));
                 };
-                // 这一路下坏了（截断、内容损坏）：删掉，继续时只重下它
+                // 这一路下坏了（截断、内容损坏）：删掉，继续时只重下它；重下过一次仍读不出的是网站上的就坏了，再下也一样
+                let redone = ctx.work_dir.join(format!("{}.{REDONE}", lanes[index].role));
+                if exists(&redone).await? {
+                    return Err(Stop::failed(
+                        FailureKind::Unrecoverable,
+                        format!(
+                            "{}那一路重下过一次仍读不出，网站上的内容就是坏的：{error}",
+                            lanes[index].label()
+                        ),
+                    ));
+                }
+                tokio::fs::write(&redone, b"")
+                    .await
+                    .map_err(|error| Stop::disk(&redone, &error))?;
                 remove(&files[index]).await?;
                 return Err(Stop::failed(
                     FailureKind::Integrity,

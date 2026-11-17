@@ -345,10 +345,17 @@ impl Service {
         let tx = store.transaction()?;
         store::pause_interrupted(&tx)?;
         let settings = store::settings(&tx)?;
-        let seeding: Vec<TaskId> = store::list(&tx)?
-            .into_iter()
+        let tasks = store::list(&tx)?;
+        let seeding: Vec<TaskId> = tasks
+            .iter()
             .filter(|task| task.seeding)
             .map(|task| task.id)
+            .collect();
+        // 完成了的网页视频任务的任务目录：完成时写存储没成、事后补写的，或写进后、删之前退出的，留到这里删
+        let finished_web: Vec<PathBuf> = tasks
+            .into_iter()
+            .filter(|task| task.status == Status::Done && task.spec.web().is_some())
+            .filter_map(|task| task.work_dir)
             .collect();
         tx.commit()?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -394,14 +401,22 @@ impl Service {
             shared,
             runtime: Some(runtime),
         };
-        // 上次更新 yt-dlp 换下来的旧版本：这时没有任务在用
+        // 上次更新 yt-dlp 换下来的旧版本：这时没有任务在用；完成了的网页视频任务留下的任务目录
         {
             let _entered = service.runtime().enter();
             let shared = service.shared.clone();
-            service
-                .shared
-                .tracker
-                .spawn(async move { shared.web.sweep().await });
+            service.shared.tracker.spawn(async move {
+                shared.web.sweep().await;
+                for work_dir in finished_web {
+                    if let Err(error) = web_task::remove_work_dir(&work_dir).await {
+                        // 接收端就在返回值里，界面关闭前不会丢弃
+                        let _closed = shared.events.send(Event::Orphaned {
+                            paths: vec![work_dir],
+                            reason: error.to_string(),
+                        });
+                    }
+                }
+            });
         }
         // 上次退出时还在做种的接着做；开始不了的与做种中途开始不了的一样，以做种停了报出、记为不再做种（可再点做种）
         {

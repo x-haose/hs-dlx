@@ -94,6 +94,9 @@ pub enum FailureKind {
     /// 网页视频：网站这次给的格式里认不出选中的画质（没了、编号移位、内容重新编码过）。网站有时少给一些格式，再试可能
     /// 就有；一直认不出只能放弃后重新新建
     WebChanged,
+    /// 网页视频：自己下时网站拒绝了这次给的下载地址（401、403、404、410 或大小不符），换过几次直链仍然这样。继续时
+    /// 重新解析；要登录的补上登录后的 Cookie
+    WebDenied,
     /// 网页视频：解析组件没装好或坏了，重新安装后再继续
     WebComponents,
     /// 其余（任务目录正被别的任务或没做完的放弃占着、本机建不出 HTTP 客户端、不经暂停的取消）
@@ -209,7 +212,9 @@ impl FailureKind {
             ExtractError::Unsupported(_) | ExtractError::Other(_) | ExtractError::Crashed(_) => {
                 FailureKind::WebExtract
             }
-            ExtractError::Proxy(_) | ExtractError::Cancelled => FailureKind::Other,
+            ExtractError::Proxy(_) | ExtractError::System(_) | ExtractError::Cancelled => {
+                FailureKind::Other
+            }
         }
     }
 
@@ -269,6 +274,7 @@ impl FailureKind {
             | FailureKind::WebExtract
             | FailureKind::WebComponents
             | FailureKind::WebChanged
+            | FailureKind::WebDenied
             | FailureKind::Other => true,
             FailureKind::WebGone
             | FailureKind::CloudApi
@@ -295,6 +301,7 @@ impl FailureKind {
             | FailureKind::Stalled
             | FailureKind::NothingToWrite
             | FailureKind::WebLogin
+            | FailureKind::WebDenied
             | FailureKind::Other => true,
             FailureKind::Certificate
             | FailureKind::WebGeo
@@ -353,6 +360,7 @@ impl FailureKind {
             FailureKind::WebExtract => "web-extract".into(),
             FailureKind::WebGone => "web-gone".into(),
             FailureKind::WebChanged => "web-changed".into(),
+            FailureKind::WebDenied => "web-denied".into(),
             FailureKind::WebComponents => "web-components".into(),
             FailureKind::Other => "other".into(),
         }
@@ -383,6 +391,7 @@ impl FailureKind {
             "web-extract" => FailureKind::WebExtract,
             "web-gone" => FailureKind::WebGone,
             "web-changed" => FailureKind::WebChanged,
+            "web-denied" => FailureKind::WebDenied,
             "web-components" => FailureKind::WebComponents,
             "other" => FailureKind::Other,
             _ => FailureKind::Status(code.strip_prefix("status:")?.parse().ok()?),
@@ -418,6 +427,7 @@ pub(crate) fn every() -> Vec<FailureKind> {
         FailureKind::WebExtract,
         FailureKind::WebGone,
         FailureKind::WebChanged,
+        FailureKind::WebDenied,
         FailureKind::WebComponents,
         FailureKind::Other,
     ];
@@ -446,6 +456,7 @@ pub(crate) fn every() -> Vec<FailureKind> {
             | FailureKind::WebExtract
             | FailureKind::WebGone
             | FailureKind::WebChanged
+            | FailureKind::WebDenied
             | FailureKind::WebComponents
             | FailureKind::Other => {}
         }

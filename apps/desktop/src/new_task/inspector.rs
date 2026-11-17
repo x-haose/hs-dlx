@@ -8,7 +8,7 @@ use gpui_kit::{
     AnyElement, Context, Div, IntoElement, ParentElement as _, SharedString, Styled as _, div, px,
 };
 use gpui_kit::{InteractiveElement as _, StatefulInteractiveElement as _};
-use hs_dlx_app::{Failure, MetadataProgress, OutputKind};
+use hs_dlx_app::{Failure, FailureKind, MetadataProgress, OutputKind};
 use hs_m3u8_core::{FileInfo, Probe};
 
 use super::{NewTask, NewTaskEvent, PageCheck, Probing, Route, TorrentChoice, duration_of};
@@ -103,7 +103,7 @@ impl NewTask {
     }
 
     /// 探测失败：错误（与看过不是网页的说明）、请求经哪里走、缺请求头时的编辑框；底栏是重新探测与另找。被拒或取到错误
-    /// 页的多半缺请求头，带上再探测；再试也一样的不给重新探测。不是从嗅探页来的还可以在网页里打开它找视频流。
+    /// 页的多半缺请求头、网页视频要登录的缺 Cookie，带上再探测；再试也一样的不给重新探测。不是从嗅探页来的还可以在网页里打开它找视频流。
     fn failed_inspector(
         &self,
         title: String,
@@ -111,7 +111,9 @@ impl NewTask {
         failure: &Failure,
         cx: &mut Context<Self>,
     ) -> Div {
-        let headers = failure.kind.headers_likely_missing();
+        // 网页视频要登录：补上登录后的 Cookie 再解析
+        let headers =
+            failure.kind.headers_likely_missing() || failure.kind == FailureKind::WebLogin;
         let again = headers || failure.kind.retry_helps();
         let mut body = vec![ui::note(failure.message.clone(), true).into_any_element()];
         if let PageCheck::NotPage(note) = &self.page_check {

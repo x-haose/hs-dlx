@@ -91,9 +91,12 @@ pub enum ExtractError {
     /// 解析进程意外退出或回的认不出：原因是它标准错误的末尾
     #[error("解析进程出错：{0}")]
     Crashed(String),
-    /// 解析进程起不来（组件的文件缺了或坏了）：重新安装组件
+    /// 解析进程起不来（组件的文件缺了、没有执行权限或不是可执行文件）：重新安装组件
     #[error("解析组件运行不了：{0}")]
     Broken(String),
+    /// 本机一时起不了进程（打开的文件或进程太多、内存不够）：过一会再试
+    #[error("起不了解析进程：{0}")]
+    System(String),
     /// 系统代理设置读不了
     #[error("{0}")]
     Proxy(String),
@@ -181,6 +184,19 @@ impl Extractor {
             timeout,
             idle: Mutex::new(VecDeque::new()),
             slots: Semaphore::new(WORKERS),
+        }
+    }
+
+    /// 停掉闲着的解析进程，等它们退出（换下组件之前：Windows 上删不掉在运行的程序）。在解析的照常解析完。
+    pub async fn shutdown(&self) {
+        let idle: Vec<Worker> = self
+            .idle
+            .lock()
+            .expect("锁里不会 panic")
+            .drain(..)
+            .collect();
+        for worker in idle {
+            worker.stop().await;
         }
     }
 
@@ -292,9 +308,19 @@ impl Extractor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let mut child = command
-            .spawn()
-            .map_err(|error| ExtractError::Broken(format!("起不来：{error}")))?;
+        let mut child = command.spawn().map_err(|error| {
+            // ENOEXEC（Unix）、ERROR_BAD_EXE_FORMAT（Windows）：不是可执行文件
+            let not_executable = if cfg!(windows) { 193 } else { 8 };
+            let broken = matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) || error.raw_os_error() == Some(not_executable);
+            if broken {
+                ExtractError::Broken(format!("起不来：{error}"))
+            } else {
+                ExtractError::System(error.to_string())
+            }
+        })?;
         let stdin = child.stdin.take().expect("上面设了 piped");
         let stdout = BufReader::new(child.stdout.take().expect("上面设了 piped"));
         let mut stderr_pipe = child.stderr.take().expect("上面设了 piped");

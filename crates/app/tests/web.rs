@@ -348,7 +348,7 @@ fn video_and_audio_are_fetched_apart_and_merged() {
     assert!(!folder.join("两路.mp4.hsdl").exists());
 }
 
-/// 直链被拒（过期、与出口绑定）：重新解析换新的再下，不以 403 停下；一直被拒时照 403 停下。
+/// 直链被拒（过期、与出口绑定）：重新解析换新的再下，不以 403 停下；一直被拒时以直链被拒停下（可继续）。
 #[test]
 fn a_refused_link_is_resolved_again() {
     let dir = test_dir("relink");
@@ -380,7 +380,8 @@ fn a_refused_link_is_resolved_again() {
                 assert_eq!(std::fs::read(folder.join("两路.ts")).unwrap(), samples().0);
             }
             ("always", Status::Failed(failure)) => {
-                assert_eq!(failure.kind, FailureKind::Status(403));
+                assert_eq!(failure.kind, FailureKind::WebDenied);
+                assert!(failure.kind.retry_helps());
             }
             (name, other) => panic!("{name}：{other:?}"),
         }

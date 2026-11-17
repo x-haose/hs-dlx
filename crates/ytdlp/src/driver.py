@@ -54,6 +54,8 @@ TRACEBACK_TAIL = 2000
 INTERNAL_EXTENSIONS = frozenset(
     {"description", "json", "meta", "orig", "part", "temp", "uncut", "unknown_video", "ytdl"}
 )
+# 网站说资源没了的 HTTP 状态
+GONE = frozenset({404, 410})
 # 下载进度至多多久报一次（秒）
 PROGRESS_INTERVAL = 0.2
 # 用 yt-dlp 锁定版本的这两组依赖：默认的依赖与模拟浏览器 TLS 指纹的 curl-cffi
@@ -249,19 +251,24 @@ def classify(error: BaseException) -> tuple[str, str]:
     种类：`unsupported`（没有专门的解析器认得这个网址）、`geo`（地区限制）、`login`（要登录或 Cookie）、
     `rate_limited`（429）、`network`（连不上、超时、TLS；下载时服务器回的错误状态与没下完整）、`disk`（下载时写不了
     文件）、`unavailable`（网站说视频不可用：私密、删了、未开播等）、`other`（其余，多为网站改了、yt-dlp 要更新）。
-    下载时（不经解析器）的错误状态多为直链过期或被拒（403、404 等），重新解析即换新的。
+    网站回的错误状态（解析时请求接口、下载时请求直链）：404、410 为不可用，429 为限流，其余（403 被拒、412 风控、
+    5xx 等）算网络：多为一时的，再试即重新解析、换新的直链。
     """
     original = unwrapped(error)
     message = clean(str(getattr(original, "orig_msg", None) or original))
-    names, causes = lineage(original), lineage(root_of(original))
+    root = root_of(original)
+    names, causes = lineage(original), lineage(root)
+    status = getattr(root, "status", None) if "HTTPError" in causes else None
     kind = "other"
     if "UnsupportedError" in names:
         kind = "unsupported"
     elif "GeoRestrictedError" in names:
         kind = "geo"
-    elif "HTTPError" in causes and getattr(root_of(original), "status", None) == TOO_MANY_REQUESTS:
+    elif status == TOO_MANY_REQUESTS:
         kind = "rate_limited"
-    elif "TransportError" in causes or names & {"HTTPError", "ContentTooShortError"}:
+    elif status in GONE:
+        kind = "unavailable"
+    elif status is not None or "TransportError" in causes or "ContentTooShortError" in names:
         kind = "network"
     elif isinstance(original, OSError):
         kind = "disk"
@@ -275,7 +282,8 @@ def said(message: str) -> str:
     lowered = message.lower()
     if any(word in lowered for word in ("rate-limited", "try again later", "too many requests")):
         return "rate_limited"
-    if any(word in lowered for word in ("sign in", "log in", "login", "cookies", "captcha", "not a bot")):
+    login = ("sign in", "log in", "login", "cookies", "captcha", "not a bot", "members-only", "join this channel")
+    if any(word in lowered for word in login):
         return "login"
     return "unavailable"
 
@@ -419,9 +427,10 @@ def same_format(fmt: Mapping[str, object], wanted: Mapping[str, object]) -> bool
 def download(yt_dlp: ModuleType, request: Mapping[str, object], deno: str, cache: str, replies: TextIO) -> Info:
     """用 yt-dlp 自己的下载器把请求里要的那个格式下到当前目录下的 `name`，进度逐行写进 `replies`，返回最后的回应。
 
-    解析一次，在结果里按格式编号与属性找到要的那个（不当作格式选择式：`mp4`、`b` 之类的编号会被当成选择式），只把它
-    交给 yt-dlp 下载；不合并、不做修复、HLS 与 DASH 用它自己的下载器（没有 ffmpeg 程序，HLS 写出的是各分片接起来的）；
-    已有的 `.part` 接着下，已下完的不覆盖；缺了的片段不跳过。
+    照 yt-dlp 自己的流程解析、选格式、下载，选格式时只选按格式编号与属性认出的那个（不用格式选择式：`mp4`、`b` 之类的
+    编号会被当成选择式），认不出时报 `changed`；选中之后 yt-dlp 报的、没带原因的失败（重试用尽）算网络。不合并、不做
+    修复、HLS 与 DASH 用它自己的下载器（没有 ffmpeg 程序，HLS 写出的是各分片接起来的）；已有的 `.part` 接着下，已下完
+    的不覆盖；缺了的片段不跳过。
     输出写成相对当前目录的名字：yt-dlp 会展开输出模板里的 `$` 与 `~`，且没有转义的写法，目录可以含它们（由调用方
     切换过去），名字（应用给的 `<路>.<扩展名>`）不含它们与路径分隔符，含了是应用的缺陷，报错不下。
     """
@@ -458,20 +467,25 @@ def download(yt_dlp: ModuleType, request: Mapping[str, object], deno: str, cache
             "external_downloader": {"default": "native"},
         }
     )
+    # 选格式时有没有认出要的：认出之后的失败出在下载
+    picked: list[bool] = []
+
+    def select(ctx: Mapping[str, object]) -> list[object]:
+        chosen = [fmt for fmt in items(ctx.get("formats")) if same_format(mapping(fmt) or {}, wanted)][:1]
+        picked.append(bool(chosen))
+        return chosen
+
+    options["format"] = select
     with yt_dlp.YoutubeDL(options) as ydl:
         try:
-            info = mapping(ydl.extract_info(text(request.get("url")) or "", download=False)) or {}
-            formats = [fmt for fmt in map(mapping, items(info.get("formats"))) if fmt is not None]
-            chosen = next((fmt for fmt in formats if same_format(fmt, wanted)), None)
-            if chosen is None:
-                return {"error": {"kind": "changed", "message": f"网站给的格式里没有要的 {wanted.get('format_id')}"}}
-            # 同 yt-dlp 选中格式后的做法：视频的信息合进这个格式，交给它下载这一个
-            selected = dict(info)
-            selected.update(chosen)
-            selected.pop("requested_formats", None)
-            ydl.process_info(selected)
+            ydl.extract_info(text(request.get("url")) or "", download=True)
         except yt_dlp.utils.YoutubeDLError as error:
+            if picked == [False]:
+                return {"error": {"kind": "changed", "message": f"网站给的格式里没有要的 {wanted.get('format_id')}"}}
             kind, message = classify(error)
+            # 重试用尽时 yt-dlp 在 except 之外报错，DownloadError 不带原因
+            if kind == "other" and picked == [True] and unwrapped(error) is error:
+                kind = "network"
             return {"error": {"kind": kind, "message": message}}
     skipped = [warning for warning in logger.warnings if "Skipping fragment" in warning]
     if skipped:

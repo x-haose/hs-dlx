@@ -86,8 +86,6 @@ pub fn path(path: &Path, home: Option<&Path>) -> String {
     }
 }
 
-/// 一类失败的简写与说明：简写（状态码或种类）是表盘圆盘里的大字；说明写这类失败多半是怎么回事，任务页写在检查面板，
-/// 新建页写在圆盘里。完整的错误另外列出。
 /// 网页视频组件安装到哪一步与这一步的字节进度，如「下载 Python · 12 MB / 30 MB」。
 pub fn web_install(progress: &InstallProgress) -> String {
     let stage = match progress.stage {
@@ -104,6 +102,8 @@ pub fn web_install(progress: &InstallProgress) -> String {
     format!("{stage}{amount}")
 }
 
+/// 一类失败的简写与说明：简写（状态码或种类）是表盘圆盘里的大字；说明写这类失败多半是怎么回事，任务页写在检查面板，
+/// 新建页写在圆盘里。完整的错误另外列出。
 pub fn failure(kind: FailureKind) -> (String, &'static str) {
     match kind {
         FailureKind::Status(code @ (401 | 403)) => (
@@ -175,6 +175,10 @@ pub fn failure(kind: FailureKind) -> (String, &'static str) {
         FailureKind::WebGone => (
             "没了".into(),
             "网站说视频不可用了，或网页现在是另一个视频：只能放弃，或重新粘贴网页另建",
+        ),
+        FailureKind::WebDenied => (
+            "被拒".into(),
+            "网站拒绝了下载地址：继续时重新解析；要登录的，在嗅探页登录后用「解析网页视频」重新建",
         ),
         FailureKind::WebChanged => (
             "画质".into(),

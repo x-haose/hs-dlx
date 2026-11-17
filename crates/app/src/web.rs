@@ -164,20 +164,22 @@ pub fn choices(info: &Info, preference: Preference) -> Vec<Choice> {
         .filter(|format| {
             format.video.maybe()
                 && (!matches!(format.audio, Track::Absent)
-                    || !matches!(
-                        VideoCodec::of(&format.video),
-                        VideoCodec::Other(_) | VideoCodec::Unknown
-                    ))
+                    || (mergeable(format)
+                        && !matches!(
+                            VideoCodec::of(&format.video),
+                            VideoCodec::Other(_) | VideoCodec::Unknown
+                        )))
         })
         .collect();
     let pairable: Vec<&Format> = audio_only
         .iter()
         .copied()
         .filter(|format| {
-            !matches!(
-                AudioCodec::of(&format.audio),
-                AudioCodec::Other(_) | AudioCodec::Unknown
-            )
+            mergeable(format)
+                && !matches!(
+                    AudioCodec::of(&format.audio),
+                    AudioCodec::Other(_) | AudioCodec::Unknown
+                )
         })
         .collect();
     let mut heights: Vec<Option<u32>> = with_video.iter().map(|format| format.height).collect();
@@ -204,6 +206,21 @@ pub fn choices(info: &Info, preference: Preference) -> Vec<Choice> {
         found.push(choice_of(audio, None));
     }
     found
+}
+
+/// 合并收不收 `format` 下到的文件：合并只收 MP4（含 M4A）、Matroska（含 WebM）、TS 与裸 AAC、MP3。HLS 与 DASH 下到的
+/// 是 MP4、TS 或分片接起来的 MP4、WebM；别的按扩展名。
+fn mergeable(format: &Format) -> bool {
+    match format.protocol {
+        Protocol::Hls | Protocol::Dash => true,
+        Protocol::Http | Protocol::Other(_) => format.ext.as_deref().is_some_and(|ext| {
+            [
+                "mp4", "m4a", "m4v", "mkv", "mka", "webm", "ts", "aac", "mp3",
+            ]
+            .iter()
+            .any(|known| ext.eq_ignore_ascii_case(known))
+        }),
+    }
 }
 
 /// 同一档清晰度里比较视频的分数：自己下的先于交回 yt-dlp 的；兼容优先时 H.264、SDR 在前；再比帧率与码率。

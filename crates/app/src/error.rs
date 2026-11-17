@@ -95,6 +95,9 @@ pub enum Error {
     /// 网页视频的组件还没装好
     #[error("还没装网页视频的解析组件")]
     WebNotReady,
+    /// 有网页视频任务在跑，重装组件要先暂停它们（在用的组件换不下）
+    #[error("有网页视频任务在跑：先暂停它们再重装")]
+    WebInUse,
     /// 调网盘的接口失败（提交、登录等不在任务里做的）
     #[error(transparent)]
     PikPak(#[from] hs_dlx_cloud::pikpak::Error),

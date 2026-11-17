@@ -34,21 +34,21 @@ impl NewTask {
     pub(super) fn resolve_page(&mut self, first: bool, cx: &mut Context<Self>) {
         let state = self.service.web_state().borrow().clone();
         match state {
-            WebState::Ready(_) | WebState::UpdateFailed { .. } => self.resolve(cx),
+            WebState::Ready(_) | WebState::UpdateFailed { .. } => self.resolve(first, cx),
             WebState::Unavailable => self.not_resolvable(first, cx),
             WebState::Missing
             | WebState::Installing(_)
             | WebState::Failed(_)
             | WebState::Broken(_) => {
                 self.probing = Probing::NeedsWeb(state);
-                self.watch_web(cx);
+                self.watch_web(first, cx);
                 cx.notify();
             }
         }
     }
 
     /// 看着组件的状态：装着时更新进度，装好即解析。
-    fn watch_web(&mut self, cx: &mut Context<Self>) {
+    fn watch_web(&mut self, first: bool, cx: &mut Context<Self>) {
         let mut states = self.service.web_state();
         self._web = cx.spawn(async move |this, cx| {
             loop {
@@ -61,7 +61,7 @@ impl NewTask {
                         return false;
                     }
                     if matches!(state, WebState::Ready(_) | WebState::UpdateFailed { .. }) {
-                        this.resolve(cx);
+                        this.resolve(first, cx);
                         return false;
                     }
                     this.probing = Probing::NeedsWeb(state);
@@ -86,8 +86,9 @@ impl NewTask {
         cx.notify();
     }
 
-    /// 交给 yt-dlp 解析（之前的结果作废），带上请求头里的 Cookie（要登录才看得到的视频）。
-    fn resolve(&mut self, cx: &mut Context<Self>) {
+    /// 交给 yt-dlp 解析（之前的结果作废），带上请求头里的 Cookie（要登录才看得到的视频）；`first` 为第一次探测（见
+    /// [`NewTask::not_resolvable`]）。
+    fn resolve(&mut self, first: bool, cx: &mut Context<Self>) {
         let headers = self.headers.read(cx).headers().to_vec();
         let handle = match self.service.resolve(self.url.clone(), &headers) {
             Ok(handle) => handle,
@@ -108,7 +109,7 @@ impl NewTask {
             let _closed = this.update(cx, |this, cx| {
                 match result {
                     Ok(Ok(resolved)) => this.resolved(resolved, cx),
-                    Ok(Err(ExtractError::Unsupported(_))) => this.not_resolvable(true, cx),
+                    Ok(Err(ExtractError::Unsupported(_))) => this.not_resolvable(first, cx),
                     Ok(Err(error)) => {
                         this.probing = Probing::Failed(Failure::of_extract(&error));
                     }

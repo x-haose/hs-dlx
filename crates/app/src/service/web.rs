@@ -113,11 +113,17 @@ impl Web {
         }
     }
 
-    /// 解析进程起不来（组件的文件被隔离或坏了）：不再拿它解析，状态记为坏了（带上原因），由用户重装。在用它的任务
-    /// 照样以组件坏了停下。
-    pub(super) fn broken(&self, reason: String) {
-        *lock(&self.extractor) = None;
-        self.state.send_replace(WebState::Broken(reason));
+    /// `extractor` 的解析进程起不来（组件的文件被隔离或坏了）：它还是在用的那个时不再拿它解析，状态记为坏了（带上
+    /// 原因），由用户重装；已换掉（重装、更新过）时什么也不做。在用它的任务照样以组件坏了停下。
+    pub(super) fn broken(&self, extractor: &Arc<Extractor>, reason: String) {
+        let mut current = lock(&self.extractor);
+        if current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, extractor))
+        {
+            *current = None;
+            self.state.send_replace(WebState::Broken(reason));
+        }
     }
 
     /// 删掉不再用的组件（见 [`Components::sweep`]）；本平台没有组件时什么也不做。
@@ -282,7 +288,15 @@ impl Service {
         }
         let settings = self.settings()?;
         let (proxy, channel) = (settings.proxy, settings.web_channel);
-        let repair = !matches!(*web.state.borrow(), WebState::Missing | WebState::Failed(_));
+        let before = web.state.borrow().clone();
+        let repair = !matches!(before, WebState::Missing | WebState::Failed(_));
+        if repair
+            && lock(&self.shared.running)
+                .values()
+                .any(|running| matches!(running.control, super::Control::Web(_)))
+        {
+            return Err(Error::WebInUse);
+        }
         let cancel = {
             let mut installing = lock(&web.installing);
             if installing.is_some() {
@@ -302,7 +316,43 @@ impl Service {
                 state.send_replace(WebState::Installing(progress));
             };
             let installed = if repair {
-                components.repair(&proxy, channel, &report, &cancel).await
+                // 闲着的解析进程用着要换下的组件
+                let old = lock(&web.extractor).take();
+                if let Some(old) = old {
+                    old.shutdown().await;
+                }
+                let repaired = components.repair(&proxy, channel, &report, &cancel).await;
+                if let Err(error) = &repaired {
+                    // 新的没就位时旧的照旧在（下载失败、取消），照原来的状态接着用
+                    let kept = match components.installed() {
+                        Ok(Some(installed)) if !matches!(before, WebState::Broken(_)) => {
+                            Some(installed)
+                        }
+                        Ok(_) | Err(_) => None,
+                    };
+                    let next = match (kept, &before) {
+                        (Some(installed), _) => {
+                            let version = installed.version.clone();
+                            *lock(&web.extractor) = Some(Arc::new(Extractor::new(
+                                installed,
+                                web.cache.clone(),
+                                EXTRACT_TIMEOUT,
+                            )));
+                            WebState::UpdateFailed {
+                                version,
+                                reason: format!("重装没成：{error}"),
+                            }
+                        }
+                        (None, WebState::Broken(_)) => {
+                            WebState::Broken(format!("重装没成：{error}"))
+                        }
+                        (None, _) => WebState::Failed(error.to_string()),
+                    };
+                    *lock(&web.installing) = None;
+                    web.state.send_replace(next);
+                    return;
+                }
+                repaired
             } else {
                 components.install(&proxy, channel, &report, &cancel).await
             };
@@ -356,7 +406,7 @@ impl Service {
                 .await
                 .inspect_err(|error| {
                     if let ExtractError::Broken(reason) = error {
-                        shared.web.broken(reason.clone());
+                        shared.web.broken(&extractor, reason.clone());
                     }
                 })?;
             let choices = choices(&info, preference);

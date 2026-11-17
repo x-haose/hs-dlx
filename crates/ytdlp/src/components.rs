@@ -4,9 +4,9 @@
 //! 进度，pip 不联网。每个版本自检过了才记成当前的，没装成的不影响在用的。
 //!
 //! 目录布局（`root` 下）：
-//! - `python-<版本>/`、`deno-<版本>/`：解开的组件包；不是锁定版本的在装好之后删掉
-//! - `yt-dlp-<版本>/`：pip 的 `--target` 目录；保留当前的与上一个，更早的在安装后与应用启动时（[`Components::sweep`]）
-//!   删掉：更新时不删，换版本前起的解析进程可能还在用
+//! - `python-<版本>/`、`deno-<版本>/`：解开的组件包；不是锁定版本的在应用启动时删掉
+//! - `yt-dlp-<版本>/`：pip 的 `--target` 目录；保留当前的与上一个，更早的在应用启动时（[`Components::sweep`]）删掉：
+//!   安装、更新、重装时不删，换版本前起的解析进程可能还在用
 //! - `state.json`：当前与上一个 yt-dlp 版本、装它时的 Python 版本；先写临时文件、落盘再改名
 //! - `downloads/`：下载中与下好了的组件包、wheel 与核心的任务目录（续传用），用过即删
 //! - `staging/`：解包与 pip 安装的临时目录，每次安装前清空
@@ -74,6 +74,13 @@ pub struct Installed {
     /// 上一个 yt-dlp 版本（更新前的，留着可换回，见 [`Components::rollback`]）；没有时为 None
     pub previous: Option<String>,
     pub driver: PathBuf,
+}
+
+/// 解开即用的组件包。
+#[derive(Clone, Copy)]
+enum Package {
+    Python,
+    Deno,
 }
 
 /// 安装进行到哪一步。
@@ -198,8 +205,9 @@ impl Components {
         self.install_missing(proxy, channel, progress, cancel).await
     }
 
-    /// 重装：删掉在用的 Python、deno 与 yt-dlp（文件被杀毒软件隔离或坏了、进程起不来），再照 [`Components::install`]
-    /// 装上（yt-dlp 照状态文件记着的版本）。用着它们的解析进程之后起不来，重装完换新的。
+    /// 重装：Python、deno 与 yt-dlp（状态文件记着的版本，没有或坏了时为 `channel` 上最新的）都重新下载、解开或安装、
+    /// 自检，再换下在用的（文件被杀毒软件隔离或坏了、进程起不来）。每一样都是新的就位了才删旧的：下载失败（离线、代理
+    /// 坏了）时在用的不动。用着它们的解析进程要先停下（Windows 上删不掉在运行的程序）；上一个 yt-dlp 版本照旧记着。
     pub async fn repair(
         &self,
         proxy: &Proxy,
@@ -208,19 +216,15 @@ impl Components {
         cancel: &CancellationToken,
     ) -> Result<Installed, Error> {
         let _busy = self.busy.lock().await;
-        let mut dirs = vec![
-            self.root
-                .join(format!("python-{}", self.pins.python.version)),
-            self.root.join(format!("deno-{}", self.pins.deno.version)),
-        ];
-        // 坏了的状态文件由安装重写
-        if let Ok(Some(state)) = self.state() {
-            dirs.push(self.root.join(format!("yt-dlp-{}", state.yt_dlp)));
+        self.prepare().await?;
+        for package in [Package::Python, Package::Deno] {
+            self.ensure(package, true, proxy, progress, cancel).await?;
         }
-        for dir in &dirs {
-            remove_dir(dir).await?;
-        }
-        self.install_missing(proxy, channel, progress, cancel).await
+        let version = match self.state() {
+            Ok(Some(state)) => state.yt_dlp,
+            Ok(None) | Err(_) => self.latest(proxy, channel).await?,
+        };
+        self.install_yt_dlp(proxy, &version, progress, cancel).await
     }
 
     /// 换回上一个 yt-dlp（更新后新版出了问题时）：不联网，自检过了才换，换后上一个是刚才在用的。没有上一个（没更新过，
@@ -243,11 +247,40 @@ impl Components {
         Ok(back)
     }
 
-    /// 删掉不再用的：锁定版本以外的 Python 与 deno、当前与上一个以外的 yt-dlp、旧的驱动脚本。更新之后用旧版本的
-    /// 解析进程可能还在跑（换版本前开始的任务），在没有任务运行时（应用启动时）调用。
+    /// 删掉不再用的：锁定版本以外的 Python 与 deno、当前与上一个以外的 yt-dlp、旧的驱动脚本；删不掉的留着，下次再删。
+    /// 换版本之后用旧版本的解析进程可能还在跑（换版本前开始的任务），在没有任务运行时（应用启动时）调用。
     pub async fn sweep(&self) {
         let _busy = self.busy.lock().await;
-        self.sweep_unlocked().await;
+        let Ok(Some(state)) = self.state() else {
+            return;
+        };
+        let keep = [
+            format!("python-{}", self.pins.python.version),
+            format!("deno-{}", self.pins.deno.version),
+            format!("yt-dlp-{}", state.yt_dlp),
+            state
+                .previous
+                .map_or_else(String::new, |previous| format!("yt-dlp-{previous}")),
+        ];
+        let driver = self.driver_path();
+        let Ok(mut entries) = tokio::fs::read_dir(&self.root).await else {
+            return;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = entry.path();
+            let stale_dir = ["python-", "deno-", "yt-dlp-"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+                && !keep.contains(&name);
+            let stale_driver = name.starts_with("driver-") && path != driver;
+            // 清理失败不影响已装好的，下次安装时再删
+            if stale_dir {
+                let _left = tokio::fs::remove_dir_all(&path).await;
+            } else if stale_driver {
+                let _left = tokio::fs::remove_file(&path).await;
+            }
+        }
     }
 
     /// [`Components::install`] 拿到锁、核对过没装全之后的部分。
@@ -259,24 +292,9 @@ impl Components {
         cancel: &CancellationToken,
     ) -> Result<Installed, Error> {
         self.prepare().await?;
-        self.ensure(
-            &self.pins.python,
-            "python",
-            Stage::Python,
-            proxy,
-            progress,
-            cancel,
-        )
-        .await?;
-        self.ensure(
-            &self.pins.deno,
-            "deno",
-            Stage::Deno,
-            proxy,
-            progress,
-            cancel,
-        )
-        .await?;
+        for package in [Package::Python, Package::Deno] {
+            self.ensure(package, false, proxy, progress, cancel).await?;
+        }
         // 坏了的状态文件不挡着修：照没有处理
         let wanted = match self.state() {
             Ok(Some(state)) => Some(state.yt_dlp),
@@ -286,11 +304,7 @@ impl Components {
             Some(version) => version,
             None => self.latest(proxy, channel).await?,
         };
-        let installed = self
-            .install_yt_dlp(proxy, &version, progress, cancel)
-            .await?;
-        self.sweep_unlocked().await;
-        Ok(installed)
+        self.install_yt_dlp(proxy, &version, progress, cancel).await
     }
 
     /// 装上 yt-dlp 的 `version`（PyPI 上的写法，经 `proxy`）、自检，过了才换成当前的，上一个留着；已是当前的直接返回。
@@ -496,25 +510,23 @@ impl Components {
         Ok(())
     }
 
-    /// 锁定的组件 `pinned` 在 `<name>-<版本>/` 下就位：没有、或里面缺了可执行文件（被杀毒软件隔离、被删）时下载、
-    /// 核对、解开再改名就位。
+    /// 锁定的组件包 `package` 在 `<name>-<版本>/` 下就位：没有、或里面缺了可执行文件（被杀毒软件隔离、被删）时，或
+    /// `again`（重装）时，下载、核对、解开，新的就位了才删旧的。
     async fn ensure(
         &self,
-        pinned: &Pinned,
-        name: &str,
-        stage: Stage,
+        package: Package,
+        again: bool,
         proxy: &Proxy,
         progress: &(dyn Fn(InstallProgress) + Sync),
         cancel: &CancellationToken,
     ) -> Result<(), Error> {
+        let (pinned, name, stage) = match package {
+            Package::Python => (&self.pins.python, "python", Stage::Python),
+            Package::Deno => (&self.pins.deno, "deno", Stage::Deno),
+        };
         let target = self.root.join(format!("{name}-{}", pinned.version));
-        if executable(&self.root, name, pinned).is_file() {
+        if !again && executable(&self.root, name, pinned).is_file() {
             return Ok(());
-        }
-        if target.exists() {
-            tokio::fs::remove_dir_all(&target)
-                .await
-                .map_err(|error| Error::disk(&target, &error))?;
         }
         let package = self
             .root
@@ -549,6 +561,7 @@ impl Components {
                 pinned.executable
             )));
         }
+        remove_dir(&target).await?;
         tokio::fs::rename(&staging, &target)
             .await
             .map_err(|error| Error::disk(&target, &error))?;
@@ -669,8 +682,10 @@ impl Components {
         tokio::fs::rename(&staging, &target)
             .await
             .map_err(|error| Error::disk(&target, &error))?;
+        // 重装同一版本时上一个照旧
         let previous = match self.state() {
-            Ok(Some(state)) => Some(state.yt_dlp).filter(|old| old != version),
+            Ok(Some(state)) if state.yt_dlp == version => state.previous,
+            Ok(Some(state)) => Some(state.yt_dlp),
             Ok(None) | Err(_) => None,
         };
         self.write_state(version, previous.clone()).await?;
@@ -685,40 +700,6 @@ impl Components {
         let body = self.get(proxy, &format!("{name}/{version}/json")).await?;
         serde_json::from_slice(&body)
             .map_err(|error| Error::Index(format!("PyPI 回的 {name} {version} 认不出：{error}")))
-    }
-
-    /// 删掉不再用的：不是锁定版本的 Python、deno，不是当前与上一个的 yt-dlp，旧的驱动脚本。删不掉的留着，下次再删。
-    async fn sweep_unlocked(&self) {
-        let Ok(Some(state)) = self.state() else {
-            return;
-        };
-        let keep = [
-            format!("python-{}", self.pins.python.version),
-            format!("deno-{}", self.pins.deno.version),
-            format!("yt-dlp-{}", state.yt_dlp),
-            state
-                .previous
-                .map_or_else(String::new, |previous| format!("yt-dlp-{previous}")),
-        ];
-        let driver = self.driver_path();
-        let Ok(mut entries) = tokio::fs::read_dir(&self.root).await else {
-            return;
-        };
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let path = entry.path();
-            let stale_dir = ["python-", "deno-", "yt-dlp-"]
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
-                && !keep.contains(&name);
-            let stale_driver = name.starts_with("driver-") && path != driver;
-            // 清理失败不影响已装好的，下次安装时再删
-            if stale_dir {
-                let _left = tokio::fs::remove_dir_all(&path).await;
-            } else if stale_driver {
-                let _left = tokio::fs::remove_file(&path).await;
-            }
-        }
     }
 }
 

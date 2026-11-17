@@ -379,7 +379,8 @@ async fn leftovers_from_an_interrupted_install_are_checked_not_trusted() {
     assert!(!root.join("downloads/python-3.13.hsdl").exists());
 }
 
-/// 重装：在用的 Python、deno 与 yt-dlp 删掉重下（内容坏了而路径还在，安装会当作装好了），yt-dlp 照记着的版本。
+/// 重装：Python、deno 与 yt-dlp 都重下、换下在用的（内容坏了而路径还在，安装会当作装好了），yt-dlp 照记着的版本；
+/// 下载失败时在用的不动。
 #[tokio::test(flavor = "multi_thread")]
 async fn repairing_downloads_everything_again() {
     let root = test_dir("repair");
@@ -401,6 +402,22 @@ async fn repairing_downloads_everything_again() {
     assert_ne!(std::fs::read(&repaired.deno).unwrap(), b"broken");
     assert_eq!(server.hits("python.tar.gz"), 2);
     assert_eq!(server.hits("deno.zip"), 2);
+    // 下不到（服务器上没有了）：报错，在用的照旧
+    server.put("deno.zip", Vec::new());
+    std::fs::write(&repaired.deno, b"broken").unwrap();
+    assert!(
+        components
+            .repair(
+                &Proxy::Direct,
+                Channel::Stable,
+                &|_| {},
+                &CancellationToken::new()
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&repaired.deno).unwrap(), b"broken");
+    assert_eq!(components.installed().unwrap(), Some(repaired));
 }
 
 /// 更新：装进另一个目录、自检过了才换成当前的，上一个留着，更早的到清理时删掉（更新时不删）；每日构建的版本号带 `.dev0`（元数据也这样
@@ -468,7 +485,8 @@ async fn updates_switch_only_after_the_new_version_passes() {
     assert!(!root.join("yt-dlp-2026.10.21").exists(), "更早的删掉");
 }
 
-/// 换了锁定的 Python（应用升级）：已装的 yt-dlp 不算装好，安装时用新的 Python 重装同一版本，旧的 Python 删掉。
+/// 换了锁定的 Python（应用升级）：已装的 yt-dlp 不算装好，安装时用新的 Python 重装同一版本，旧的 Python 到清理时
+/// 删掉。
 #[tokio::test(flavor = "multi_thread")]
 async fn a_new_python_reinstalls_yt_dlp() {
     let root = test_dir("python");
@@ -490,6 +508,8 @@ async fn a_new_python_reinstalls_yt_dlp() {
             .python
             .starts_with(root.join("python-3.14.10-20261110"))
     );
+    assert!(root.join("python-3.13.18-20261110").exists(), "安装时不删");
+    components.sweep().await;
     assert!(!root.join("python-3.13.18-20261110").exists());
 }
 
