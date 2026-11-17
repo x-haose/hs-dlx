@@ -124,7 +124,7 @@ struct State {
     yt_dlp: String,
     /// 上一个版本；没有时为 None
     previous: Option<String>,
-    /// 装 yt-dlp 时用的 Python（[`Bundled::id`]）：依赖里有按解释器版本编译的扩展模块，换了 Python 要重装
+    /// 装 yt-dlp 时用的 Python 的 ABI（[`Bundle::python_abi`]）：依赖里有按它编译的扩展模块，它变了要重装
     python: String,
 }
 
@@ -187,7 +187,7 @@ impl Components {
         let Some(state) = self.state()? else {
             return Ok(None);
         };
-        if state.python != self.bundle.python.id {
+        if state.python != self.bundle.python_abi {
             return Ok(None);
         }
         let installed = self.installed_as(&state.yt_dlp, state.previous.clone());
@@ -244,10 +244,32 @@ impl Components {
                     bytes: 0,
                     total: None,
                 });
-                self.latest(proxy, channel).await?
+                self.latest(proxy, channel, cancel).await?
             }
         };
         self.install_yt_dlp(proxy, &version, progress, cancel).await
+    }
+
+    /// 装着的 yt-dlp 用的 Python 与这一版应用带的 ABI 相同、而随带的还没解出来（应用升级换了它们）时为 true：
+    /// [`Components::unpack_bundled`] 解出来即可用，不用重装 yt-dlp。
+    pub fn bundled_missing(&self) -> bool {
+        let Ok(Some(state)) = self.state() else {
+            return false;
+        };
+        let installed = self.installed_as(&state.yt_dlp, state.previous);
+        state.python == self.bundle.python_abi
+            && installed.site.is_dir()
+            && !(installed.python.is_file() && installed.quickjs.is_file())
+    }
+
+    /// 把这一版应用带的 Python 与 QuickJS-NG 解出来（不联网，见 [`Components::bundled_missing`]），返回装好了的。
+    pub async fn unpack_bundled(&self) -> Result<Installed, Error> {
+        let _busy = self.busy.lock().await;
+        self.prepare().await?;
+        for package in [Package::Python, Package::QuickJs] {
+            self.ensure(package, false, &|_| {}).await?;
+        }
+        self.installed()?.ok_or(Error::NotInstalled)
     }
 
     /// 换回上一个 yt-dlp（更新后新版出了问题时）：不联网，自检过了才换，换后上一个是刚才在用的。没有上一个（没更新过，
@@ -375,8 +397,9 @@ impl Components {
         cancel: &CancellationToken,
     ) -> Result<Installed, Error> {
         self.prepare().await?;
+        // 没装好（含没装成）时随带的总是重新解出来：可执行文件还在而别的文件被隔离、删了时，看不出来
         for package in [Package::Python, Package::QuickJs] {
-            self.ensure(package, false, progress).await?;
+            self.ensure(package, true, progress).await?;
         }
         // 坏了的状态文件不挡着修：照没有处理
         let wanted = match self.state() {
@@ -391,7 +414,7 @@ impl Components {
                     bytes: 0,
                     total: None,
                 });
-                self.latest(proxy, channel).await?
+                self.latest(proxy, channel, cancel).await?
             }
         };
         self.install_yt_dlp(proxy, &version, progress, cancel).await
@@ -424,10 +447,11 @@ impl Components {
                     return self
                         .install_yt_dlp(proxy, version, progress, cancel)
                         .await
-                        .map_err(|error| {
-                            Error::SelfTest(format!(
+                        .map_err(|error| match error {
+                            Error::Cancelled => Error::Cancelled,
+                            error => Error::SelfTest(format!(
                                 "本机的 {version} 坏了（{broken}），重装也没成：{error}"
-                            ))
+                            )),
                         });
                 }
                 switched => return switched,
@@ -438,8 +462,13 @@ impl Components {
     }
 
     /// `channel` 上最新的 yt-dlp 版本（经 `proxy` 查 PyPI）。
-    pub async fn latest(&self, proxy: &Proxy, channel: Channel) -> Result<String, Error> {
-        let body = self.get(proxy, &format!("{PROJECT}/json")).await?;
+    pub async fn latest(
+        &self,
+        proxy: &Proxy,
+        channel: Channel,
+        cancel: &CancellationToken,
+    ) -> Result<String, Error> {
+        let body = self.get(proxy, &format!("{PROJECT}/json"), cancel).await?;
         latest_of(&body, channel)
     }
 
@@ -490,7 +519,7 @@ impl Components {
         let state = State {
             yt_dlp: yt_dlp.to_owned(),
             previous,
-            python: self.bundle.python.id.clone(),
+            python: self.bundle.python_abi.clone(),
         };
         write_atomically(
             &self.root.join("state.json"),
@@ -516,7 +545,12 @@ impl Components {
     }
 
     /// 经 `proxy` 取 PyPI 的 JSON 接口 `<根>/<path>`。
-    async fn get(&self, proxy: &Proxy, path: &str) -> Result<Vec<u8>, Error> {
+    async fn get(
+        &self,
+        proxy: &Proxy,
+        path: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<u8>, Error> {
         let url = self
             .sources
             .api
@@ -529,11 +563,10 @@ impl Components {
             body: None,
             limit: JSON_LIMIT,
         };
-        let reply = self
-            .engine
-            .call(&source, &call)
-            .await
-            .map_err(Error::Download)?;
+        let reply = tokio::select! {
+            reply = self.engine.call(&source, &call) => reply.map_err(Error::Download)?,
+            () = cancel.cancelled() => return Err(Error::Cancelled),
+        };
         match reply.status {
             200 => Ok(reply.body),
             404 => Err(Error::Index(format!("PyPI 上没有 {path}"))),
@@ -680,10 +713,12 @@ impl Components {
         })
         .await
         .expect("解包不会 panic，运行时关闭时本任务也一起丢弃")?;
+        // 构建时核对过包里有它：解出来就没了是本机的事（被杀毒软件隔离、删了）
         if !relative(&staging, &bundled.executable).is_file() {
-            return Err(Error::Archive(format!(
-                "随应用带的 {name} 里没有 {}",
-                bundled.executable
+            return Err(Error::Disk(format!(
+                "解出来的 {name} 里没有 {}：可能被杀毒软件隔离了，把组件目录 {} 加进例外后重装",
+                bundled.executable,
+                self.root.display()
             )));
         }
         let target = self.root.join(format!("{name}-{}", bundled.id));
@@ -724,7 +759,7 @@ impl Components {
         let python = executable(&self.root, "python", &self.bundle.python);
         let driver = self.driver_path();
         // yt-dlp 这个版本与它锁定的依赖，各自在 PyPI 上的文件
-        let release = self.release(proxy, PROJECT, version).await?;
+        let release = self.release(proxy, PROJECT, version, cancel).await?;
         let requires = release.info.requires_dist.clone().unwrap_or_default();
         let listed = run_driver(&python, &driver, "requirements", &requires, cancel).await?;
         let requirements: Vec<Requirement> = serde_json::from_slice(&listed)
@@ -733,7 +768,7 @@ impl Components {
         files.insert(PROJECT.to_owned(), release.urls);
         for requirement in &requirements {
             let release = self
-                .release(proxy, &requirement.name, &requirement.version)
+                .release(proxy, &requirement.name, &requirement.version, cancel)
                 .await?;
             files.insert(requirement.name.clone(), release.urls);
         }
@@ -807,7 +842,7 @@ impl Components {
         self.replace_dir(&staging, &target).await?;
         // 重装同一版本时上一个照旧；换了 Python 时上一个是用旧 Python 装的（带按解释器版本编译的扩展模块），不再算
         let previous = match self.state() {
-            Ok(Some(state)) if state.python != self.bundle.python.id => None,
+            Ok(Some(state)) if state.python != self.bundle.python_abi => None,
             Ok(Some(state)) if state.yt_dlp == version => state.previous,
             Ok(Some(state)) => Some(state.yt_dlp),
             Ok(None) | Err(_) => None,
@@ -820,8 +855,16 @@ impl Components {
     }
 
     /// PyPI 上 `name` 的 `version` 这一版。
-    async fn release(&self, proxy: &Proxy, name: &str, version: &str) -> Result<Release, Error> {
-        let body = self.get(proxy, &format!("{name}/{version}/json")).await?;
+    async fn release(
+        &self,
+        proxy: &Proxy,
+        name: &str,
+        version: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Release, Error> {
+        let body = self
+            .get(proxy, &format!("{name}/{version}/json"), cancel)
+            .await?;
         serde_json::from_slice(&body)
             .map_err(|error| Error::Index(format!("PyPI 回的 {name} {version} 认不出：{error}")))
     }
@@ -967,7 +1010,8 @@ async fn self_test(
         .arg("utf8")
         .arg(driver)
         .arg("selftest")
-        .arg(site);
+        .arg(site)
+        .arg(quickjs);
     let out = run(selftest, SELF_TEST_TIMEOUT, cancel)
         .await
         .map_err(|error| match error {

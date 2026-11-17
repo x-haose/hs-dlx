@@ -241,7 +241,8 @@ def test_failures_are_classified_by_what_the_site_said_and_where_they_happened()
     # 解析时接口回的错误状态：yt-dlp 包成 expected 的 ExtractorError，按状态归类
     networking = importlib.import_module("yt_dlp.networking")
     for status, kind in (
-        (412, "network"),
+        (412, "blocked"),
+        (403, "blocked"),
         (503, "network"),
         (404, "unavailable"),
         (429, "rate_limited"),

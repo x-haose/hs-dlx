@@ -643,7 +643,8 @@ fn rebuild_with_cloud(tx: &Transaction<'_>) -> Result<(), Error> {
 ///   `web_audio`，至少一个；认出格式用的各项，写法见 `StoredFormat`）、合并后的容器（`web_container`：`mp4`、`matroska`，只有一路不合并时为 `original`）、输出
 ///   （`web_path`）；有任务目录（各路各一个核心的任务目录在里面）。只属于网页视频的列在别的任务为 NULL。请求头只放
 ///   Cookie（解析与下载时带上）。
-/// - 失败的种类加 `web-login`、`web-geo`、`web-extract`、`web-gone`、`web-changed`、`web-denied`、`web-components`。其余约束不变，已有的行原样搬过来。
+/// - 失败的种类加 `web-login`、`web-geo`、`web-extract`、`web-gone`、`web-changed`、`web-denied`、`web-blocked`、
+///   `web-components`。其余约束不变，已有的行原样搬过来。
 /// - 设置加网页视频的 yt-dlp 渠道（`web_channel`：`stable`、`nightly`）与画质取向（`web_preference`：`compatible`、
 ///   `quality`），没设过为稳定版、兼容优先。
 fn rebuild_with_web(tx: &Transaction<'_>) -> Result<(), Error> {
@@ -695,7 +696,8 @@ fn rebuild_with_web(tx: &Transaction<'_>) -> Result<(), Error> {
                                     'malformed', 'stalled', 'nothing-to-write', 'mp4-unsupported', 'unsupported',
                                     'unrecoverable', 'cloud-login', 'cloud-quota', 'cloud-failed', 'cloud-api',
                                     'integrity', 'web-login', 'web-geo', 'web-extract', 'web-gone',
-                                    'web-changed', 'web-denied', 'web-components', 'other')
+                                    'web-changed', 'web-denied', 'web-blocked', 'web-components',
+                                    'other')
                      OR failure GLOB 'status:[0-9][0-9][0-9]')
             ),
             created_at INTEGER NOT NULL,
@@ -3112,6 +3114,7 @@ mod tests {
             FailureKind::WebGone,
             FailureKind::WebChanged,
             FailureKind::WebDenied,
+            FailureKind::WebBlocked,
             FailureKind::WebComponents,
         ] {
             let failure = Failure {

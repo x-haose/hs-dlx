@@ -5,8 +5,10 @@ Berkeley DB、按 Sleepycat 许可证分发的 `_dbm`），在本机跑一遍确
 归零，同样的输入得到同样的字节）经 zstd 压缩，与 QuickJS-NG 一起放进 third_party/runtime/dist/，桌面应用的
 build.rs 把它们编进程序。
 
-只备本机（rustc 的 host）这个目标：应用在各平台上各自构建。dist 里另有 bundle.env（目标、各项的 id 与可执行文件，
-给 build.rs）与本脚本的副本 .hs-dlx-runtime（Makefile 的 runtime_present 据此判断 dist 是不是这份脚本备的）。下载放在
+只备本机（rustc 的 host）这个目标：应用在各平台上各自构建。dist 里另有 bundle.env（目标、各项的 id、可执行文件与
+Python 的 ABI，给 build.rs）与本脚本的副本 .hs-dlx-runtime（`--present` 与 build.rs 据此判断 dist 是不是这份脚本备的）。
+裁剪的每一条都要在本目标上匹配到东西，匹配不到（换了版本、包的结构变了）即失败：许可证要求裁掉的（`_dbm`）不能
+悄悄留下。下载放在
 third_party/runtime/build/，核对过的留着复用。随带的许可证原文在 third_party/runtime/licenses/（换版本时一并核对）。
 """
 
@@ -33,6 +35,8 @@ PYTHON_RELEASE = "20261110"
 PYTHON_VERSION = "3.13.18"
 # QuickJS-NG 的版本（2026-11-01）
 QUICKJS_VERSION = "0.18.0"
+# CPython 的大小版本，进标准库的路径与 ABI
+PYTHON_MINOR = ".".join(PYTHON_VERSION.split(".")[:2])
 # 压缩级别：再高（20 以上）要更大的解压窗口，省下的不到 1%
 ZSTD_LEVEL = 19
 # 下载失败时最多试几次（GitHub 的下载偶尔断）
@@ -63,7 +67,6 @@ STDLIB_TRIMMED = (
     "pydoc_data",
     "turtledemo",
     "turtle.py",
-    "test",
     "_pyrepl",
 )
 # macOS 与 Linux 都裁掉的：头文件、文档、pkg-config、Tcl/Tk、idle 与 pydoc 等脚本、只给嵌入用的 libpython（解释器是
@@ -82,16 +85,16 @@ UNIX_TRIMMED = (
     "python/bin/pydoc*",
     "python/bin/pip*",
     "python/bin/*-config",
-    "python/lib/python3.13/config-*",
-    "python/lib/python3.13/lib-dynload/_tkinter*",
-    "python/lib/python3.13/lib-dynload/_dbm*",
+    f"python/lib/python{PYTHON_MINOR}/config-*",
+    f"python/lib/python{PYTHON_MINOR}/lib-dynload/_tkinter*",
+    f"python/lib/python{PYTHON_MINOR}/lib-dynload/_dbm*",
 )
 
 TARGETS = {
     "aarch64-apple-darwin": Target(
         python_sha256="7a2384641584ab9984221fcb0fc9265df465922af71be71410529e2a9c3f0540",
         python_executable="python/bin/python3",
-        stdlib="python/lib/python3.13",
+        stdlib=f"python/lib/python{PYTHON_MINOR}",
         trimmed=UNIX_TRIMMED,
         quickjs_asset="qjs-darwin-arm64",
         quickjs_sha256="91fe89916d3b0a6c01c4dc8382a99c3c1fd91ecfc214aa81ca051902bcce590d",
@@ -100,7 +103,7 @@ TARGETS = {
     "x86_64-unknown-linux-gnu": Target(
         python_sha256="f2d2199eb25880e07863b391cf7124e7ffa1338b0d65600dfcec117c4223a7fb",
         python_executable="python/bin/python3",
-        stdlib="python/lib/python3.13",
+        stdlib=f"python/lib/python{PYTHON_MINOR}",
         trimmed=UNIX_TRIMMED,
         quickjs_asset="qjs-linux-x86_64",
         quickjs_sha256="85ded23b9fabe8c1644fc40a8d2bbdd71157affcbd807359c618cc717ee24d7d",
@@ -131,11 +134,13 @@ TARGETS = {
     ),
 }
 
-# 裁过的 Python 要能做的：解析与下载用到的模块（TLS、压缩、数据库、ctypes 等）与挑 wheel 用的 pip
+# 裁过的 Python 要能做的：解析与下载用到的模块（TLS、压缩、数据库、ctypes 等）与挑 wheel 用的 pip；裁掉的 _dbm 与
+# _tkinter 导入不了
 SMOKE = (
     "import bz2, ctypes, decimal, hashlib, json, lzma, sqlite3, ssl, uuid, zlib, xml.parsers.expat;"
-    "import pip._vendor.packaging.tags;"
-    "print('ok')"
+    "import pip._vendor.packaging.tags, importlib.util;"
+    "left = [name for name in ('_dbm', '_tkinter') if importlib.util.find_spec(name)];"
+    "print('left: ' + ', '.join(left) if left else 'ok')"
 )
 
 
@@ -184,8 +189,12 @@ def fetch(url: str, expected: str, path: Path) -> bytes:
 
 
 def trim(root: Path, target: Target) -> None:
-    """在解开的 Python（`root` 下有 python/）里删掉 `target` 要裁掉的与各处的 __pycache__。"""
+    """在解开的 Python（`root` 下有 python/）里删掉 `target` 要裁掉的与各处的 __pycache__；哪一条都没匹配到时失败。"""
     patterns = [*target.trimmed, *(f"{target.stdlib}/{name}" for name in STDLIB_TRIMMED)]
+    unmatched = [pattern for pattern in patterns if not any(root.glob(pattern))]
+    if unmatched:
+        message = f"裁剪的这几条在包里没有匹配到（版本或包的结构变了）：{', '.join(unmatched)}"
+        raise RuntimeError(message)
     for pattern in patterns:
         for path in root.glob(pattern):
             if path.is_dir() and not path.is_symlink():
@@ -221,9 +230,27 @@ def smoke(command: list[str], expected: str) -> None:
         raise RuntimeError(message)
 
 
+def present(triple: str) -> bool:
+    """`triple` 用得上的 dist 已备好：不是发布的平台（没有随带的运行时，不用备），或 dist 是这份脚本为它备的。"""
+    if triple not in TARGETS:
+        return True
+    env = DIST / "bundle.env"
+    return (
+        MARKER.exists()
+        and MARKER.read_bytes() == Path(__file__).read_bytes()
+        and env.exists()
+        and f"TARGET={triple}" in env.read_text(encoding="utf-8").splitlines()
+    )
+
+
 def main() -> None:
-    """为本机这个目标备好 dist。"""
+    """为本机这个目标备好 dist；`--present` 时只看是否已备好（见 `present`），没有时退出码为 1。"""
     triple = host()
+    if sys.argv[1:] == ["--present"]:
+        if not present(triple):
+            sys.stderr.write(f"{DIST} is not prepared by this {Path(__file__).name} for {triple}: run make runtime\n")
+            raise SystemExit(1)
+        return
     target = TARGETS.get(triple)
     if target is None:
         message = f"{triple} 不是应用发布的平台，没有随应用带的运行时"
@@ -242,7 +269,8 @@ def main() -> None:
     with tarfile.open(fileobj=io.BytesIO(python_package), mode="r:gz") as tar:
         tar.extractall(unpacked, filter="data")
     trim(unpacked, target)
-    smoke([str(unpacked / target.python_executable), "-I", "-c", SMOKE], "ok")
+    # -B：不写 .pyc，包里不带构建机的路径，产物与在哪个目录构建无关
+    smoke([str(unpacked / target.python_executable), "-I", "-B", "-c", SMOKE], "ok")
 
     shutil.rmtree(DIST, ignore_errors=True)
     DIST.mkdir(parents=True)
@@ -256,12 +284,14 @@ def main() -> None:
         f"TARGET={triple}",
         f"PYTHON_ID={PYTHON_VERSION}-{PYTHON_RELEASE}-{sha256(python)[:12]}",
         f"PYTHON_EXECUTABLE={target.python_executable}",
+        f"PYTHON_ABI=cp{PYTHON_MINOR.replace('.', '')}-{triple}",
         f"QUICKJS_ID={QUICKJS_VERSION}-{sha256(quickjs)[:12]}",
         f"QUICKJS_FILE={target.quickjs_file}",
     ]
     (DIST / "bundle.env").write_text("\n".join(lines) + "\n", encoding="utf-8")
     shutil.copyfile(Path(__file__), MARKER)
-    sys.stdout.write(f"{triple}：Python {len(python) / 1e6:.1f} MB，QuickJS-NG {len(quickjs) / 1e6:.1f} MB\n")
+    # 只写 ASCII：Windows 上标准输出是管道时按 ANSI 代码页编码，-I 下 PYTHONUTF8 不起作用
+    sys.stdout.write(f"{triple}: Python {len(python) / 1e6:.1f} MB, QuickJS-NG {len(quickjs) / 1e6:.1f} MB\n")
 
 
 if __name__ == "__main__":

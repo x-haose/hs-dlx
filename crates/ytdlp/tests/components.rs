@@ -76,6 +76,10 @@ fn python_package() -> Vec<u8> {
     ruzstd::encoding::compress_to_vec(tar.as_slice(), ruzstd::encoding::CompressionLevel::Fastest)
 }
 
+/// 随应用带的「QuickJS-NG」：`--help` 报版本，别的（自检让它算 6 * 7）打出 42。
+const QUICKJS: &[u8] =
+    b"#!/bin/sh\n[ \"$1\" = --help ] && echo 'QuickJS-ng version 0.18.0' || echo 42\n";
+
 /// 随应用带的 Python 与「QuickJS-NG」（自检让它算 6 * 7）。
 fn bundle() -> Bundle {
     Bundle {
@@ -84,9 +88,10 @@ fn bundle() -> Bundle {
             bytes: python_package().into(),
             executable: "python/bin/python3".to_owned(),
         },
+        python_abi: "cp313-test".to_owned(),
         quickjs: Bundled {
             id: "0.18.0-test".to_owned(),
-            bytes: b"#!/bin/sh\necho 42\n".to_vec().into(),
+            bytes: QUICKJS.to_vec().into(),
             executable: "qjs".to_owned(),
         },
     }
@@ -142,6 +147,19 @@ fn release_json(base: &Url, requires: &[&str], files: &[(String, Vec<u8>)]) -> V
         .into_bytes()
 }
 
+/// 假 yt-dlp 的 `yt_dlp/__init__.py`：驱动脚本的自检要的 YoutubeDL 认得给它的 QuickJS-NG（像真的那样跑它的
+/// `--help`，第一行带 `QuickJS-ng` 即认为支持）。
+const FAKE_YT_DLP: &str = "\
+import subprocess, types
+
+class YoutubeDL:
+    def __init__(self, params):
+        path = params['js_runtimes']['quickjs']['path']
+        out = subprocess.run([path, '--help'], capture_output=True, text=True).stdout
+        info = types.SimpleNamespace(supported=out.startswith('QuickJS-ng')) if out else None
+        self._js_runtimes = {'quickjs': types.SimpleNamespace(info=info)}
+";
+
 /// 在服务器上发布 yt-dlp `version`（wheel 的元数据也写这个版本，像 PyPI 上的一样；`yt_dlp.version` 的写法不同，自检
 /// 不该看它）与它锁定的依赖：certifi、yt-dlp-ejs；mutagen 锁定了但不该装（服务器上没有它，请求即失败）；brotlicffi
 /// 只给别的解释器。
@@ -152,7 +170,7 @@ fn publish(server: &Server, base: &Url, version: &str) {
 /// 同 [`publish`]；`allowlist` 为假时包里没有驱动脚本自检要找的扩展名白名单（像改掉了内部名字的新版）。
 fn publish_with(server: &Server, base: &Url, version: &str, allowlist: bool) {
     let mut files = vec![
-        ("yt_dlp/__init__.py".to_owned(), String::new()),
+        ("yt_dlp/__init__.py".to_owned(), FAKE_YT_DLP.to_owned()),
         (
             "yt_dlp/version.py".to_owned(),
             "__version__ = 'not-the-pypi-spelling'\n".to_owned(),
@@ -387,10 +405,7 @@ async fn repairing_puts_everything_in_place_again() {
         .await
         .unwrap();
     assert_eq!(repaired, first);
-    assert_eq!(
-        std::fs::read(&repaired.quickjs).unwrap(),
-        b"#!/bin/sh\necho 42\n"
-    );
+    assert_eq!(std::fs::read(&repaired.quickjs).unwrap(), QUICKJS);
     assert_eq!(server.hits(wheel), fetched + 1);
     // yt-dlp 下不到（服务器上没有了）：报错，在用的照旧
     server.files.lock().unwrap().remove(wheel);
@@ -530,6 +545,7 @@ async fn a_new_python_reinstalls_yt_dlp() {
         .unwrap();
     let mut newer = bundle();
     newer.python.id = "3.14.10-test".to_owned();
+    newer.python_abi = "cp314-test".to_owned();
     let components = components(&root, newer, &base);
     assert_eq!(components.installed().unwrap(), None);
     let installed = install(&components, Channel::Stable).await.unwrap();
@@ -565,7 +581,7 @@ async fn the_nightly_channel_installs_the_latest_dev_release() {
     let components = components(&root, bundle(), &base);
     assert_eq!(
         components
-            .latest(&Proxy::Direct, Channel::Stable)
+            .latest(&Proxy::Direct, Channel::Stable, &CancellationToken::new())
             .await
             .unwrap(),
         "2026.10.26"
@@ -592,6 +608,7 @@ fn real_bundle() -> Bundle {
             bytes: std::fs::read(dist.join("python.tar.zst")).unwrap().into(),
             executable: get("PYTHON_EXECUTABLE"),
         },
+        python_abi: get("PYTHON_ABI"),
         quickjs: Bundled {
             id: get("QUICKJS_ID"),
             bytes: std::fs::read(dist.join(&quickjs)).unwrap().into(),

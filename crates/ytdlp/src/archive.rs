@@ -39,13 +39,24 @@ pub(crate) fn sha256_of(path: &Path) -> Result<String, Error> {
 pub(crate) fn unpack_tar_zst(bytes: &[u8], into: &Path) -> Result<(), Error> {
     let broken =
         |error: &dyn std::fmt::Display| Error::Archive(format!("随应用带的 Python：{error}"));
+    // 写文件出错（磁盘满、没有权限、被杀毒软件拦下）是本机的事，带着系统的错误码；别的是包的内容不对
+    let failed = |error: std::io::Error| {
+        if error.raw_os_error().is_some() {
+            Error::Disk(format!(
+                "解出随应用带的 Python 到 {}：{error}",
+                into.display()
+            ))
+        } else {
+            broken(&error)
+        }
+    };
     let decoder = ruzstd::decoding::StreamingDecoder::new(bytes).map_err(|error| broken(&error))?;
     let mut tar = tar::Archive::new(decoder);
     tar.set_preserve_permissions(true);
-    for entry in tar.entries().map_err(|error| broken(&error))? {
-        let mut entry = entry.map_err(|error| broken(&error))?;
+    for entry in tar.entries().map_err(failed)? {
+        let mut entry = entry.map_err(failed)?;
         // unpack_in 拒绝越出 `into` 的条目时返回 false
-        if !entry.unpack_in(into).map_err(|error| broken(&error))? {
+        if !entry.unpack_in(into).map_err(failed)? {
             let name = entry.path().map_err(|error| broken(&error))?.into_owned();
             return Err(broken(&format!("条目 {} 越出了解包目录", name.display())));
         }

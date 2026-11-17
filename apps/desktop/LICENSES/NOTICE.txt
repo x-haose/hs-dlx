@@ -43,5 +43,6 @@ hs-dlx 桌面应用静态链接或随带了以下软件：
    pip 按 MIT 授权，许可证随它在包里。
 
 9. QuickJS-NG 0.18.0（https://github.com/quickjs-ng/quickjs，© Fabrice Bellard、Charlie Gordon、
-   Ben Noordhuis 等），按 MIT 许可证授权，全文见 QuickJS-NG-LICENSE.txt；随带的可执行文件未作修改，yt-dlp 用它解
-   YouTube 的 JavaScript 挑战。
+   Ben Noordhuis 等），按 MIT 许可证授权；随带的可执行文件取自它的发布，未作修改，yt-dlp 用它解 YouTube 的
+   JavaScript 挑战。它静态链入的 mimalloc（MIT）、musl（Linux 版，MIT）、mingw-w64 运行时（Windows 版）的许可证全文与
+   QuickJS-NG 的一起见 QuickJS-NG-LICENSES.txt。

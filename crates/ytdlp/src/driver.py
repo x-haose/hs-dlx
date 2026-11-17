@@ -6,7 +6,8 @@
   `pin-curl-cffi` 两组，按本机的解释器与平台取舍，不要 mutagen）：`[{"name": 名字, "version": 版本}]`。
 - `pick`：标准输入为 `{包名: [{"filename": 文件名, ...}]}`（PyPI 上这个版本的各个文件），标准输出为每个包本机能装
   的、最合适的那个 wheel 的文件名：`{包名: 文件名}`；有包没有能装的时退出码非 0。
-- `selftest <site>`：导入 site 目录里的 yt-dlp 与 yt-dlp-ejs，标准输出打出 `{"yt_dlp": 规范化的版本}`。
+- `selftest <site> <quickjs>`：导入 site 目录里的 yt-dlp 与 yt-dlp-ejs、核对它认得 QuickJS-NG，标准输出打出
+  `{"yt_dlp": 规范化的版本}`。
 - `serve <site> <quickjs> <cache>`：常驻解析。标准输入每行一个请求，标准输出每行一个回应，一次只处理一个：
   - 请求 `{"id": 整数, "url": 网址, "proxy": 代理地址（空串为直连）, "cookies": Netscape 格式的 Cookie 或 null,
     "generic": 只有通用解析器认得时也解析}`；`generic` 为假时只认得通用解析器的网址不发请求，直接回 `unsupported`；
@@ -59,6 +60,8 @@ NO_DATA = ("Got error", "Did not get any data blocks", "The downloaded file is e
 # 网站说资源没了的 HTTP 状态
 GONE = frozenset({404, 410})
 UNAUTHORIZED = 401
+# 网站拦下了这个出口（风控）的 HTTP 状态
+BLOCKED = frozenset({403, 412})
 # 下载进度至多多久报一次（秒）
 PROGRESS_INTERVAL = 0.2
 # 用 yt-dlp 锁定版本的这两组依赖：默认的依赖与模拟浏览器 TLS 指纹的 curl-cffi
@@ -252,10 +255,12 @@ def classify(error: BaseException, *, downloading: bool = False) -> tuple[str, s
     """yt-dlp 的失败归类：种类与说明。
 
     种类：`unsupported`（没有专门的解析器认得这个网址）、`geo`（地区限制）、`login`（要登录或 Cookie）、
-    `rate_limited`（429）、`network`（连不上、超时、TLS；下载时服务器回的错误状态与没下完整）、`disk`（下载时写不了
-    文件）、`unavailable`（网站说视频不可用：私密、删了、未开播等）、`other`（其余，多为网站改了、yt-dlp 要更新）。
-    网站回的错误状态：429 为限流；解析时请求接口回的 401 为要登录，404、410 为不可用；其余（403 被拒、412 风控、5xx
-    等，与 `downloading` 时直链回的一切状态）算网络：多为一时的或直链过期，再试即重新解析、换新的直链。
+    `rate_limited`（429）、`blocked`（网站拦下了这个出口）、`network`（连不上、超时、TLS；下载时服务器回的错误状态与
+    没下完整）、`disk`（下载时写不了文件）、`unavailable`（网站说视频不可用：私密、删了、未开播等）、`other`（其余，
+    多为网站改了、yt-dlp 要更新）。
+    网站回的错误状态：429 为限流；解析时请求网页与接口回的 401 为要登录，403、412 为拦截（`blocked`：多为出口 IP 被
+    风控，如 B 站对境外代理回 412；换直连或别的出口、登录后再试），404、410 为不可用；其余（5xx 等，与 `downloading` 时
+    直链回的一切状态）算网络：多为一时的或直链过期，再试即重新解析、换新的直链。
     """
     original = unwrapped(error)
     message = clean(str(getattr(original, "orig_msg", None) or original))
@@ -271,6 +276,8 @@ def classify(error: BaseException, *, downloading: bool = False) -> tuple[str, s
         kind = "rate_limited"
     elif status == UNAUTHORIZED and not downloading:
         kind = "login"
+    elif status in BLOCKED and not downloading:
+        kind = "blocked"
     elif status in GONE and not downloading:
         kind = "unavailable"
     elif status is not None or "TransportError" in causes or "ContentTooShortError" in names:
@@ -513,11 +520,12 @@ def watch_stdin() -> None:
     threading.Thread(target=wait, daemon=True).start()
 
 
-def selftest(site: str) -> None:
-    """导入 yt-dlp 与解 YouTube 的 JavaScript 挑战用的 yt-dlp-ejs，核对扩展名白名单还在，报出 yt-dlp 的版本。
+def selftest(site: str, quickjs: str) -> None:
+    """导入 yt-dlp 与 yt-dlp-ejs，核对扩展名白名单还在、yt-dlp 认得 `quickjs`，报出 yt-dlp 的版本。
 
-    版本取自安装元数据，按 PEP 440 规范化，与 PyPI 上的写法一致；`yt_dlp.version.__version__` 的写法不同（补零、
-    不带 `.dev0`）。
+    yt-dlp-ejs 解 YouTube 的 JavaScript 挑战；`quickjs` 是随应用带的 QuickJS-NG，yt-dlp 认不出或判为不支持时 YouTube
+    只少格式、不报错。版本取自安装元数据，按 PEP 440 规范化，与 PyPI 上的写法一致；`yt_dlp.version.__version__` 的写法
+    不同（补零、不带 `.dev0`）。
     """
     # site 目录要先加进 sys.path 才导入得到，所以按名字导入
     sys.path.insert(0, site)
@@ -526,6 +534,13 @@ def selftest(site: str) -> None:
     # 白名单是 yt-dlp 的内部名字：新版改掉了就装不上，而不是装上后每次解析都出错
     if safe_ext("mp4") != "mp4" or safe_ext("exe") is not None:
         message = "yt-dlp 的扩展名白名单认不出"
+        raise RuntimeError(message)
+    yt_dlp = importlib.import_module("yt_dlp")
+    runtimes = yt_dlp.YoutubeDL({"quiet": True, "js_runtimes": {"quickjs": {"path": quickjs}}})._js_runtimes
+    runtime = runtimes.get("quickjs")
+    info = runtime.info if runtime is not None else None
+    if info is None or not info.supported:
+        message = f"yt-dlp 认不出随应用带的 QuickJS-NG（{quickjs}）"
         raise RuntimeError(message)
     metadata = importlib.import_module("importlib.metadata")
     version = importlib.import_module("pip._vendor.packaging.version")
@@ -540,8 +555,8 @@ def main() -> None:
             json.dump(requirements(items(json.load(sys.stdin))), sys.stdout)
         case ["pick"]:
             json.dump(pick(mapping(json.load(sys.stdin)) or {}), sys.stdout)
-        case ["selftest", site]:
-            selftest(site)
+        case ["selftest", site, quickjs]:
+            selftest(site, quickjs)
         case ["download", site, quickjs, cache]:
             replies = sys.stdout
             sys.stdout = sys.stderr

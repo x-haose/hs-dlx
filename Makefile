@@ -108,10 +108,9 @@ libtorrent:
 RUNTIME_DIST := third_party/runtime/dist
 RUNTIME_SCRIPT := scripts/runtime.py
 
-runtime_present:
-	@test -f $(RUNTIME_DIST)/bundle.env || { echo "缺少 $(RUNTIME_DIST)，先运行 make runtime"; exit 1; }
-	@cmp -s $(RUNTIME_DIST)/.hs-dlx-runtime $(RUNTIME_SCRIPT) || \
-		{ echo "$(RUNTIME_DIST) 不是当前的 $(RUNTIME_SCRIPT) 备的，先运行 make runtime"; exit 1; }
+# 不是发布的平台（没有随带的运行时）时算备好了
+runtime_present: py_env
+	@uv run --no-sync python -I $(RUNTIME_SCRIPT) --present
 
 runtime: py_env
 	uv run --no-sync python -I $(RUNTIME_SCRIPT)

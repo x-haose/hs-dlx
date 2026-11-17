@@ -19,5 +19,8 @@ pub struct Bundled {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bundle {
     pub python: Bundled,
+    /// Python 的 ABI 与平台，如 `cp313-aarch64-apple-darwin`：yt-dlp 的依赖里有按它编译的扩展模块。应用升级换了随带的
+    /// Python 而它没变时，装着的 yt-dlp 照用
+    pub python_abi: String,
     pub quickjs: Bundled,
 }

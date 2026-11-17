@@ -82,8 +82,21 @@ impl Web {
         if let Some(components) = &components {
             components.recover();
         }
+        // 应用升级换了随带的 Python 与 QuickJS-NG、而装着的 yt-dlp 照用得上（ABI 没变）：启动后在后台解出来（见
+        // [`Shared::unpack_bundled_on_start`]），先显示在解
+        let unpack = components.as_ref().is_some_and(|components| {
+            matches!(components.installed(), Ok(None)) && components.bundled_missing()
+        });
         let (state, extractor) = match components.as_ref().map(Components::installed) {
             None => (WebState::Unavailable, None),
+            Some(Ok(None)) if unpack => (
+                WebState::Installing(InstallProgress {
+                    stage: Stage::Python,
+                    bytes: 0,
+                    total: None,
+                }),
+                None,
+            ),
             Some(Ok(None)) => (WebState::Missing, None),
             Some(Ok(Some(installed))) => (
                 WebState::Ready(installed.version.clone()),
@@ -100,7 +113,7 @@ impl Web {
             cache,
             state: watch::Sender::new(state),
             extractor: Mutex::new(extractor),
-            installing: Mutex::new(None),
+            installing: Mutex::new(unpack.then(CancellationToken::new)),
         }
     }
 
@@ -146,6 +159,35 @@ impl Web {
     }
 }
 
+impl super::Shared {
+    /// 启动时：随带的 Python 与 QuickJS-NG 要解出来时（见 [`Web::new`]）在后台解，解好即可用；没解成时状态记为没装成
+    /// （带上原因，再装即重新解出）。
+    pub(super) fn unpack_bundled_on_start(self: &Arc<Self>) {
+        if lock(&self.web.installing).is_none() {
+            return;
+        }
+        let shared = self.clone();
+        self.tracker.spawn(async move {
+            let web = &shared.web;
+            let components = web.components.as_ref().expect("要解出来即有组件");
+            let next = match components.unpack_bundled().await {
+                Ok(installed) => {
+                    let version = installed.version.clone();
+                    *lock(&web.extractor) = Some(Arc::new(Extractor::new(
+                        installed,
+                        web.cache.clone(),
+                        EXTRACT_TIMEOUT,
+                    )));
+                    WebState::Ready(version)
+                }
+                Err(error) => WebState::Failed(error.to_string()),
+            };
+            *lock(&web.installing) = None;
+            web.state.send_replace(next);
+        });
+    }
+}
+
 impl Service {
     /// 记下网页视频的 yt-dlp 渠道：之后的安装与更新照它。
     pub fn set_web_channel(&self, channel: Channel) -> Result<(), Error> {
@@ -170,7 +212,12 @@ impl Service {
         Ok(AbortOnDropHandle::new(self.runtime().spawn(async move {
             let components = shared.web.components.as_ref().expect("装好了即有组件");
             let latest = components
-                .latest(&settings.proxy, settings.web_channel)
+                // 句柄释放即丢弃这个任务，不另取消
+                .latest(
+                    &settings.proxy,
+                    settings.web_channel,
+                    &CancellationToken::new(),
+                )
                 .await?;
             Ok((latest != current).then_some(latest))
         })))
@@ -193,7 +240,7 @@ impl Service {
             *installing = Some(cancel.clone());
             cancel
         };
-        // 一开始就显示在装：到第一个字节之前（连 GitHub、查 PyPI）也有好几秒
+        // 一开始就显示在装：到第一个字节之前（查 PyPI、解出随带的）也有好几秒
         web.state
             .send_replace(WebState::Installing(InstallProgress {
                 stage: Stage::Preparing,
@@ -324,7 +371,7 @@ impl Service {
             *installing = Some(cancel.clone());
             cancel
         };
-        // 一开始就显示在装：到第一个字节之前（连 GitHub、查 PyPI）也有好几秒
+        // 一开始就显示在装：到第一个字节之前（查 PyPI、解出随带的）也有好几秒
         web.state
             .send_replace(WebState::Installing(InstallProgress {
                 stage: Stage::Preparing,
@@ -414,7 +461,8 @@ impl Service {
                     )));
                     WebState::Ready(version)
                 }
-                Err(hs_dlx_ytdlp::Error::Cancelled) => WebState::Missing,
+                // 取消的不算失败：照原来的
+                Err(hs_dlx_ytdlp::Error::Cancelled) => before,
                 Err(error) => WebState::Failed(error.to_string()),
             };
             *lock(&web.installing) = None;

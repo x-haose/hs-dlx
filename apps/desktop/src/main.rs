@@ -63,19 +63,13 @@ fn bundle() -> Option<hs_dlx_app::ytdlp::Bundle> {
     Some(hs_dlx_app::ytdlp::Bundle {
         python: hs_dlx_app::ytdlp::Bundled {
             id: env!("HS_DLX_RUNTIME_PYTHON_ID").to_owned(),
-            bytes: Cow::Borrowed(include_bytes!(concat!(
-                env!("HS_DLX_RUNTIME_DIR"),
-                "/python.tar.zst"
-            ))),
+            bytes: Cow::Borrowed(include_bytes!(env!("HS_DLX_RUNTIME_PYTHON_PATH"))),
             executable: env!("HS_DLX_RUNTIME_PYTHON_EXECUTABLE").to_owned(),
         },
+        python_abi: env!("HS_DLX_RUNTIME_PYTHON_ABI").to_owned(),
         quickjs: hs_dlx_app::ytdlp::Bundled {
             id: env!("HS_DLX_RUNTIME_QUICKJS_ID").to_owned(),
-            bytes: Cow::Borrowed(include_bytes!(concat!(
-                env!("HS_DLX_RUNTIME_DIR"),
-                "/",
-                env!("HS_DLX_RUNTIME_QUICKJS_FILE")
-            ))),
+            bytes: Cow::Borrowed(include_bytes!(env!("HS_DLX_RUNTIME_QUICKJS_PATH"))),
             executable: env!("HS_DLX_RUNTIME_QUICKJS_FILE").to_owned(),
         },
     })

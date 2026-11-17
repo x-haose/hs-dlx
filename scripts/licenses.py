@@ -1,10 +1,12 @@
 """生成随桌面应用的安装包分发的声明（apps/desktop/LICENSES，打包时放进安装包）；`--check` 时只核对是否最新。
 
 声明有 NOTICE.txt、THIRD-PARTY-RUST.txt 与随带的许可证全文的副本（本项目、FFmpeg、libtorrent、OpenSSL、Boost、字体、
-gpui-webview、随带的 Python 与它链入的库、QuickJS-NG）。libtorrent、OpenSSL、Boost 的许可证原文取自
+gpui-webview、随带的 Python 与 QuickJS-NG 和它们链入的库）。libtorrent、OpenSSL、Boost 的许可证原文取自
 third_party/libtorrent/build.sh 下载核对过的源码包，存在 third_party/libtorrent/licenses/（升级它们时一并换），
-NOTICE.txt 里的版本取自 build.sh。随带的 Python 与 QuickJS-NG 的许可证原文存在 third_party/runtime/licenses/（取自
-python-build-standalone 完整包的 python/licenses 与 QuickJS-NG 仓库，换版本时一并核对），版本取自 scripts/runtime.py。
+NOTICE.txt 里的版本取自 build.sh。随带的 Python 与 QuickJS-NG 和它们链入的库的许可证原文存在
+third_party/runtime/licenses/（Python 的取自 python-build-standalone 完整包的 python/licenses；QuickJS-NG 的取自它的
+仓库，它的发布构建静态链入的 mimalloc、musl（Linux 版）、mingw-w64 运行时（Windows 版）的取自各自的仓库；换版本时按
+发布流程与可执行文件里的字符串一并核对），版本取自 scripts/runtime.py。
 
 THIRD-PARTY-RUST.txt 收录桌面应用（hs-dlx）在各发布平台（deny.toml 的 `[graph] targets`）上依赖的 Rust crate：
 按 `cargo tree` 解析特性后的正常依赖，过程宏与工作区成员不算。各 crate 根目录里的许可证文件原样收录，内容相同的只收
@@ -442,8 +444,9 @@ hs-dlx 桌面应用静态链接或随带了以下软件：
    pip 按 MIT 授权，许可证随它在包里。
 
 9. QuickJS-NG {QUICKJS_VERSION}（https://github.com/quickjs-ng/quickjs，© Fabrice Bellard、Charlie Gordon、
-   Ben Noordhuis 等），按 MIT 许可证授权，全文见 QuickJS-NG-LICENSE.txt；随带的可执行文件未作修改，yt-dlp 用它解
-   YouTube 的 JavaScript 挑战。
+   Ben Noordhuis 等），按 MIT 许可证授权；随带的可执行文件取自它的发布，未作修改，yt-dlp 用它解 YouTube 的
+   JavaScript 挑战。它静态链入的 mimalloc（MIT）、musl（Linux 版，MIT）、mingw-w64 运行时（Windows 版）的许可证全文与
+   QuickJS-NG 的一起见 QuickJS-NG-LICENSES.txt。
 """
 
 
@@ -467,15 +470,37 @@ PYTHON_LIBRARIES = (
 )
 
 
+# 随带的 QuickJS-NG 与它的发布构建静态链入的库（三个发布平台合计）和 third_party/runtime/licenses/ 里的许可证文件
+# （quickjs-<名字>.txt）
+QUICKJS_LIBRARIES = (
+    ("QuickJS-NG", "ng"),
+    ("mimalloc", "mimalloc"),
+    ("musl（Linux 版）", "musl"),
+    ("mingw-w64 运行时（Windows 版）", "mingw-w64-runtime"),
+)
+
+
+def runtime_licenses(prefix: str, libraries: tuple[tuple[str, str], ...]) -> str:
+    """`libraries`（标题与 third_party/runtime/licenses/<prefix>-<名字>.txt 的名字）的许可证全文依次接起来。"""
+    return "\n".join(
+        f"{RULE}\n{label}\n{RULE}\n\n{read_text(RUNTIME_LICENSES / f'{prefix}-{name}.txt').strip()}\n"
+        for label, name in libraries
+    )
+
+
 def python_licenses() -> str:
     """Python-LICENSES.txt：CPython 与它链入的各个库的许可证全文。"""
-    parts = [
-        f"{RULE}\n{label}\n{RULE}\n\n{read_text(RUNTIME_LICENSES / f'python-{name}.txt').strip()}\n"
-        for label, name in PYTHON_LIBRARIES
-    ]
     return (
         f"随 hs-dlx 带的 Python {PYTHON_VERSION} 与它链入的库的许可证全文。由 scripts/licenses.py 生成。\n\n"
-        + "\n".join(parts)
+        + runtime_licenses("python", PYTHON_LIBRARIES)
+    )
+
+
+def quickjs_licenses() -> str:
+    """QuickJS-NG-LICENSES.txt：QuickJS-NG 与它静态链入的各个库的许可证全文。"""
+    return (
+        f"随 hs-dlx 带的 QuickJS-NG {QUICKJS_VERSION} 与它链入的库的许可证全文。由 scripts/licenses.py 生成。\n\n"
+        + runtime_licenses("quickjs", QUICKJS_LIBRARIES)
     )
 
 
@@ -505,7 +530,7 @@ def main() -> int:
         out / "OpenSSL-LICENSE.txt": read_text(LIBTORRENT_LICENSES / "OpenSSL-LICENSE.txt"),
         out / "Boost-LICENSE_1_0.txt": read_text(LIBTORRENT_LICENSES / "Boost-LICENSE_1_0.txt"),
         out / "Python-LICENSES.txt": python_licenses(),
-        out / "QuickJS-NG-LICENSE.txt": read_text(RUNTIME_LICENSES / "quickjs-ng-LICENSE.txt"),
+        out / "QuickJS-NG-LICENSES.txt": quickjs_licenses(),
     }
     stale: list[Path] = []
     for path, content in expected.items():

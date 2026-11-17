@@ -37,6 +37,7 @@ fn bundle() -> Bundle {
     };
     Bundle {
         python: bundled("python/bin/python3"),
+        python_abi: "test".to_owned(),
         quickjs: bundled("qjs"),
     }
 }

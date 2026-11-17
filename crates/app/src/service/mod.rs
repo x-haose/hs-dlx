@@ -410,6 +410,7 @@ impl Service {
                 .shared
                 .tracker
                 .spawn(async move { shared.web.sweep().await });
+            service.shared.unpack_bundled_on_start();
             let shared = service.shared.clone();
             service.shared.tracker.spawn(async move {
                 for work_dir in finished_web {

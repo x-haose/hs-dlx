@@ -1,6 +1,6 @@
 //! 新建页右边的检查面板：标题与主机；探测中为进行到哪一步与请求经哪里走；认出播放列表为探测结果的读数、清晰度之外
 //! 的选择（音轨、输出、保存位置、请求头）与开始；认出文件为大小、类型、能否续传与保存位置、请求头、开始；探测失败为
-//! 错误与能做的事（改请求头重新探测、重新探测、在网页里找视频流）；磁力链接取种子信息时为连着的节点数，取到后（种子
+//! 错误与能做的事（改请求头、重新探测、网页视频要登录时到网页里登录、在网页里找视频流）；磁力链接取种子信息时为连着的节点数，取到后（种子
 //! 文件读到后）为大小、要下的文件、保存位置与开始。磁力链接在这几步都可以改用 PikPak 云离线。地址是网页时：yt-dlp
 //! 解析中只写请求经哪里走，组件没装时为安装与进度，解析出来后为时长、上传者、画质选项、保存位置与开始（见 web.rs）。
 
@@ -103,7 +103,8 @@ impl NewTask {
     }
 
     /// 探测失败：错误（与看过不是网页的说明）、请求经哪里走、缺请求头时的编辑框；底栏是重新探测与另找。被拒或取到错误
-    /// 页的多半缺请求头、网页视频要登录的缺 Cookie，带上再探测；再试也一样的不给重新探测。不是从嗅探页来的还可以在网页里打开它找视频流。
+    /// 页的多半缺请求头，改了再探测；再试也一样的不给重新探测。网页视频要登录时主按钮是到网页里登录（嗅探页里登录后
+    /// 点「解析网页视频」，带着登录后的 Cookie 解析）。不是从嗅探页来的还可以在网页里打开它找视频流。
     fn failed_inspector(
         &self,
         title: String,
@@ -111,13 +112,21 @@ impl NewTask {
         failure: &Failure,
         cx: &mut Context<Self>,
     ) -> Div {
-        // 网页视频要登录：补上登录后的 Cookie 再解析
-        let headers =
-            failure.kind.headers_likely_missing() || failure.kind == FailureKind::WebLogin;
+        let headers = failure.kind.headers_likely_missing();
+        let login = failure.kind == FailureKind::WebLogin && !self.from_sniff;
         let again = headers || failure.kind.retry_helps();
         let mut body = vec![ui::note(failure.message.clone(), true).into_any_element()];
         if let PageCheck::NotPage(note) = &self.page_check {
             body.push(ui::note(note.clone(), false).into_any_element());
+        }
+        if login {
+            body.push(
+                ui::note(
+                    "在打开的网页里登录，再点顶上的「解析网页视频」".to_owned(),
+                    false,
+                )
+                .into_any_element(),
+            );
         }
         body.extend(self.reads_with_route(Vec::new()));
         if headers {
@@ -126,15 +135,24 @@ impl NewTask {
             );
         }
         let mut foot = Vec::new();
-        if again {
+        if login {
+            let url = self.url.clone();
+            foot.push(
+                ui::primary(
+                    "login",
+                    "到网页里登录",
+                    None,
+                    Solid::Amber,
+                    true,
+                    cx.listener(move |_, _, _, cx| cx.emit(NewTaskEvent::Sniff(url.clone()))),
+                )
+                .into_any_element(),
+            );
+        } else if again {
             foot.push(
                 ui::primary(
                     "reprobe",
-                    if headers {
-                        "带上请求头重新探测"
-                    } else {
-                        "重新探测"
-                    },
+                    "重新探测",
                     None,
                     Solid::Amber,
                     true,
@@ -144,7 +162,19 @@ impl NewTask {
             );
         }
         let mut row = Vec::new();
-        if !self.from_sniff {
+        if login && again {
+            row.push(
+                ui::button(
+                    "reprobe",
+                    "重新探测",
+                    Tone::Plain,
+                    cx.listener(|this, _, window, cx| this.reprobe(window, cx)),
+                )
+                .flex_1()
+                .into_any_element(),
+            );
+        }
+        if !self.from_sniff && !login {
             let url = self.url.clone();
             row.push(
                 ui::button(

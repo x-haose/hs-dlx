@@ -102,6 +102,8 @@ pub fn web_install(progress: &InstallProgress) -> String {
         Stage::Checking => ("检查装好的组件", false),
     };
     let amount = match progress.total {
+        // 下载的还没收到字节：大小来自索引，先知道
+        _ if downloading && progress.bytes == 0 => " · 正在连接…".to_owned(),
         Some(0) => String::new(),
         Some(total) => format!(
             " · {} / {}（{}%）",
@@ -110,7 +112,6 @@ pub fn web_install(progress: &InstallProgress) -> String {
             progress.bytes.min(total) * 100 / total
         ),
         None if progress.bytes > 0 => format!(" · {}", bytes(progress.bytes)),
-        None if downloading => " · 正在连接…".to_owned(),
         None => "…".to_owned(),
     };
     format!("{doing}{amount}")
@@ -207,9 +208,14 @@ pub fn failure(kind: FailureKind) -> (String, &'static str) {
         ),
         FailureKind::WebLogin => (
             "登录".into(),
-            "网站要登录：在嗅探页里打开这个网站登录，再把 Cookie 带进任务后继续",
+            "网站要登录或把这个出口当成了机器人：在嗅探页里打开这个网站登录，再把 Cookie 带进任务后继续；\
+             走代理时也可以换个代理节点",
         ),
         FailureKind::WebGeo => ("地区".into(), "网站按地区限制：换个代理出口后继续"),
+        FailureKind::WebBlocked => (
+            "拦截".into(),
+            "网站拦下了这个出口，多为代理的 IP 被风控（国内网站常拦境外出口）：在设置里改直连或换个代理节点后继续",
+        ),
         FailureKind::WebExtract => (
             "解析".into(),
             "网页解析不了，多为网站改版了：在设置里更新 yt-dlp 后继续",
@@ -253,7 +259,7 @@ mod tests {
             total,
         };
         assert_eq!(
-            web_install(&at(Stage::YtDlp, 0, None)),
+            web_install(&at(Stage::YtDlp, 0, Some(12 << 20))),
             "下载 yt-dlp 与依赖 · 正在连接…"
         );
         assert_eq!(web_install(&at(Stage::Python, 0, None)), "解出 Python…");

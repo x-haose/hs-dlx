@@ -70,6 +70,10 @@ pub enum ExtractError {
     /// 请求太频繁（429）：过一阵再试
     #[error("{0}")]
     RateLimited(String),
+    /// 网站拦下了这个出口（解析时网页或接口回 403、412：多为出口 IP 被风控，如 B 站对境外代理）：换直连或别的出口、登录
+    /// 后再试
+    #[error("{0}")]
+    Blocked(String),
     /// 连不上网站、超时、TLS 出错
     #[error("{0}")]
     Network(String),
@@ -614,6 +618,7 @@ impl Failure {
             "geo" => ExtractError::Geo(message),
             "login" => ExtractError::Login(message),
             "rate_limited" => ExtractError::RateLimited(message),
+            "blocked" => ExtractError::Blocked(message),
             "network" => ExtractError::Network(message),
             "unavailable" => ExtractError::Unavailable(message),
             "changed" => ExtractError::Changed(message),
