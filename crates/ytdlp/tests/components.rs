@@ -420,7 +420,8 @@ async fn repairing_downloads_everything_again() {
     assert_eq!(components.installed().unwrap(), Some(repaired));
 }
 
-/// 换组件目录时在两次改名之间中断：原名没有新的放上，清理时把最近挪开的那个挪回去，别的挪开的删掉。
+/// 换组件目录时在两次改名之间中断：原名没有新的放上，启动时把最近挪开的那个挪回去；清理删掉别的挪开的，要挪回而没
+/// 挪成的留着。
 #[tokio::test(flavor = "multi_thread")]
 async fn an_interrupted_replacement_is_moved_back_when_sweeping() {
     let root = test_dir("trash");
@@ -431,8 +432,13 @@ async fn an_interrupted_replacement_is_moved_back_when_sweeping() {
     std::fs::create_dir_all(root.join("trash-deno-2.9.8-10")).unwrap();
     std::fs::create_dir_all(root.join("trash-yt-dlp-2026.10.26-5")).unwrap();
     assert_eq!(components.installed().unwrap(), None);
+    // 没挪回之前清理：要挪回的那个留着
     components.sweep().await;
+    assert!(root.join("trash-deno-2.9.8-20").is_dir());
+    assert!(!root.join("trash-deno-2.9.8-10").exists());
+    components.recover();
     assert_eq!(components.installed().unwrap(), Some(installed));
+    components.sweep().await;
     let left: Vec<_> = std::fs::read_dir(&root)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())

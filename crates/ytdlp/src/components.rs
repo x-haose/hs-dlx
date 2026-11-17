@@ -258,7 +258,7 @@ impl Components {
     }
 
     /// 删掉不再用的：锁定版本以外的 Python 与 deno、当前与上一个以外的 yt-dlp、旧的驱动脚本、换下来挪开的组件目录（原名
-    /// 没有新的放上时先挪回去）；删不掉的留着，下次再删。
+    /// 不在时最近挪开的那个留着，等 [`Components::recover`] 挪回）；删不掉的留着，下次再删。
     /// 换版本之后用旧版本的解析进程可能还在跑（换版本前开始的任务），在没有任务运行时（应用启动时）调用。
     pub async fn sweep(&self) {
         let _busy = self.busy.lock().await;
@@ -269,31 +269,8 @@ impl Components {
         while let Ok(Some(entry)) = entries.next_entry().await {
             names.push(entry.file_name().to_string_lossy().into_owned());
         }
-        // 换下来挪开、而原名没有新的放上（两次改名之间中断）的：最近挪开的那个是完好的旧组件，挪回去
-        let mut restore: BTreeMap<&str, (&str, u128)> = BTreeMap::new();
-        for name in &names {
-            let Some((original, nanos)) = name
-                .strip_prefix(TRASH)
-                .and_then(|rest| rest.rsplit_once('-'))
-                .and_then(|(original, nanos)| Some((original, nanos.parse::<u128>().ok()?)))
-            else {
-                continue;
-            };
-            if !self.root.join(original).exists()
-                && restore.get(original).is_none_or(|(_, at)| *at < nanos)
-            {
-                restore.insert(original, (name, nanos));
-            }
-        }
-        let mut restored = Vec::new();
-        for (original, (name, _)) in &restore {
-            if tokio::fs::rename(self.root.join(name), self.root.join(original))
-                .await
-                .is_ok()
-            {
-                restored.push(*name);
-            }
-        }
+        // 要挪回而没挪成（见 recover）的留着，下次启动再挪
+        let pending: Vec<String> = self.unplaced(&names).into_values().collect();
         // 状态文件读不出时只删挪开的，别的不知道哪个在用
         let keep = match self.state() {
             Ok(Some(state)) => Some([
@@ -309,7 +286,7 @@ impl Components {
         let driver = self.driver_path();
         for name in &names {
             let path = self.root.join(name);
-            let trash = name.starts_with(TRASH) && !restored.contains(&name.as_str());
+            let trash = name.starts_with(TRASH) && !pending.contains(name);
             let stale_dir = keep.as_ref().is_some_and(|keep| {
                 ["python-", "deno-", "yt-dlp-"]
                     .iter()
@@ -324,6 +301,44 @@ impl Components {
                 let _left = tokio::fs::remove_file(&path).await;
             }
         }
+    }
+
+    /// 换组件目录时在两次改名之间中断（断电、崩溃）、原名没有新的放上的：把最近挪开的那个（完好的旧组件）挪回去，等于那次
+    /// 换没开始。应用启动时、算组件装没装好之前调（同步，只是几次改名）；挪不回去（文件被占）的留给下次启动。
+    pub fn recover(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return;
+        };
+        let names: Vec<String> = entries
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        for (original, name) in self.unplaced(&names) {
+            let _later = std::fs::rename(self.root.join(&name), self.root.join(original));
+        }
+    }
+
+    /// `names`（组件目录里的）中原名不在的挪开的目录：原名对最近挪开的那个的名字。
+    fn unplaced(&self, names: &[String]) -> BTreeMap<String, String> {
+        let mut newest: BTreeMap<String, (String, u128)> = BTreeMap::new();
+        for name in names {
+            let Some((original, nanos)) = name
+                .strip_prefix(TRASH)
+                .and_then(|rest| rest.rsplit_once('-'))
+                .and_then(|(original, nanos)| Some((original, nanos.parse::<u128>().ok()?)))
+            else {
+                continue;
+            };
+            if !self.root.join(original).exists()
+                && newest.get(original).is_none_or(|(_, at)| *at < nanos)
+            {
+                newest.insert(original.to_owned(), (name.clone(), nanos));
+            }
+        }
+        newest
+            .into_iter()
+            .map(|(original, (name, _))| (original, name))
+            .collect()
     }
 
     /// [`Components::install`] 拿到锁、核对过没装全之后的部分。
@@ -351,7 +366,8 @@ impl Components {
     }
 
     /// 装上 yt-dlp 的 `version`（PyPI 上的写法，经 `proxy`）、自检，过了才换成当前的，上一个留着；已是当前的直接返回，
-    /// 是上一个（目录还在）时照 [`Components::rollback`] 换回、不重装（运行中的任务可能还在用它的目录）。Python 与 deno
+    /// 是上一个（目录还在）时照 [`Components::rollback`] 换回、不重装（运行中的任务可能还在用它的目录），换回的自检
+    /// 不过（它坏了）时才重装。Python 与 deno
     /// 要已装好（见 [`Components::install`]），没装时报 [`Error::NotInstalled`]。
     pub async fn update(
         &self,
@@ -365,12 +381,23 @@ impl Components {
         if current.version == version {
             return Ok(current);
         }
-        // 自检不过（目录里的文件被隔离、删了）时照常重装：replace_dir 把坏的挪开
+        // 自检不过（导入失败、版本对不上：目录里的文件被隔离、删了）时照常重装，replace_dir 把坏的挪开；起不来、超时等
+        // 一时的失败照样报出
         if current.previous.as_deref() == Some(version)
             && self.root.join(format!("yt-dlp-{version}")).is_dir()
         {
             match self.switch_back(cancel).await {
-                Err(Error::SelfTest(_)) => {}
+                Err(Error::SelfTest(broken)) => {
+                    self.prepare().await?;
+                    return self
+                        .install_yt_dlp(proxy, version, progress, cancel)
+                        .await
+                        .map_err(|error| {
+                            Error::SelfTest(format!(
+                                "本机的 {version} 坏了（{broken}），重装也没成：{error}"
+                            ))
+                        });
+                }
                 switched => return switched,
             }
         }
@@ -692,7 +719,7 @@ impl Components {
         let picked = run_driver(&python, &driver, "pick", &files, cancel)
             .await
             .map_err(|error| match error {
-                Error::Command(reason) => Error::Unsupported(reason),
+                Error::Exited(reason) => Error::Unsupported(reason),
                 error => error,
             })?;
         let picked: BTreeMap<String, String> = serde_json::from_slice(&picked)
@@ -739,7 +766,7 @@ impl Components {
         run(pip, PIP_TIMEOUT, cancel)
             .await
             .map_err(|error| match error {
-                Error::Command(reason) => Error::Pip(reason),
+                Error::Command(reason) | Error::Exited(reason) => Error::Pip(reason),
                 error => error,
             })?;
         progress(InstallProgress {
@@ -903,7 +930,7 @@ async fn self_test(
     let out = run(selftest, SELF_TEST_TIMEOUT, cancel)
         .await
         .map_err(|error| match error {
-            Error::Command(reason) => Error::SelfTest(reason),
+            Error::Exited(reason) => Error::SelfTest(reason),
             error => error,
         })?;
     #[derive(Deserialize)]
@@ -917,7 +944,7 @@ async fn self_test(
     let out = run(version, SELF_TEST_TIMEOUT, cancel)
         .await
         .map_err(|error| match error {
-            Error::Command(reason) => Error::SelfTest(format!("deno 运行不了：{reason}")),
+            Error::Exited(reason) => Error::SelfTest(format!("deno 运行不了：{reason}")),
             error => error,
         })?;
     if !String::from_utf8_lossy(&out).starts_with("deno ") {
@@ -936,7 +963,8 @@ pub(crate) async fn run(
 }
 
 /// 运行 `command` 到结束，标准输入为 `input`（None 时为空），返回标准输出；超过 `timeout` 或 `cancel` 时杀掉进程
-/// （后者报 [`Error::Cancelled`]），退出码不为 0 时报 [`Error::Command`]（带错误输出的末尾）。
+/// （后者报 [`Error::Cancelled`]），起不来、超时报 [`Error::Command`]，退出码不为 0 时报 [`Error::Exited`]（带错误
+/// 输出的末尾）。
 async fn run_with(
     mut command: tokio::process::Command,
     input: Option<Vec<u8>>,
@@ -1001,7 +1029,7 @@ async fn run_with(
         let start = (start..text.len())
             .find(|index| text.is_char_boundary(*index))
             .unwrap_or(text.len());
-        return Err(Error::Command(format!(
+        return Err(Error::Exited(format!(
             "{program} 失败（{status}）：{}",
             text[start..].trim()
         )));

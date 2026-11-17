@@ -44,9 +44,12 @@ pub enum Error {
     /// PyPI 回的认不出，或给的地址不对
     #[error("{0}")]
     Index(String),
-    /// 子进程起不来、超时或失败
+    /// 子进程起不来、超时，或输出认不出
     #[error("{0}")]
     Command(String),
+    /// 子进程跑完了、退出码不为 0：原因是它错误输出的末尾
+    #[error("{0}")]
+    Exited(String),
     /// 系统代理设置读不了
     #[error("{0}")]
     Proxy(String),
@@ -78,6 +81,7 @@ impl Error {
             | Error::SelfTest(_)
             | Error::Index(_)
             | Error::Command(_)
+            | Error::Exited(_)
             | Error::Proxy(_)
             | Error::NotInstalled
             | Error::NoPrevious

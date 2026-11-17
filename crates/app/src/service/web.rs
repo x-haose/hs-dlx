@@ -78,6 +78,10 @@ impl Web {
         let components = config
             .pins
             .map(|pins| Components::new(config.root, pins, config.sources, engine));
+        // 上次换组件时在两次改名之间中断的，先挪回去再看装没装好
+        if let Some(components) = &components {
+            components.recover();
+        }
         let (state, extractor) = match components.as_ref().map(Components::installed) {
             None => (WebState::Unavailable, None),
             Some(Ok(None)) => (WebState::Missing, None),
@@ -178,6 +182,7 @@ impl Service {
     pub fn update_web(&self, version: String) -> Result<(), Error> {
         let web = &self.shared.web;
         let current = web.version().ok_or(Error::WebNotReady)?;
+        let before = web.state.borrow().clone();
         let proxy = self.settings()?.proxy;
         let cancel = {
             let mut installing = lock(&web.installing);
@@ -215,6 +220,8 @@ impl Service {
                     WebState::Ready(version)
                 }
                 // 没换成：原来的照旧在用
+                // 取消的不算失败：照原来的
+                Err(hs_dlx_ytdlp::Error::Cancelled) => before,
                 Err(error) => WebState::UpdateFailed {
                     version: current,
                     reason: format!("更新没成：{error}"),
@@ -232,6 +239,7 @@ impl Service {
     pub fn rollback_web(&self) -> Result<(), Error> {
         let web = &self.shared.web;
         let current = web.version().ok_or(Error::WebNotReady)?;
+        let before = web.state.borrow().clone();
         let cancel = {
             let mut installing = lock(&web.installing);
             if installing.is_some() {
@@ -256,6 +264,8 @@ impl Service {
                     )));
                     WebState::Ready(version)
                 }
+                // 取消的不算失败：照原来的
+                Err(hs_dlx_ytdlp::Error::Cancelled) => before,
                 Err(error) => WebState::UpdateFailed {
                     version: current,
                     reason: format!("换回没成：{error}"),
@@ -325,31 +335,30 @@ impl Service {
                         bytes: 0,
                         total: None,
                     }));
+                    // 先看取消：取消时 wait_idle 还没关上名额，这一个照常能用
                     let waited = tokio::select! {
-                        () = old.shutdown() => true,
+                        biased;
                         () = cancel.cancelled() => false,
+                        () = old.wait_idle() => true,
                     };
                     if !waited {
-                        // 取消了：照原来的接着用（停到一半的名额已关上，换一个新的）
-                        *lock(&web.extractor) = Some(Arc::new(Extractor::new(
-                            old.installed().clone(),
-                            web.cache.clone(),
-                            EXTRACT_TIMEOUT,
-                        )));
+                        *lock(&web.extractor) = Some(old);
                         *lock(&web.installing) = None;
                         web.state.send_replace(before);
                         return;
                     }
+                    old.stop_workers().await;
                 }
                 let repaired = components.repair(&proxy, channel, &report, &cancel).await;
                 if let Err(error) = &repaired {
-                    // 新的没就位时旧的照旧在（下载失败、取消），照原来的状态接着用
+                    // 新的没就位时旧的照旧在（下载失败、取消），照原来的状态接着用；取消的不算失败
                     let kept = match components.installed() {
                         Ok(Some(installed)) if !matches!(before, WebState::Broken(_)) => {
                             Some(installed)
                         }
                         Ok(_) | Err(_) => None,
                     };
+                    let cancelled = matches!(error, hs_dlx_ytdlp::Error::Cancelled);
                     let next = match (kept, &before) {
                         (Some(installed), _) => {
                             let version = installed.version.clone();
@@ -358,11 +367,16 @@ impl Service {
                                 web.cache.clone(),
                                 EXTRACT_TIMEOUT,
                             )));
-                            WebState::UpdateFailed {
-                                version,
-                                reason: format!("重装没成：{error}"),
+                            if cancelled {
+                                before
+                            } else {
+                                WebState::UpdateFailed {
+                                    version,
+                                    reason: format!("重装没成：{error}"),
+                                }
                             }
                         }
+                        (None, _) if cancelled => before,
                         (None, WebState::Broken(_)) => {
                             WebState::Broken(format!("重装没成：{error}"))
                         }

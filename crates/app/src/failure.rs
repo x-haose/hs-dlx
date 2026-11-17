@@ -212,9 +212,10 @@ impl FailureKind {
             ExtractError::Unsupported(_) | ExtractError::Other(_) | ExtractError::Crashed(_) => {
                 FailureKind::WebExtract
             }
-            ExtractError::Proxy(_) | ExtractError::System(_) | ExtractError::Cancelled => {
-                FailureKind::Other
-            }
+            ExtractError::Proxy(_)
+            | ExtractError::System(_)
+            | ExtractError::Replacing
+            | ExtractError::Cancelled => FailureKind::Other,
         }
     }
 

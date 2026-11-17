@@ -76,6 +76,9 @@ pub enum ExtractError {
     /// 网站说视频不可用：私密、删了、未开播等
     #[error("{0}")]
     Unavailable(String),
+    /// 组件正在换（[`Extractor::wait_idle`] 之后）：换好后用新的再试
+    #[error("解析组件正在换，换好后再试")]
+    Replacing,
     /// 交回 yt-dlp 下载时，网站这次给的格式里没有要的那个（见 [`crate::FormatKey`]）
     #[error("{0}")]
     Changed(String),
@@ -108,7 +111,7 @@ pub enum ExtractError {
 struct Worker {
     /// 停下（[`Worker::stop`]）或释放时取走
     child: Option<Child>,
-    /// 没经停下就释放的进程交到这里，由 [`Extractor::shutdown`] 等它们退出
+    /// 没经停下（或停到一半）就释放的进程交到这里，由 [`Extractor::stop_workers`] 等它们退出
     dying: Arc<Mutex<Vec<Child>>>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
@@ -121,13 +124,20 @@ struct Worker {
 impl Worker {
     /// 杀掉进程与它起的子进程，等它退出（至多 [`STOP_WAIT`]）：之后它打开的文件已关上（Windows 上才删得掉）。
     async fn stop(mut self) {
-        let Some(mut child) = self.child.take() else {
+        // 进程留在 Worker 里直到退出：停到一半被丢弃时释放照常把它交给 dying
+        let Some(pid) = self.child.as_ref().and_then(Child::id) else {
             return;
         };
-        if let Some(pid) = child.id() {
-            // 杀不到（已经退出了）或杀的命令起不来时，下面等不到退出，释放 Child 时再杀一次（kill_on_drop）
-            let _killed = tokio::process::Command::from(killer(pid)).status().await;
-            let _exited = tokio::time::timeout(STOP_WAIT, child.wait()).await;
+        let killed = tokio::process::Command::from(killer(pid)).status().await;
+        if let (Err(_), Some(child)) = (killed, self.child.as_mut()) {
+            // 杀进程组的命令起不来：至少杀掉它本身
+            let _signalled = child.start_kill();
+        }
+        if let Some(child) = self.child.as_mut() {
+            // 等不到退出（系统忙）时下面释放照样交给 dying
+            if tokio::time::timeout(STOP_WAIT, child.wait()).await.is_ok() {
+                self.child = None;
+            }
         }
     }
 
@@ -149,14 +159,20 @@ impl Drop for Worker {
         let Some(pid) = child.id() else {
             return;
         };
-        // 杀不到（已经退出了）或杀的命令起不来都不影响：本进程随 Child 的释放（kill_on_drop）照样杀掉
         if tokio::runtime::Handle::try_current().is_ok() {
-            let _spawned = tokio::process::Command::from(killer(pid)).spawn();
+            let spawned = tokio::process::Command::from(killer(pid)).spawn();
+            let mut child = child;
+            if spawned.is_err() {
+                // 杀进程组的命令起不来（打开的文件或进程太多）：至少杀掉它本身。不先杀：Windows 上父进程先没了，
+                // taskkill /T 找不到它的子进程
+                let _signalled = child.start_kill();
+            }
             let mut dying = self.dying.lock().expect("锁里不会 panic");
             // 已退出的不必再等
             dying.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
             dying.push(child);
         } else {
+            // 不在运行时里（应用退出时）：等命令跑完；起不来时本进程随 Child 的释放（kill_on_drop）杀掉
             let _done = killer(pid).status();
         }
     }
@@ -192,7 +208,7 @@ pub struct Extractor {
     cache: PathBuf,
     timeout: Duration,
     idle: Mutex<VecDeque<Worker>>,
-    /// 解析的名额；[`Extractor::shutdown`] 之后关上
+    /// 解析的名额；[`Extractor::wait_idle`] 之后关上
     slots: Semaphore,
     /// 释放了、杀了而还没等到退出的进程
     dying: Arc<Mutex<Vec<Child>>>,
@@ -211,14 +227,19 @@ impl Extractor {
         }
     }
 
-    /// 等在解析的解析完（至多一次解析的时限），关上解析的名额（之后的解析报 [`ExtractError::System`]），停掉闲着的解析
-    /// 进程，等它们与释放时杀了的进程都退出（各至多 5 秒）：换下组件之前，Windows 上挪不动在运行的程序。交回
-    /// yt-dlp 下载的进程不在这里：调用方要先停下用它的任务。
-    pub async fn shutdown(&self) {
+    /// 等在解析的、排着队的解析都做完，再关上解析的名额：之后的解析报 [`ExtractError::Replacing`]，不再用这套组件起
+    /// 进程。可以取消（丢弃即可）：关上之前取消时这个 Extractor 照常能用。换下组件之前调，接着调
+    /// [`Extractor::stop_workers`]。
+    pub async fn wait_idle(&self) {
         if let Ok(all) = self.slots.acquire_many(WORKERS as u32).await {
             self.slots.close();
             drop(all);
         }
+    }
+
+    /// 停掉闲着的解析进程，等它们与释放时杀了的进程都退出（各至多 5 秒）：Windows 上挪不动在运行的程序。交回 yt-dlp
+    /// 下载的进程不在这里：调用方要先停下用它的任务。
+    pub async fn stop_workers(&self) {
         let idle: Vec<Worker> = self
             .idle
             .lock()
@@ -254,9 +275,7 @@ impl Extractor {
             .map_err(|error| ExtractError::Proxy(error.to_string()))?
             .map_or_else(String::new, |proxy| proxy.to_string());
         let _slot = tokio::select! {
-            slot = self.slots.acquire() => slot.map_err(|_| {
-                ExtractError::System("解析组件正在换，换好后再试".to_owned())
-            })?,
+            slot = self.slots.acquire() => slot.map_err(|_| ExtractError::Replacing)?,
             () = cancel.cancelled() => return Err(ExtractError::Cancelled),
         };
         let idle = self.idle.lock().expect("锁里不会 panic").pop_front();
