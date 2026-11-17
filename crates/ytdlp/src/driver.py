@@ -56,6 +56,7 @@ INTERNAL_EXTENSIONS = frozenset(
 )
 # 网站说资源没了的 HTTP 状态
 GONE = frozenset({404, 410})
+UNAUTHORIZED = 401
 # 下载进度至多多久报一次（秒）
 PROGRESS_INTERVAL = 0.2
 # 用 yt-dlp 锁定版本的这两组依赖：默认的依赖与模拟浏览器 TLS 指纹的 curl-cffi
@@ -245,14 +246,14 @@ def root_of(original: BaseException) -> BaseException:
     return root
 
 
-def classify(error: BaseException) -> tuple[str, str]:
+def classify(error: BaseException, *, downloading: bool = False) -> tuple[str, str]:
     """yt-dlp 的失败归类：种类与说明。
 
     种类：`unsupported`（没有专门的解析器认得这个网址）、`geo`（地区限制）、`login`（要登录或 Cookie）、
     `rate_limited`（429）、`network`（连不上、超时、TLS；下载时服务器回的错误状态与没下完整）、`disk`（下载时写不了
     文件）、`unavailable`（网站说视频不可用：私密、删了、未开播等）、`other`（其余，多为网站改了、yt-dlp 要更新）。
-    网站回的错误状态（解析时请求接口、下载时请求直链）：404、410 为不可用，429 为限流，其余（403 被拒、412 风控、
-    5xx 等）算网络：多为一时的，再试即重新解析、换新的直链。
+    网站回的错误状态：429 为限流；解析时请求接口回的 401 为要登录，404、410 为不可用；其余（403 被拒、412 风控、5xx
+    等，与 `downloading` 时直链回的一切状态）算网络：多为一时的或直链过期，再试即重新解析、换新的直链。
     """
     original = unwrapped(error)
     message = clean(str(getattr(original, "orig_msg", None) or original))
@@ -266,7 +267,9 @@ def classify(error: BaseException) -> tuple[str, str]:
         kind = "geo"
     elif status == TOO_MANY_REQUESTS:
         kind = "rate_limited"
-    elif status in GONE:
+    elif status == UNAUTHORIZED and not downloading:
+        kind = "login"
+    elif status in GONE and not downloading:
         kind = "unavailable"
     elif status is not None or "TransportError" in causes or "ContentTooShortError" in names:
         kind = "network"
@@ -482,9 +485,9 @@ def download(yt_dlp: ModuleType, request: Mapping[str, object], deno: str, cache
         except yt_dlp.utils.YoutubeDLError as error:
             if picked == [False]:
                 return {"error": {"kind": "changed", "message": f"网站给的格式里没有要的 {wanted.get('format_id')}"}}
-            kind, message = classify(error)
-            # 重试用尽时 yt-dlp 在 except 之外报错，DownloadError 不带原因
-            if kind == "other" and picked == [True] and unwrapped(error) is error:
+            kind, message = classify(error, downloading=picked == [True])
+            # 重试用尽时 yt-dlp 在 except 之外报「Got error: …」，DownloadError 不带原因
+            if kind == "other" and picked == [True] and unwrapped(error) is error and "Got error" in message:
                 kind = "network"
             return {"error": {"kind": kind, "message": message}}
     skipped = [warning for warning in logger.warnings if "Skipping fragment" in warning]

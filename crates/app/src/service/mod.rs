@@ -401,14 +401,31 @@ impl Service {
             shared,
             runtime: Some(runtime),
         };
-        // 上次更新 yt-dlp 换下来的旧版本：这时没有任务在用；完成了的网页视频任务留下的任务目录
+        // 上次更新 yt-dlp 换下来的旧版本：这时没有任务在用。完成了的网页视频任务留下的任务目录另删，不等前者（它等着
+        // 组件的锁，安装期间一直被占）
         {
             let _entered = service.runtime().enter();
             let shared = service.shared.clone();
+            service
+                .shared
+                .tracker
+                .spawn(async move { shared.web.sweep().await });
+            let shared = service.shared.clone();
             service.shared.tracker.spawn(async move {
-                shared.web.sweep().await;
                 for work_dir in finished_web {
-                    if let Err(error) = web_task::remove_work_dir(&work_dir).await {
+                    // 这期间移除了那个任务、又新建了同一输出的任务时，目录是新任务的
+                    let taken = shared.write(|tx| {
+                        Ok(store::list(tx)?.iter().any(|task| {
+                            task.status != Status::Done
+                                && task.work_dir.as_deref() == Some(work_dir.as_path())
+                        }))
+                    });
+                    let removed = match taken {
+                        Ok(true) => continue,
+                        Ok(false) => web_task::remove_work_dir(&work_dir).await,
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = removed {
                         // 接收端就在返回值里，界面关闭前不会丢弃
                         let _closed = shared.events.send(Event::Orphaned {
                             paths: vec![work_dir],

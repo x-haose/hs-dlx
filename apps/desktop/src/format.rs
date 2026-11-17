@@ -178,7 +178,7 @@ pub fn failure(kind: FailureKind) -> (String, &'static str) {
         ),
         FailureKind::WebDenied => (
             "被拒".into(),
-            "网站拒绝了下载地址：继续时重新解析；要登录的，在嗅探页登录后用「解析网页视频」重新建",
+            "网站拒绝了下载地址：继续时重新解析；要登录的，改请求头补上登录后的 Cookie 再接着下",
         ),
         FailureKind::WebChanged => (
             "画质".into(),

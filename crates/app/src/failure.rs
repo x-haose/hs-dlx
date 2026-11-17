@@ -220,8 +220,18 @@ impl FailureKind {
 
     /// 合并（写 MP4、核对能否合并）时的错误。
     fn of_remux(error: &RemuxError) -> FailureKind {
+        // FFmpeg 读写文件出错时给负的 errno（本机磁盘的事）；它自己的错误码（数据不对等）远在这之外
+        let disk = |cause: &hs_m3u8_core::remux::FfmpegError| {
+            cause
+                .code
+                .checked_neg()
+                .is_some_and(|errno| (1..4096).contains(&errno))
+        };
         match error {
             RemuxError::Io { .. } | RemuxError::OpenOutput { .. } => FailureKind::Disk,
+            RemuxError::OpenInput { cause, .. } | RemuxError::Read { cause, .. } if disk(cause) => {
+                FailureKind::Disk
+            }
             RemuxError::Unsupported(_) => FailureKind::Mp4Unsupported,
             RemuxError::Cancelled => FailureKind::Other,
             RemuxError::Init(_)

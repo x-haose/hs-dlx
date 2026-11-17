@@ -196,7 +196,7 @@ impl SettingsView {
         let failed = match (&self.web.state, &self.web.latest) {
             (WebState::Failed(reason), _) => Some(format!("上次没装成：{reason}")),
             (WebState::Broken(reason), _) => Some(format!("组件运行不了，要重装：{reason}")),
-            (WebState::UpdateFailed { reason, .. }, _) => Some(format!("上次更新没成：{reason}")),
+            (WebState::UpdateFailed { reason, .. }, _) => Some(format!("上次{reason}")),
             (_, Some(Err(reason))) => Some(format!("没查成：{reason}")),
             _ => None,
         };

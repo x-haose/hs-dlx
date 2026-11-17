@@ -622,10 +622,11 @@ impl Shared {
                         ),
                     ));
                 }
+                // 先删后记：删不掉时下次还是同一份文件，不算重下过
+                remove(&files[index]).await?;
                 tokio::fs::write(&redone, b"")
                     .await
                     .map_err(|error| Stop::disk(&redone, &error))?;
-                remove(&files[index]).await?;
                 return Err(Stop::failed(
                     FailureKind::Integrity,
                     format!(
@@ -763,26 +764,34 @@ fn find<'a>(info: &'a Info, key: &FormatKey) -> Result<&'a Format, Stop> {
     })
 }
 
-/// 合并失败是不是第几路的文件读不出（打不开、读到一半出错、没有能写出的包）：下坏了，重下可能就好。格式不收、缺了
-/// 要的流的不算：重下也一样。
+/// 合并失败是不是第几路下坏了：打不开、读到一半出错（FFmpeg 说数据不对、意外到了结尾，不是读盘出错）、没有能写出的包。
+/// 重下可能就好。读盘出错（FFmpeg 的错误码是负的 errno）、格式不收、缺了要的流的不算：前者是本机磁盘的事，后两者重下
+/// 也一样。
 fn broken_input(error: &hs_m3u8_core::Error) -> Option<usize> {
     use hs_m3u8_core::remux::{Error as Remux, Origin};
     let hs_m3u8_core::Error::Remux(error) = error else {
         return None;
     };
-    match **error {
+    // FFmpeg 读写文件出错时给负的 errno；它自己的错误码（AVERROR_INVALIDDATA、AVERROR_EOF 等）远在这之外
+    let content = |cause: &hs_m3u8_core::remux::FfmpegError| {
+        !cause
+            .code
+            .checked_neg()
+            .is_some_and(|errno| (1..4096).contains(&errno))
+    };
+    match &**error {
         Remux::OpenInput {
             at: Origin::Input(index),
-            ..
+            cause,
         }
         | Remux::Read {
             at: Origin::Input(index),
-            ..
-        }
-        | Remux::EmptyInput {
+            cause,
+        } if content(cause) => Some(*index),
+        Remux::EmptyInput {
             at: Origin::Input(index),
             ..
-        } => Some(index),
+        } => Some(*index),
         _ => None,
     }
 }

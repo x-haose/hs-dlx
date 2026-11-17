@@ -40,7 +40,7 @@ pub enum WebState {
     Installing(InstallProgress),
     /// 装好了：yt-dlp 的版本
     Ready(String),
-    /// 装好了（`version` 照常在用），上次更新没成：原因
+    /// 装好了（`version` 照常在用），上次更新、换回或重装没成：做的是什么与原因，如「更新没成：…」
     UpdateFailed {
         version: String,
         reason: String,
@@ -181,7 +181,7 @@ impl Service {
         let cancel = {
             let mut installing = lock(&web.installing);
             if installing.is_some() {
-                return Err(Error::WebNotReady);
+                return Err(Error::WebInstalling);
             }
             let cancel = CancellationToken::new();
             *installing = Some(cancel.clone());
@@ -216,7 +216,7 @@ impl Service {
                 // 没换成：原来的照旧在用
                 Err(error) => WebState::UpdateFailed {
                     version: current,
-                    reason: error.to_string(),
+                    reason: format!("更新没成：{error}"),
                 },
             };
             *lock(&web.installing) = None;
@@ -234,7 +234,7 @@ impl Service {
         let cancel = {
             let mut installing = lock(&web.installing);
             if installing.is_some() {
-                return Err(Error::WebNotReady);
+                return Err(Error::WebInstalling);
             }
             let cancel = CancellationToken::new();
             *installing = Some(cancel.clone());
@@ -257,7 +257,7 @@ impl Service {
                 }
                 Err(error) => WebState::UpdateFailed {
                     version: current,
-                    reason: error.to_string(),
+                    reason: format!("换回没成：{error}"),
                 },
             };
             *lock(&web.installing) = None;
@@ -388,6 +388,11 @@ impl Service {
         url: Url,
         headers: &[(String, String)],
     ) -> Result<AbortOnDropHandle<Result<Resolved, ExtractError>>, Error> {
+        // 与新建时同样校验：不合的头建不成任务，解析时也不该悄悄丢掉
+        for (name, value) in headers {
+            hs_m3u8_core::check_option_header(name, value).map_err(Error::InvalidInput)?;
+        }
+        super::web_task::check_headers(headers)?;
         let extractor = lock(&self.shared.web.extractor)
             .clone()
             .ok_or(Error::WebNotReady)?;

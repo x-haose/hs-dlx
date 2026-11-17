@@ -10,6 +10,7 @@
 //! - `state.json`：当前与上一个 yt-dlp 版本、装它时的 Python 版本；先写临时文件、落盘再改名
 //! - `downloads/`：下载中与下好了的组件包、wheel 与核心的任务目录（续传用），用过即删
 //! - `staging/`：解包与 pip 安装的临时目录，每次安装前清空
+//! - `trash-<名>-<纳秒>/`：换下来的组件目录（见 [`Components::replace_dir`]），应用启动时删掉
 //! - `driver-<摘要>.py`：解析进程的驱动脚本，按内容命名，内容变了另写一个
 
 use std::collections::BTreeMap;
@@ -31,6 +32,8 @@ pub(crate) const DRIVER: &str = include_str!("driver.py");
 const PIP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// 自检最多多久：只导入模块、运行 deno 报版本。
 const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// 换下来的组件目录挪到的名字的前缀（见 [`Components::replace_dir`]）。
+const TRASH: &str = "trash-";
 /// 命令的错误输出最多留多少字节写进错误信息：出错时末尾是原因。
 const STDERR_TAIL: usize = 4096;
 /// PyPI 的 JSON 接口响应最多多少字节：yt-dlp 的全部发布约 1.2 MB（2026-11）。
@@ -231,6 +234,11 @@ impl Components {
     /// 或它的目录没了）时报 [`Error::NoPrevious`]，没装时报 [`Error::NotInstalled`]。
     pub async fn rollback(&self, cancel: &CancellationToken) -> Result<Installed, Error> {
         let _busy = self.busy.lock().await;
+        self.switch_back(cancel).await
+    }
+
+    /// [`Components::rollback`] 拿到锁之后的部分。
+    async fn switch_back(&self, cancel: &CancellationToken) -> Result<Installed, Error> {
         let current = self.installed()?.ok_or(Error::NotInstalled)?;
         let previous = current.previous.clone().ok_or(Error::NoPrevious)?;
         let back = self.installed_as(&previous, Some(current.version.clone()));
@@ -269,12 +277,13 @@ impl Components {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name().to_string_lossy().into_owned();
             let path = entry.path();
-            let stale_dir = ["python-", "deno-", "yt-dlp-"]
+            let stale_dir = (["python-", "deno-", "yt-dlp-"]
                 .iter()
                 .any(|prefix| name.starts_with(prefix))
-                && !keep.contains(&name);
+                && !keep.contains(&name))
+                || name.starts_with(TRASH);
             let stale_driver = name.starts_with("driver-") && path != driver;
-            // 清理失败不影响已装好的，下次安装时再删
+            // 清理失败不影响已装好的，下次启动时再删
             if stale_dir {
                 let _left = tokio::fs::remove_dir_all(&path).await;
             } else if stale_driver {
@@ -307,8 +316,9 @@ impl Components {
         self.install_yt_dlp(proxy, &version, progress, cancel).await
     }
 
-    /// 装上 yt-dlp 的 `version`（PyPI 上的写法，经 `proxy`）、自检，过了才换成当前的，上一个留着；已是当前的直接返回。
-    /// Python 与 deno 要已装好（见 [`Components::install`]），没装时报 [`Error::NotInstalled`]。
+    /// 装上 yt-dlp 的 `version`（PyPI 上的写法，经 `proxy`）、自检，过了才换成当前的，上一个留着；已是当前的直接返回，
+    /// 是上一个（目录还在）时照 [`Components::rollback`] 换回、不重装（运行中的任务可能还在用它的目录）。Python 与 deno
+    /// 要已装好（见 [`Components::install`]），没装时报 [`Error::NotInstalled`]。
     pub async fn update(
         &self,
         proxy: &Proxy,
@@ -320,6 +330,11 @@ impl Components {
         let current = self.installed()?.ok_or(Error::NotInstalled)?;
         if current.version == version {
             return Ok(current);
+        }
+        if current.previous.as_deref() == Some(version)
+            && self.root.join(format!("yt-dlp-{version}")).is_dir()
+        {
+            return self.switch_back(cancel).await;
         }
         self.prepare().await?;
         self.install_yt_dlp(proxy, version, progress, cancel).await
@@ -340,6 +355,37 @@ impl Components {
             previous,
             driver: self.driver_path(),
         }
+    }
+
+    /// 把装好的 `staging` 放到 `target`：`target` 在时先把它整个改名挪开（`trash-<名>-<纳秒>`，由
+    /// [`Components::sweep`] 删），再放新的，放不上时挪回来。Windows 上目录里有文件被占时改名整体失败，旧的完好；不删
+    /// 一半。
+    async fn replace_dir(&self, staging: &Path, target: &Path) -> Result<(), Error> {
+        let name = target
+            .file_name()
+            .expect("组件目录以名字结尾")
+            .to_string_lossy();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        let trash = self.root.join(format!("{TRASH}{name}-{nanos}"));
+        let moved = match tokio::fs::rename(target, &trash).await {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(Error::disk(target, &error)),
+        };
+        if let Err(error) = tokio::fs::rename(staging, target).await {
+            if moved && let Err(back) = tokio::fs::rename(&trash, target).await {
+                // 旧的留在 trash 里：之后照没装处理
+                return Err(Error::Disk(format!(
+                    "{}：{error}；旧的挪不回来（在 {}）：{back}",
+                    target.display(),
+                    trash.display()
+                )));
+            }
+            return Err(Error::disk(target, &error));
+        }
+        Ok(())
     }
 
     /// 记下当前（`yt_dlp`）与上一个 yt-dlp 版本：先写临时文件、落盘再改名。
@@ -561,10 +607,7 @@ impl Components {
                 pinned.executable
             )));
         }
-        remove_dir(&target).await?;
-        tokio::fs::rename(&staging, &target)
-            .await
-            .map_err(|error| Error::disk(&target, &error))?;
+        self.replace_dir(&staging, &target).await?;
         remove(&package).await
     }
 
@@ -674,16 +717,10 @@ impl Components {
             )));
         }
         let target = self.root.join(format!("yt-dlp-{version}"));
-        if target.exists() {
-            tokio::fs::remove_dir_all(&target)
-                .await
-                .map_err(|error| Error::disk(&target, &error))?;
-        }
-        tokio::fs::rename(&staging, &target)
-            .await
-            .map_err(|error| Error::disk(&target, &error))?;
-        // 重装同一版本时上一个照旧
+        self.replace_dir(&staging, &target).await?;
+        // 重装同一版本时上一个照旧；换了 Python 时上一个是用旧 Python 装的（带按解释器版本编译的扩展模块），不再算
         let previous = match self.state() {
+            Ok(Some(state)) if state.python != self.pins.python.version => None,
             Ok(Some(state)) if state.yt_dlp == version => state.previous,
             Ok(Some(state)) => Some(state.yt_dlp),
             Ok(None) | Err(_) => None,

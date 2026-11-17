@@ -93,8 +93,14 @@ impl NewTask {
         let handle = match self.service.resolve(self.url.clone(), &headers) {
             Ok(handle) => handle,
             Err(error) => {
+                // 请求头不合的（带了 Cookie 以外的、值里有制表符）改了再试；其余是组件没装好
+                let kind = if matches!(error, hs_dlx_app::Error::InvalidInput(_)) {
+                    FailureKind::Unrecoverable
+                } else {
+                    FailureKind::WebComponents
+                };
                 self.probing = Probing::Failed(Failure {
-                    kind: FailureKind::WebComponents,
+                    kind,
                     message: error.to_string(),
                 });
                 cx.notify();

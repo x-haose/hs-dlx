@@ -240,11 +240,20 @@ def test_failures_are_classified_by_what_the_site_said_and_where_they_happened()
     assert driver.classify(report_error(members))[0] == "login"
     # 解析时接口回的错误状态：yt-dlp 包成 expected 的 ExtractorError，按状态归类
     networking = importlib.import_module("yt_dlp.networking")
-    for status, kind in ((412, "network"), (503, "network"), (404, "unavailable"), (429, "rate_limited")):
+    for status, kind in (
+        (412, "network"),
+        (503, "network"),
+        (404, "unavailable"),
+        (429, "rate_limited"),
+        (401, "login"),
+    ):
         response = networking.Response(io.BytesIO(b""), "http://x/", {}, status=status)
         cause = networking.exceptions.HTTPError(response)
         refused = utils.ExtractorError(f"HTTP Error {status}", cause=cause, expected=True)
         assert driver.classify(report_error(refused))[0] == kind, status
+        # 下载时直链回的：除了限流都算网络（再试即换新的直链）
+        downloading = "rate_limited" if status == driver.TOO_MANY_REQUESTS else "network"
+        assert driver.classify(report_error(cause), downloading=True)[0] == downloading, status
     assert driver.classify(report_error(utils.ContentTooShortError(1, 2)))[0] == "network"
     full = OSError(28, "No space left on device")
     assert driver.classify(report_error(full))[0] == "disk"

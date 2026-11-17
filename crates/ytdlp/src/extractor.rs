@@ -187,8 +187,14 @@ impl Extractor {
         }
     }
 
-    /// 停掉闲着的解析进程，等它们退出（换下组件之前：Windows 上删不掉在运行的程序）。在解析的照常解析完。
+    /// 等在解析的解析完（至多一次解析的时限），再停掉闲着的解析进程、等它们退出：换下组件之前，Windows 上挪不动在运行
+    /// 的程序。
     pub async fn shutdown(&self) {
+        let _all = self
+            .slots
+            .acquire_many(WORKERS as u32)
+            .await
+            .expect("信号量不会关闭");
         let idle: Vec<Worker> = self
             .idle
             .lock()
@@ -309,12 +315,19 @@ impl Extractor {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut child = command.spawn().map_err(|error| {
-            // ENOEXEC（Unix）、ERROR_BAD_EXE_FORMAT（Windows）：不是可执行文件
-            let not_executable = if cfg!(windows) { 193 } else { 8 };
+            // 不是可执行文件：ENOEXEC（Unix）；ERROR_BAD_EXE_FORMAT、ERROR_EXE_MACHINE_TYPE_MISMATCH（Windows）。被杀毒
+            // 软件拦下：ERROR_VIRUS_INFECTED、ERROR_VIRUS_DELETED（Windows）
+            let unusable: &[i32] = if cfg!(windows) {
+                &[193, 216, 225, 226]
+            } else {
+                &[8]
+            };
             let broken = matches!(
                 error.kind(),
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ) || error.raw_os_error() == Some(not_executable);
+            ) || error
+                .raw_os_error()
+                .is_some_and(|code| unusable.contains(&code));
             if broken {
                 ExtractError::Broken(format!("起不来：{error}"))
             } else {
