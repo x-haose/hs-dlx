@@ -108,7 +108,7 @@ fn installed_components_are_ready_and_resolve_through_the_driver() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     // 只有通用解析器认得的地址：驱动脚本不发请求即回不支持（转嗅探页）
     let handle = service
-        .resolve(Url::parse("http://127.0.0.1:9/page").unwrap(), Vec::new())
+        .resolve(Url::parse("http://127.0.0.1:9/page").unwrap(), &[])
         .unwrap();
     let result = runtime.block_on(handle).unwrap();
     assert!(
@@ -132,7 +132,7 @@ fn components_that_cannot_start_are_marked_broken() {
     let handle = service
         .resolve(
             Url::parse("https://www.youtube.com/watch?v=x").unwrap(),
-            Vec::new(),
+            &[],
         )
         .unwrap();
     let result = runtime.block_on(handle).unwrap();
@@ -140,7 +140,7 @@ fn components_that_cannot_start_are_marked_broken() {
     assert!(matches!(*service.web_state().borrow(), WebState::Broken(_)));
     let refused = service.resolve(
         Url::parse("https://www.youtube.com/watch?v=x").unwrap(),
-        Vec::new(),
+        &[],
     );
     assert!(matches!(refused, Err(Error::WebNotReady)));
 }
@@ -152,7 +152,7 @@ fn resolving_before_the_components_are_installed_is_refused() {
     assert_eq!(*service.web_state().borrow(), WebState::Missing);
     let refused = service.resolve(
         Url::parse("https://www.youtube.com/watch?v=x").unwrap(),
-        Vec::new(),
+        &[],
     );
     assert!(matches!(refused, Err(Error::WebNotReady)));
 }

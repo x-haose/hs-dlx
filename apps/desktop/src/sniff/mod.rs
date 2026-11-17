@@ -36,7 +36,9 @@ use crate::dial;
 use crate::links::{NOT_HTTP, http_url};
 use crate::new_task::Link;
 use crate::ui::GAP;
+use crate::wait::within;
 use crate::web_route::{Lease, RelayFailure, WebRoute};
+use hs_dlx_webview::cookies::cookies_for;
 
 /// 一个页面里最多列出多少条流：网页能报任意多条，再多的只计数。
 const MAX_FOUND: usize = 200;
@@ -102,6 +104,8 @@ pub struct SniffView {
     navigated: Option<String>,
     /// 正在后台探测的一条（一次一条）；释放即取消
     checking: Option<Task<()>>,
+    /// 在读网页的 Cookie、好把网页交给网页视频解析（见 [`SniffView::open_page_as_web`]）；释放即取消
+    opening_web: Option<Task<()>>,
     _engine: Task<()>,
     /// 找流中逐帧重画、加载够久时重画一次好给出建议（见 [`SniffView::wait_to_suggest`]）
     _suggest: Task<()>,
@@ -267,6 +271,7 @@ impl SniffView {
             download: None,
             navigated: None,
             checking: None,
+            opening_web: None,
             _engine: engine,
             _suggest: Task::ready(()),
             _deadline: deadline,
@@ -530,6 +535,49 @@ impl SniffView {
     /// 把网页要下载的文件 `url` 不带请求头交给新建页去探测；任务照网页的标题取名。
     fn open_download(&self, url: Url, cx: &mut Context<Self>) {
         self.open_link(url, self.title.clone(), Vec::new(), None, cx);
+    }
+
+    /// 把正显示的网页交给新建页按网页视频解析（yt-dlp），带上网页引擎里发往它的 Cookie：在这里登录过的网站，解析与
+    /// 下载都带着登录状态。读不出 Cookie 时写明原因、不交。
+    fn open_page_as_web(&mut self, cx: &mut Context<Self>) {
+        let Some(webview) = self.webview().cloned() else {
+            return;
+        };
+        let page = self
+            .load
+            .shown
+            .as_deref()
+            .and_then(http_url)
+            .unwrap_or_else(|| self.opened.clone());
+        let cookies = cookies_for(webview.read(cx).raw(), &page);
+        self.opening_web = Some(cx.spawn(async move |this, cx| {
+            let executor = cx.background_executor().clone();
+            let cookies = within(
+                std::pin::pin!(cookies),
+                executor.timer(check::COOKIE_TIMEOUT),
+            )
+            .await
+            .unwrap_or_else(|| {
+                Err(format!(
+                    "网页引擎 {} 秒没有回出 Cookie",
+                    check::COOKIE_TIMEOUT.as_secs()
+                ))
+            });
+            // 关了时不再需要
+            let _closed = this.update(cx, |this, cx| {
+                this.opening_web = None;
+                match cookies {
+                    Ok(cookies) => {
+                        let headers = request::cookie_header(&cookies).into_iter().collect();
+                        this.open_link(page, None, headers, None, cx);
+                    }
+                    Err(reason) => {
+                        this.error = Some(format!("没读出网页的 Cookie：{reason}"));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
     }
 
     /// 把打开的地址当作播放列表交给新建页：它取到的是网页（多为缺请求头时源站回的拦截页），网页的标题不是视频的，

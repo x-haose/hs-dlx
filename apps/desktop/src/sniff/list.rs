@@ -174,6 +174,17 @@ impl SniffView {
                 .into_any_element(),
             );
         }
+        if self.webview.is_ok() {
+            actions.push(
+                ui::button(
+                    "page-as-web",
+                    "解析网页视频",
+                    Tone::Plain,
+                    cx.listener(|this, _, _, cx| this.open_page_as_web(cx)),
+                )
+                .into_any_element(),
+            );
+        }
         actions.push(
             ui::button(
                 "close-sniff",

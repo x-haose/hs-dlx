@@ -86,9 +86,10 @@ impl NewTask {
         cx.notify();
     }
 
-    /// 交给 yt-dlp 解析（之前的结果作废）。
+    /// 交给 yt-dlp 解析（之前的结果作废），带上请求头里的 Cookie（要登录才看得到的视频）。
     fn resolve(&mut self, cx: &mut Context<Self>) {
-        let handle = match self.service.resolve(self.url.clone(), Vec::new()) {
+        let headers = self.headers.read(cx).headers().to_vec();
+        let handle = match self.service.resolve(self.url.clone(), &headers) {
             Ok(handle) => handle,
             Err(error) => {
                 self.probing = Probing::Failed(Failure {

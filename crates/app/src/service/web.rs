@@ -6,8 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hs_dlx_ytdlp::{
-    Channel, Components, Cookie, ExtractError, Extractor, Info, InstallProgress, Pins, Request,
-    Sources,
+    Channel, Components, ExtractError, Extractor, Info, InstallProgress, Pins, Request, Sources,
 };
 use hs_m3u8_core::{CancellationToken, Engine, Url};
 use tokio::sync::watch;
@@ -283,13 +282,13 @@ impl Service {
         self.shared.web.cancel_install();
     }
 
-    /// 经设置里的代理解析网页地址 `url`（带 `cookies`），按设置里的取向给出画质选项。组件没装好时报
-    /// [`Error::WebNotReady`]，读不出设置时报错；句柄在任何执行器上都可等待，释放它即取消（解析进程随之杀掉）。只有
+    /// 经设置里的代理解析网页地址 `url`（带上请求头 `headers` 里的 Cookie，发往网页所在的可注册域名，与任务运行时
+    /// 一样），按设置里的取向给出画质选项。组件没装好时报 [`Error::WebNotReady`]，读不出设置时报错；句柄在任何执行器上都可等待，释放它即取消（解析进程随之杀掉）。只有
     /// 通用解析器认得的地址报 [`ExtractError::Unsupported`]（转嗅探页找）。
     pub fn resolve(
         &self,
         url: Url,
-        cookies: Vec<Cookie>,
+        headers: &[(String, String)],
     ) -> Result<AbortOnDropHandle<Result<Resolved, ExtractError>>, Error> {
         let extractor = lock(&self.shared.web.extractor)
             .clone()
@@ -297,8 +296,8 @@ impl Service {
         let settings = self.settings()?;
         let (proxy, preference) = (settings.proxy, settings.web_preference);
         let request = Request {
+            cookies: super::web_task::cookies(&url, headers),
             url,
-            cookies,
             generic: false,
         };
         let shared = self.shared.clone();

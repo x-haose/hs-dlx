@@ -68,6 +68,11 @@ impl HeadersEditor {
     }
 
     /// 让输入框获得焦点。
+    /// 已加入的请求头（输入框里还没加入的不算）。
+    pub fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.input.update(cx, |input, cx| input.focus(window, cx));
     }

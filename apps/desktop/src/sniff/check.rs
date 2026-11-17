@@ -14,7 +14,7 @@ use super::{SniffView, request};
 use crate::wait::within;
 
 /// 等网页引擎回出 Cookie 最多多久：引擎卡住时不让探测一直挂着。
-const COOKIE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const COOKIE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 探测一条流最多多久，到时取消（连同核心在途的请求与重试）：源站不回应时不让后面的一直排着。核心默认连接超时 15
 /// 秒、第一次重试前等约 0.5 秒，30 秒容得下一次连接超时后再试一次。
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
