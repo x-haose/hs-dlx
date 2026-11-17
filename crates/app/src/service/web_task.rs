@@ -2,7 +2,8 @@
 //! 另配的音频）分别下到任务目录里，再合并（两路时）或改名（一路时）成输出。
 //!
 //! 任务目录（输出旁的 `<输出>.hsdl`）里：每一路下完的文件 `<路>.<扩展名>`（在即这一路下完了）与它的核心任务目录
-//! `<路>.hsdl`（续传用；交回 yt-dlp 下的那一路是 yt-dlp 的 `.part`），合并时的半成品 `merged.<扩展名>`。
+//! `<路>.hsdl`（续传用；交回 yt-dlp 下的那一路是 yt-dlp 的 `.part`），合并出的 `merged.<扩展名>`（core 先写临时文件、写完
+//! 才换上）。
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -422,7 +423,7 @@ impl Shared {
         }
     }
 
-    /// 各路下完的 `files` 变成输出：两路时合并（先写任务目录里的半成品、写完改名），一路时直接改名。输出位置上已有
+    /// 各路下完的 `files` 变成输出：两路时合并进任务目录里的 `merged`、再改名，一路时直接改名。输出位置上已有
     /// 东西时不覆盖，以保存位置被占报出。
     async fn assemble(
         &self,
@@ -482,17 +483,8 @@ impl Shared {
                 progress,
             )
             .await;
-            let report = match merging {
-                Ok(report) => report,
-                Err(error) => {
-                    // 半成品不留着：下次从头合并
-                    let _gone = tokio::fs::remove_file(&merged).await;
-                    return Err(match error {
-                        hs_m3u8_core::remux::Error::Cancelled => Stop::Paused,
-                        error => Stop::failed(FailureKind::of_remux(&error), error.to_string()),
-                    });
-                }
-            };
+            // 失败或取消时 core 删掉它写的临时文件，`merged` 要么是完整的、要么不在
+            let report = merging.map_err(|error| Stop::core(&error))?;
             resolution = report.streams.iter().find_map(|stream| match stream.shape {
                 hs_m3u8_core::remux::Shape::Video { width, height, .. } => Some((width, height)),
                 hs_m3u8_core::remux::Shape::Audio { .. } => None,

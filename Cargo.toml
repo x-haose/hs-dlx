@@ -35,7 +35,7 @@ gpui-kit = "=0.9.1"
 # Linux 上嵌网页用的 GTK 3 绑定，与 wry 0.57.2 用的同一版
 gtk = "0.18"
 # HLS 的探测、下载、直播录制与转封装（hs-m3u8 的核心库）；固定到 hs-m3u8 主干上的提交，升级时与下面的 ffmpeg-sys-next 一起改
-hs-m3u8-core = { git = "https://github.com/x-haose/hs-m3u8", rev = "4b6f5b50016af56d287461a5030d21758d00ea18" }
+hs-m3u8-core = { git = "https://github.com/x-haose/hs-m3u8", rev = "3844c2a4ececcf022021dbaecc550d7d062f3a26" }
 # 比较路径时统一 Unicode 写法（NFC）
 icu_normalizer = { version = "2.4.0", default-features = false, features = ["compiled_data"] }
 # 桌面界面的事件时刻按本地时区显示
@@ -61,4 +61,4 @@ wry = "=0.57.2"
 
 [patch.crates-io]
 # hs-m3u8 对 ffmpeg-sys-next 的本地修改（与上游的差异见那里的 PATCHED.md）：依赖方的 patch 不会传过来，这里照样打上
-ffmpeg-sys-next = { git = "https://github.com/x-haose/hs-m3u8", rev = "4b6f5b50016af56d287461a5030d21758d00ea18" }
+ffmpeg-sys-next = { git = "https://github.com/x-haose/hs-m3u8", rev = "3844c2a4ececcf022021dbaecc550d7d062f3a26" }

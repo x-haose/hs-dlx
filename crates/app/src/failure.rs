@@ -183,7 +183,7 @@ impl FailureKind {
     }
 
     /// 合并（写 MP4、核对能否合并）时的错误。
-    pub(crate) fn of_remux(error: &RemuxError) -> FailureKind {
+    fn of_remux(error: &RemuxError) -> FailureKind {
         match error {
             RemuxError::Io { .. } | RemuxError::OpenOutput { .. } => FailureKind::Disk,
             RemuxError::Unsupported(_) => FailureKind::Mp4Unsupported,

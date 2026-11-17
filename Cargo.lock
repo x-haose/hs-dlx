@@ -2042,7 +2042,7 @@ dependencies = [
 [[package]]
 name = "ffmpeg-sys-next"
 version = "9.0.0"
-source = "git+https://github.com/x-haose/hs-m3u8?rev=4b6f5b50016af56d287461a5030d21758d00ea18#4b6f5b50016af56d287461a5030d21758d00ea18"
+source = "git+https://github.com/x-haose/hs-m3u8?rev=3844c2a4ececcf022021dbaecc550d7d062f3a26#3844c2a4ececcf022021dbaecc550d7d062f3a26"
 dependencies = [
  "bindgen",
  "cc",
@@ -3685,7 +3685,7 @@ dependencies = [
 [[package]]
 name = "hs-m3u8-core"
 version = "1.0.0"
-source = "git+https://github.com/x-haose/hs-m3u8?rev=4b6f5b50016af56d287461a5030d21758d00ea18#4b6f5b50016af56d287461a5030d21758d00ea18"
+source = "git+https://github.com/x-haose/hs-m3u8?rev=3844c2a4ececcf022021dbaecc550d7d062f3a26#3844c2a4ececcf022021dbaecc550d7d062f3a26"
 dependencies = [
  "aes 0.9.3",
  "cbc 0.2.1",
@@ -3709,7 +3709,7 @@ dependencies = [
 [[package]]
 name = "hs-m3u8-hls"
 version = "1.0.0"
-source = "git+https://github.com/x-haose/hs-m3u8?rev=4b6f5b50016af56d287461a5030d21758d00ea18#4b6f5b50016af56d287461a5030d21758d00ea18"
+source = "git+https://github.com/x-haose/hs-m3u8?rev=3844c2a4ececcf022021dbaecc550d7d062f3a26#3844c2a4ececcf022021dbaecc550d7d062f3a26"
 dependencies = [
  "thiserror 2.0.21",
  "url",
@@ -3718,7 +3718,7 @@ dependencies = [
 [[package]]
 name = "hs-m3u8-remux"
 version = "1.0.0"
-source = "git+https://github.com/x-haose/hs-m3u8?rev=4b6f5b50016af56d287461a5030d21758d00ea18#4b6f5b50016af56d287461a5030d21758d00ea18"
+source = "git+https://github.com/x-haose/hs-m3u8?rev=3844c2a4ececcf022021dbaecc550d7d062f3a26#3844c2a4ececcf022021dbaecc550d7d062f3a26"
 dependencies = [
  "ffmpeg-next",
  "libc",
@@ -3729,7 +3729,7 @@ dependencies = [
 [[package]]
 name = "hs-m3u8-sysproxy"
 version = "1.0.0"
-source = "git+https://github.com/x-haose/hs-m3u8?rev=4b6f5b50016af56d287461a5030d21758d00ea18#4b6f5b50016af56d287461a5030d21758d00ea18"
+source = "git+https://github.com/x-haose/hs-m3u8?rev=3844c2a4ececcf022021dbaecc550d7d062f3a26#3844c2a4ececcf022021dbaecc550d7d062f3a26"
 dependencies = [
  "system-configuration 0.7.0",
  "windows-registry 0.6.1",
