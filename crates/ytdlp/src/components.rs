@@ -89,6 +89,8 @@ enum Package {
 /// 安装进行到哪一步。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
+    /// 等在解析的解析完（重装前：在用的组件换不下）
+    Waiting,
     Python,
     Deno,
     /// 下载 yt-dlp 与依赖的 wheel 并装上
@@ -255,36 +257,68 @@ impl Components {
         Ok(back)
     }
 
-    /// 删掉不再用的：锁定版本以外的 Python 与 deno、当前与上一个以外的 yt-dlp、旧的驱动脚本；删不掉的留着，下次再删。
+    /// 删掉不再用的：锁定版本以外的 Python 与 deno、当前与上一个以外的 yt-dlp、旧的驱动脚本、换下来挪开的组件目录（原名
+    /// 没有新的放上时先挪回去）；删不掉的留着，下次再删。
     /// 换版本之后用旧版本的解析进程可能还在跑（换版本前开始的任务），在没有任务运行时（应用启动时）调用。
     pub async fn sweep(&self) {
         let _busy = self.busy.lock().await;
-        let Ok(Some(state)) = self.state() else {
-            return;
-        };
-        let keep = [
-            format!("python-{}", self.pins.python.version),
-            format!("deno-{}", self.pins.deno.version),
-            format!("yt-dlp-{}", state.yt_dlp),
-            state
-                .previous
-                .map_or_else(String::new, |previous| format!("yt-dlp-{previous}")),
-        ];
-        let driver = self.driver_path();
         let Ok(mut entries) = tokio::fs::read_dir(&self.root).await else {
             return;
         };
+        let mut names = Vec::new();
         while let Ok(Some(entry)) = entries.next_entry().await {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let path = entry.path();
-            let stale_dir = (["python-", "deno-", "yt-dlp-"]
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
-                && !keep.contains(&name))
-                || name.starts_with(TRASH);
-            let stale_driver = name.starts_with("driver-") && path != driver;
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        // 换下来挪开、而原名没有新的放上（两次改名之间中断）的：最近挪开的那个是完好的旧组件，挪回去
+        let mut restore: BTreeMap<&str, (&str, u128)> = BTreeMap::new();
+        for name in &names {
+            let Some((original, nanos)) = name
+                .strip_prefix(TRASH)
+                .and_then(|rest| rest.rsplit_once('-'))
+                .and_then(|(original, nanos)| Some((original, nanos.parse::<u128>().ok()?)))
+            else {
+                continue;
+            };
+            if !self.root.join(original).exists()
+                && restore.get(original).is_none_or(|(_, at)| *at < nanos)
+            {
+                restore.insert(original, (name, nanos));
+            }
+        }
+        let mut restored = Vec::new();
+        for (original, (name, _)) in &restore {
+            if tokio::fs::rename(self.root.join(name), self.root.join(original))
+                .await
+                .is_ok()
+            {
+                restored.push(*name);
+            }
+        }
+        // 状态文件读不出时只删挪开的，别的不知道哪个在用
+        let keep = match self.state() {
+            Ok(Some(state)) => Some([
+                format!("python-{}", self.pins.python.version),
+                format!("deno-{}", self.pins.deno.version),
+                format!("yt-dlp-{}", state.yt_dlp),
+                state
+                    .previous
+                    .map_or_else(String::new, |previous| format!("yt-dlp-{previous}")),
+            ]),
+            Ok(None) | Err(_) => None,
+        };
+        let driver = self.driver_path();
+        for name in &names {
+            let path = self.root.join(name);
+            let trash = name.starts_with(TRASH) && !restored.contains(&name.as_str());
+            let stale_dir = keep.as_ref().is_some_and(|keep| {
+                ["python-", "deno-", "yt-dlp-"]
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+                    && !keep.contains(name)
+            });
+            let stale_driver = keep.is_some() && name.starts_with("driver-") && path != driver;
             // 清理失败不影响已装好的，下次启动时再删
-            if stale_dir {
+            if trash || stale_dir {
                 let _left = tokio::fs::remove_dir_all(&path).await;
             } else if stale_driver {
                 let _left = tokio::fs::remove_file(&path).await;
@@ -331,10 +365,14 @@ impl Components {
         if current.version == version {
             return Ok(current);
         }
+        // 自检不过（目录里的文件被隔离、删了）时照常重装：replace_dir 把坏的挪开
         if current.previous.as_deref() == Some(version)
             && self.root.join(format!("yt-dlp-{version}")).is_dir()
         {
-            return self.switch_back(cancel).await;
+            match self.switch_back(cancel).await {
+                Err(Error::SelfTest(_)) => {}
+                switched => return switched,
+            }
         }
         self.prepare().await?;
         self.install_yt_dlp(proxy, version, progress, cancel).await

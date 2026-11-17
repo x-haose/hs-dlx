@@ -106,7 +106,10 @@ pub enum ExtractError {
 
 /// 一个解析进程。释放即连同它起的子进程（yt-dlp 解 JavaScript 挑战时起的 deno）一起杀掉。
 struct Worker {
-    child: Child,
+    /// 停下（[`Worker::stop`]）或释放时取走
+    child: Option<Child>,
+    /// 没经停下就释放的进程交到这里，由 [`Extractor::shutdown`] 等它们退出
+    dying: Arc<Mutex<Vec<Child>>>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     /// 标准错误的末尾，由后台任务 `reading` 一直读着（不读满了会让进程卡住），进程退出时它读到结尾结束
@@ -118,11 +121,21 @@ struct Worker {
 impl Worker {
     /// 杀掉进程与它起的子进程，等它退出（至多 [`STOP_WAIT`]）：之后它打开的文件已关上（Windows 上才删得掉）。
     async fn stop(mut self) {
-        if let Some(pid) = self.child.id() {
-            // 杀不到（已经退出了）或杀的命令起不来时，下面等不到退出，释放时再杀一次（连同 kill_on_drop）
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if let Some(pid) = child.id() {
+            // 杀不到（已经退出了）或杀的命令起不来时，下面等不到退出，释放 Child 时再杀一次（kill_on_drop）
             let _killed = tokio::process::Command::from(killer(pid)).status().await;
-            let _exited = tokio::time::timeout(STOP_WAIT, self.child.wait()).await;
+            let _exited = tokio::time::timeout(STOP_WAIT, child.wait()).await;
         }
+    }
+
+    /// 进程还活着（没退出、能问到）。
+    fn alive(&mut self) -> bool {
+        self.child
+            .as_mut()
+            .is_some_and(|child| matches!(child.try_wait(), Ok(None)))
     }
 }
 
@@ -130,12 +143,19 @@ impl Drop for Worker {
     /// 没经 [`Worker::stop`] 释放（解析的句柄被丢弃）时：在运行时里不等结果地起杀进程的命令（tokio 回收它），不在运行时里
     /// 时等它跑完。
     fn drop(&mut self) {
-        let Some(pid) = self.child.id() else {
+        let Some(child) = self.child.take() else {
+            return;
+        };
+        let Some(pid) = child.id() else {
             return;
         };
         // 杀不到（已经退出了）或杀的命令起不来都不影响：本进程随 Child 的释放（kill_on_drop）照样杀掉
         if tokio::runtime::Handle::try_current().is_ok() {
             let _spawned = tokio::process::Command::from(killer(pid)).spawn();
+            let mut dying = self.dying.lock().expect("锁里不会 panic");
+            // 已退出的不必再等
+            dying.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
+            dying.push(child);
         } else {
             let _done = killer(pid).status();
         }
@@ -172,7 +192,10 @@ pub struct Extractor {
     cache: PathBuf,
     timeout: Duration,
     idle: Mutex<VecDeque<Worker>>,
+    /// 解析的名额；[`Extractor::shutdown`] 之后关上
     slots: Semaphore,
+    /// 释放了、杀了而还没等到退出的进程
+    dying: Arc<Mutex<Vec<Child>>>,
 }
 
 impl Extractor {
@@ -184,17 +207,18 @@ impl Extractor {
             timeout,
             idle: Mutex::new(VecDeque::new()),
             slots: Semaphore::new(WORKERS),
+            dying: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    /// 等在解析的解析完（至多一次解析的时限），再停掉闲着的解析进程、等它们退出：换下组件之前，Windows 上挪不动在运行
-    /// 的程序。
+    /// 等在解析的解析完（至多一次解析的时限），关上解析的名额（之后的解析报 [`ExtractError::System`]），停掉闲着的解析
+    /// 进程，等它们与释放时杀了的进程都退出（各至多 5 秒）：换下组件之前，Windows 上挪不动在运行的程序。交回
+    /// yt-dlp 下载的进程不在这里：调用方要先停下用它的任务。
     pub async fn shutdown(&self) {
-        let _all = self
-            .slots
-            .acquire_many(WORKERS as u32)
-            .await
-            .expect("信号量不会关闭");
+        if let Ok(all) = self.slots.acquire_many(WORKERS as u32).await {
+            self.slots.close();
+            drop(all);
+        }
         let idle: Vec<Worker> = self
             .idle
             .lock()
@@ -203,6 +227,15 @@ impl Extractor {
             .collect();
         for worker in idle {
             worker.stop().await;
+        }
+        let dying: Vec<Child> = self
+            .dying
+            .lock()
+            .expect("锁里不会 panic")
+            .drain(..)
+            .collect();
+        for mut child in dying {
+            let _exited = tokio::time::timeout(STOP_WAIT, child.wait()).await;
         }
     }
 
@@ -221,13 +254,14 @@ impl Extractor {
             .map_err(|error| ExtractError::Proxy(error.to_string()))?
             .map_or_else(String::new, |proxy| proxy.to_string());
         let _slot = tokio::select! {
-            slot = self.slots.acquire() => slot.expect("信号量不会关闭"),
+            slot = self.slots.acquire() => slot.map_err(|_| {
+                ExtractError::System("解析组件正在换，换好后再试".to_owned())
+            })?,
             () = cancel.cancelled() => return Err(ExtractError::Cancelled),
         };
         let idle = self.idle.lock().expect("锁里不会 panic").pop_front();
         // 闲着的进程可能已被系统或别的程序结束：不拿它解析
-        let alive = idle
-            .and_then(|mut worker| matches!(worker.child.try_wait(), Ok(None)).then_some(worker));
+        let alive = idle.and_then(|mut worker| worker.alive().then_some(worker));
         let mut worker = match alive {
             Some(worker) => worker,
             None => self.spawn("serve")?,
@@ -358,7 +392,8 @@ impl Extractor {
             }
         });
         Ok(Worker {
-            child,
+            child: Some(child),
+            dying: self.dying.clone(),
             stdin,
             stdout,
             stderr,

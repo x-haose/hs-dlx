@@ -54,6 +54,8 @@ TRACEBACK_TAIL = 2000
 INTERNAL_EXTENSIONS = frozenset(
     {"description", "json", "meta", "orig", "part", "temp", "uncut", "unknown_video", "ytdl"}
 )
+# 下载时 yt-dlp 不带原因报出的、算网络的失败：重试用尽，直链回了空内容（HTTP 下载器、分片下载器）
+NO_DATA = ("Got error", "Did not get any data blocks", "The downloaded file is empty")
 # 网站说资源没了的 HTTP 状态
 GONE = frozenset({404, 410})
 UNAUTHORIZED = 401
@@ -486,8 +488,13 @@ def download(yt_dlp: ModuleType, request: Mapping[str, object], deno: str, cache
             if picked == [False]:
                 return {"error": {"kind": "changed", "message": f"网站给的格式里没有要的 {wanted.get('format_id')}"}}
             kind, message = classify(error, downloading=picked == [True])
-            # 重试用尽时 yt-dlp 在 except 之外报「Got error: …」，DownloadError 不带原因
-            if kind == "other" and picked == [True] and unwrapped(error) is error and "Got error" in message:
+            # 重试用尽（「Got error: …」）与直链回了空内容时 yt-dlp 在 except 之外报错，DownloadError 不带原因
+            if (
+                kind == "other"
+                and picked == [True]
+                and unwrapped(error) is error
+                and any(marker in message for marker in NO_DATA)
+            ):
                 kind = "network"
             return {"error": {"kind": kind, "message": message}}
     skipped = [warning for warning in logger.warnings if "Skipping fragment" in warning]

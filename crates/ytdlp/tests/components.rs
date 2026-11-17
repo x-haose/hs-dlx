@@ -420,6 +420,27 @@ async fn repairing_downloads_everything_again() {
     assert_eq!(components.installed().unwrap(), Some(repaired));
 }
 
+/// 换组件目录时在两次改名之间中断：原名没有新的放上，清理时把最近挪开的那个挪回去，别的挪开的删掉。
+#[tokio::test(flavor = "multi_thread")]
+async fn an_interrupted_replacement_is_moved_back_when_sweeping() {
+    let root = test_dir("trash");
+    let (_server, base, python, deno) = start(&["2026.10.26"]).await;
+    let components = components(&root, pins(&base, &python, &deno), &base);
+    let installed = install(&components, Channel::Stable).await.unwrap();
+    std::fs::rename(root.join("deno-2.9.8"), root.join("trash-deno-2.9.8-20")).unwrap();
+    std::fs::create_dir_all(root.join("trash-deno-2.9.8-10")).unwrap();
+    std::fs::create_dir_all(root.join("trash-yt-dlp-2026.10.26-5")).unwrap();
+    assert_eq!(components.installed().unwrap(), None);
+    components.sweep().await;
+    assert_eq!(components.installed().unwrap(), Some(installed));
+    let left: Vec<_> = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("trash-"))
+        .collect();
+    assert_eq!(left, Vec::<String>::new());
+}
+
 /// 更新：装进另一个目录、自检过了才换成当前的，上一个留着，更早的到清理时删掉（更新时不删）；每日构建的版本号带 `.dev0`（元数据也这样
 /// 写）；要装的版本 PyPI 上没有时报出、在用的不变。
 #[tokio::test(flavor = "multi_thread")]

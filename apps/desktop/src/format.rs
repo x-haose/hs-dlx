@@ -89,6 +89,7 @@ pub fn path(path: &Path, home: Option<&Path>) -> String {
 /// 网页视频组件安装到哪一步与这一步的字节进度，如「下载 Python · 12 MB / 30 MB」。
 pub fn web_install(progress: &InstallProgress) -> String {
     let stage = match progress.stage {
+        Stage::Waiting => "等在解析的解析完",
         Stage::Python => "下载 Python",
         Stage::Deno => "下载 deno",
         Stage::YtDlp => "下载 yt-dlp",

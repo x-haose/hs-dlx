@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use hs_dlx_ytdlp::{
     Channel, Components, ExtractError, Extractor, Info, InstallProgress, Pins, Request, Sources,
+    Stage,
 };
 use hs_m3u8_core::{CancellationToken, Engine, Url};
 use tokio::sync::watch;
@@ -319,7 +320,26 @@ impl Service {
                 // 闲着的解析进程用着要换下的组件
                 let old = lock(&web.extractor).take();
                 if let Some(old) = old {
-                    old.shutdown().await;
+                    state.send_replace(WebState::Installing(InstallProgress {
+                        stage: Stage::Waiting,
+                        bytes: 0,
+                        total: None,
+                    }));
+                    let waited = tokio::select! {
+                        () = old.shutdown() => true,
+                        () = cancel.cancelled() => false,
+                    };
+                    if !waited {
+                        // 取消了：照原来的接着用（停到一半的名额已关上，换一个新的）
+                        *lock(&web.extractor) = Some(Arc::new(Extractor::new(
+                            old.installed().clone(),
+                            web.cache.clone(),
+                            EXTRACT_TIMEOUT,
+                        )));
+                        *lock(&web.installing) = None;
+                        web.state.send_replace(before);
+                        return;
+                    }
                 }
                 let repaired = components.repair(&proxy, channel, &report, &cancel).await;
                 if let Err(error) = &repaired {
@@ -388,11 +408,18 @@ impl Service {
         url: Url,
         headers: &[(String, String)],
     ) -> Result<AbortOnDropHandle<Result<Resolved, ExtractError>>, Error> {
-        // 与新建时同样校验：不合的头建不成任务，解析时也不该悄悄丢掉
-        for (name, value) in headers {
+        // 只带 Cookie：别的请求头解析不用（只有通用解析器认得的网页要转嗅探页，那里用得上 Referer 等），Cookie 的值照
+        // 新建时校验，不在解析时悄悄丢掉
+        let cookies: Vec<(String, String)> = headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+            .cloned()
+            .collect();
+        for (name, value) in &cookies {
             hs_m3u8_core::check_option_header(name, value).map_err(Error::InvalidInput)?;
         }
-        super::web_task::check_headers(headers)?;
+        super::web_task::check_headers(&cookies)?;
+        let headers = cookies.as_slice();
         let extractor = lock(&self.shared.web.extractor)
             .clone()
             .ok_or(Error::WebNotReady)?;

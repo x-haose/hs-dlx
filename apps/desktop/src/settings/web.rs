@@ -145,9 +145,16 @@ impl SettingsView {
                     cx.listener(|this, _, _, cx| this.install_web(cx)),
                 ))
             }
-            WebState::Installing(progress) => {
-                line.child(ui::field(format::web_install(progress)).flex_1())
-            }
+            WebState::Installing(progress) => line
+                .child(ui::field(format::web_install(progress)).flex_1())
+                .child(ui::button(
+                    "web-cancel-install",
+                    "取消",
+                    Tone::Ghost,
+                    cx.listener(|this, _, _, cx| {
+                        this.tasks.read(cx).service().cancel_web_install();
+                    }),
+                )),
             WebState::Broken(_) => line.child(ui::field("运行不了").flex_1()).child(ui::button(
                 "web-install",
                 "重装",

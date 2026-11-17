@@ -764,34 +764,27 @@ fn find<'a>(info: &'a Info, key: &FormatKey) -> Result<&'a Format, Stop> {
     })
 }
 
-/// 合并失败是不是第几路下坏了：打不开、读到一半出错（FFmpeg 说数据不对、意外到了结尾，不是读盘出错）、没有能写出的包。
-/// 重下可能就好。读盘出错（FFmpeg 的错误码是负的 errno）、格式不收、缺了要的流的不算：前者是本机磁盘的事，后两者重下
-/// 也一样。
+/// 合并失败是不是第几路下坏了：打不开、读到一半出错、没有能写出的包，重下可能就好。这几种都是解复用器对内容的判断：
+/// 核心读输入时读盘出错报的是 `Io`（磁盘），不落在这里；解复用器碰到截断也会报 errno 形式的码（Matroska 的 EIO）。格式
+/// 不收、缺了要的流的不算：重下也一样。
 fn broken_input(error: &hs_m3u8_core::Error) -> Option<usize> {
     use hs_m3u8_core::remux::{Error as Remux, Origin};
     let hs_m3u8_core::Error::Remux(error) = error else {
         return None;
     };
-    // FFmpeg 读写文件出错时给负的 errno；它自己的错误码（AVERROR_INVALIDDATA、AVERROR_EOF 等）远在这之外
-    let content = |cause: &hs_m3u8_core::remux::FfmpegError| {
-        !cause
-            .code
-            .checked_neg()
-            .is_some_and(|errno| (1..4096).contains(&errno))
-    };
-    match &**error {
+    match **error {
         Remux::OpenInput {
             at: Origin::Input(index),
-            cause,
+            ..
         }
         | Remux::Read {
             at: Origin::Input(index),
-            cause,
-        } if content(cause) => Some(*index),
-        Remux::EmptyInput {
+            ..
+        }
+        | Remux::EmptyInput {
             at: Origin::Input(index),
             ..
-        } => Some(*index),
+        } => Some(index),
         _ => None,
     }
 }
