@@ -520,6 +520,10 @@ def watch_stdin() -> None:
     threading.Thread(target=wait, daemon=True).start()
 
 
+class SelfTestError(Exception):
+    """自检认定装上的 yt-dlp 与应用配不上；说明写给用户看，`main` 只把它写到标准错误（不带 traceback）。"""
+
+
 def selftest(site: str, quickjs: str) -> None:
     """导入 yt-dlp 与 yt-dlp-ejs，核对扩展名白名单还在、yt-dlp 认得 `quickjs`，报出 yt-dlp 的版本。
 
@@ -533,15 +537,19 @@ def selftest(site: str, quickjs: str) -> None:
     importlib.import_module("yt_dlp_ejs")
     # 白名单是 yt-dlp 的内部名字：新版改掉了就装不上，而不是装上后每次解析都出错
     if safe_ext("mp4") != "mp4" or safe_ext("exe") is not None:
-        message = "yt-dlp 的扩展名白名单认不出"
-        raise RuntimeError(message)
+        message = "yt-dlp 的扩展名白名单认不出，这一版用不了：要升级应用"
+        raise SelfTestError(message)
     yt_dlp = importlib.import_module("yt_dlp")
-    runtimes = yt_dlp.YoutubeDL({"quiet": True, "js_runtimes": {"quickjs": {"path": quickjs}}})._js_runtimes
-    runtime = runtimes.get("quickjs")
-    info = runtime.info if runtime is not None else None
+    try:
+        runtimes = yt_dlp.YoutubeDL({"quiet": True, "js_runtimes": {"quickjs": {"path": quickjs}}})._js_runtimes
+        runtime = runtimes.get("quickjs")
+        info = runtime.info if runtime is not None else None
+    except AttributeError as error:
+        message = f"yt-dlp 的 JavaScript 运行时接口认不出（{error}），这一版用不了：要升级应用"
+        raise SelfTestError(message) from error
     if info is None or not info.supported:
-        message = f"yt-dlp 认不出随应用带的 QuickJS-NG（{quickjs}）"
-        raise RuntimeError(message)
+        message = f"yt-dlp 认不出随应用带的 QuickJS-NG（{quickjs}），这一版用不了：要升级应用"
+        raise SelfTestError(message)
     metadata = importlib.import_module("importlib.metadata")
     version = importlib.import_module("pip._vendor.packaging.version")
     found = metadata.distribution("yt-dlp").version
@@ -556,7 +564,11 @@ def main() -> None:
         case ["pick"]:
             json.dump(pick(mapping(json.load(sys.stdin)) or {}), sys.stdout)
         case ["selftest", site, quickjs]:
-            selftest(site, quickjs)
+            try:
+                selftest(site, quickjs)
+            except SelfTestError as error:
+                sys.stderr.write(f"{error}\n")
+                raise SystemExit(1) from error
         case ["download", site, quickjs, cache]:
             replies = sys.stdout
             sys.stdout = sys.stderr
@@ -579,7 +591,8 @@ def main() -> None:
             serve(site, quickjs, cache, sys.stdin, replies)
         case _:
             sys.exit(
-                "用法：driver.py requirements | pick | selftest <site> | serve|download <site> <quickjs> <cache>，"
+                "用法：driver.py requirements | pick | selftest <site> <quickjs> | "
+                "serve|download <site> <quickjs> <cache>，"
                 f"收到 {sys.argv[1:]}"
             )
 

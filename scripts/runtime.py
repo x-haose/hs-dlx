@@ -1,15 +1,15 @@
 """随应用带的运行时：python-build-standalone 的 Python（install_only_stripped）与 QuickJS-NG。
 
-下载并按 SHA-256 核对，裁掉 yt-dlp 用不上的部分（Tcl/Tk、头文件、测试、idle、只给嵌入用的 libpython 动态库，与链了
-Berkeley DB、按 Sleepycat 许可证分发的 `_dbm`），在本机跑一遍确认能用；Python 打成 tar（条目按名字排序、时间与属主
-归零，同样的输入得到同样的字节）经 zstd 压缩，与 QuickJS-NG 一起放进 third_party/runtime/dist/，桌面应用的
-build.rs 把它们编进程序。
+下载并按 SHA-256 核对，裁掉 yt-dlp 用不上的部分（Tcl/Tk、头文件、Windows 上的测试扩展模块、idle、只给嵌入用的
+libpython 动态库，与链了 Berkeley DB、按 Sleepycat 许可证分发的 `_dbm`），在本机跑一遍确认能用；Python 打成 tar（条目
+按名字排序、时间与属主归零，同样的输入得到同样的字节）经 zstd 压缩，与 QuickJS-NG 一起放进
+third_party/runtime/dist/，桌面应用的 build.rs 把它们编进程序。
 
 只备本机（rustc 的 host）这个目标：应用在各平台上各自构建。dist 里另有 bundle.env（目标、各项的 id、可执行文件与
 Python 的 ABI，给 build.rs）与本脚本的副本 .hs-dlx-runtime（`--present` 与 build.rs 据此判断 dist 是不是这份脚本备的）。
 裁剪的每一条都要在本目标上匹配到东西，匹配不到（换了版本、包的结构变了）即失败：许可证要求裁掉的（`_dbm`）不能
-悄悄留下。下载放在
-third_party/runtime/build/，核对过的留着复用。随带的许可证原文在 third_party/runtime/licenses/（换版本时一并核对）。
+悄悄留下。下载放在 third_party/runtime/build/，核对过的留着复用。随带的许可证原文在
+third_party/runtime/licenses/（换版本时一并核对）。
 """
 
 import hashlib
@@ -59,7 +59,7 @@ class Target(NamedTuple):
     quickjs_file: str
 
 
-# 各平台都裁掉的标准库部分（相对于标准库目录）：图形界面、开发工具、测试、交互式命令行
+# 各平台都裁掉的标准库部分（相对于标准库目录）：图形界面、开发工具、交互式命令行
 STDLIB_TRIMMED = (
     "tkinter",
     "idlelib",

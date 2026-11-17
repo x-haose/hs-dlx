@@ -160,17 +160,17 @@ impl Web {
 }
 
 impl super::Shared {
-    /// 启动时：随带的 Python 与 QuickJS-NG 要解出来时（见 [`Web::new`]）在后台解，解好即可用；没解成时状态记为没装成
-    /// （带上原因，再装即重新解出）。
+    /// 启动时：随带的 Python 与 QuickJS-NG 要解出来时（见 [`Web::new`]）在后台解，解好即可用；取消时为没装，没解成时
+    /// 为没装成（带上原因）。两种情形再装都先解出随带的，装着的 yt-dlp 自检过了即不联网（见 `Components::install`）。
     pub(super) fn unpack_bundled_on_start(self: &Arc<Self>) {
-        if lock(&self.web.installing).is_none() {
+        let Some(cancel) = lock(&self.web.installing).clone() else {
             return;
-        }
+        };
         let shared = self.clone();
         self.tracker.spawn(async move {
             let web = &shared.web;
             let components = web.components.as_ref().expect("要解出来即有组件");
-            let next = match components.unpack_bundled().await {
+            let next = match components.unpack_bundled(&cancel).await {
                 Ok(installed) => {
                     let version = installed.version.clone();
                     *lock(&web.extractor) = Some(Arc::new(Extractor::new(
@@ -180,6 +180,7 @@ impl super::Shared {
                     )));
                     WebState::Ready(version)
                 }
+                Err(hs_dlx_ytdlp::Error::Cancelled) => WebState::Missing,
                 Err(error) => WebState::Failed(error.to_string()),
             };
             *lock(&web.installing) = None;
@@ -273,9 +274,9 @@ impl Service {
                     )));
                     WebState::Ready(version)
                 }
-                // 没换成：原来的照旧在用
                 // 取消的不算失败：照原来的
                 Err(hs_dlx_ytdlp::Error::Cancelled) => before,
+                // 没换成：原来的照旧在用
                 Err(error) => WebState::UpdateFailed {
                     version: current,
                     reason: format!("更新没成：{error}"),

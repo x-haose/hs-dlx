@@ -8,7 +8,8 @@
 //!   启动时删掉
 //! - `yt-dlp-<版本>/`：pip 的 `--target` 目录；保留当前的与上一个，更早的在应用启动时（[`Components::sweep`]）删掉：
 //!   安装、更新、重装时不删，换版本前起的解析进程可能还在用
-//! - `state.json`：当前与上一个 yt-dlp 版本、装它时的 Python 版本；先写临时文件、落盘再改名
+//! - `state.json`：当前与上一个 yt-dlp 版本、装它们时的 Python 的 ABI（见 [`Bundle::python_abi`]）；先写临时文件、
+//!   落盘再改名
 //! - `downloads/wheels/`：下载中与下好了的 wheel 与核心的任务目录（续传用），用过即删
 //! - `staging/`：解包与 pip 安装的临时目录，每次安装前清空
 //! - `trash-<名>-<纳秒>/`：换下来的组件目录（见 [`Components::replace_dir`]），应用启动时删掉
@@ -31,7 +32,7 @@ use crate::bundle::{Bundle, Bundled};
 pub(crate) const DRIVER: &str = include_str!("driver.py");
 /// pip 离线安装、驱动脚本列依赖与挑 wheel 最多多久：不联网，只解包。
 const PIP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-/// 自检最多多久：只导入模块、让 QuickJS-NG 算一个式子。
+/// 自检最多多久：只导入模块、核对 yt-dlp 认得 QuickJS-NG、让它算一个式子。
 const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// 换下来的组件目录挪到的名字的前缀（见 [`Components::replace_dir`]）。
 const TRASH: &str = "trash-";
@@ -181,7 +182,7 @@ impl Components {
         }
     }
 
-    /// 装全了的组件；缺哪一样（含 yt-dlp 不是用锁定的 Python 装的）时为 None。驱动脚本按内容命名，应用升级后换了内容时
+    /// 装全了的组件；缺哪一样（含装 yt-dlp 时的 Python 的 ABI 与这一版应用带的不同）时为 None。驱动脚本按内容命名，应用升级后换了内容时
     /// 在这里写出新的。状态文件读不出、内容认不出、驱动脚本写不出时报 [`Error::Disk`]（[`Components::install`] 能修好）。
     pub fn installed(&self) -> Result<Option<Installed>, Error> {
         let Some(state) = self.state()? else {
@@ -203,8 +204,8 @@ impl Components {
         Ok(Some(installed))
     }
 
-    /// 装上缺的：随应用带的 Python 与 QuickJS-NG（解出来，不联网）与 yt-dlp（经 `proxy`；状态文件记着的版本，没有或坏了时为
-    /// `channel` 上最新的）；已装全时直接返回。状态文件坏了时照没有处理、装好后重写。`cancel` 取消时报
+    /// 装上缺的：随应用带的 Python 与 QuickJS-NG（总是重新解出来，不联网）与 yt-dlp（经 `proxy`；状态文件记着的版本，没有
+    /// 或坏了时为 `channel` 上最新的）；已装全时直接返回，只缺随带的、装着的 yt-dlp 自检过了时不联网。状态文件坏了时照没有处理、装好后重写。`cancel` 取消时报
     /// [`Error::Cancelled`]，已下了的留着下次续传。
     pub async fn install(
         &self,
@@ -263,10 +264,18 @@ impl Components {
     }
 
     /// 把这一版应用带的 Python 与 QuickJS-NG 解出来（不联网，见 [`Components::bundled_missing`]），返回装好了的。
-    pub async fn unpack_bundled(&self) -> Result<Installed, Error> {
-        let _busy = self.busy.lock().await;
+    /// `cancel` 在拿锁时与两样之间看（一样解到一半不停，各自整个放上或不放）；取消时报 [`Error::Cancelled`]，已解出的
+    /// 留着。
+    pub async fn unpack_bundled(&self, cancel: &CancellationToken) -> Result<Installed, Error> {
+        let _busy = tokio::select! {
+            busy = self.busy.lock() => busy,
+            () = cancel.cancelled() => return Err(Error::Cancelled),
+        };
         self.prepare().await?;
         for package in [Package::Python, Package::QuickJs] {
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
             self.ensure(package, false, &|_| {}).await?;
         }
         self.installed()?.ok_or(Error::NotInstalled)
@@ -400,6 +409,27 @@ impl Components {
         // 没装好（含没装成）时随带的总是重新解出来：可执行文件还在而别的文件被隔离、删了时，看不出来
         for package in [Package::Python, Package::QuickJs] {
             self.ensure(package, true, progress).await?;
+        }
+        // 只缺随带的（应用升级后没解出来）：装着的 yt-dlp 自检过了即可用，不联网
+        if let Ok(Some(installed)) = self.installed() {
+            progress(InstallProgress {
+                stage: Stage::Checking,
+                bytes: 0,
+                total: None,
+            });
+            match self_test(
+                &installed.python,
+                &installed.driver,
+                &installed.site,
+                &installed.quickjs,
+                cancel,
+            )
+            .await
+            {
+                Ok(_) => return Ok(installed),
+                Err(Error::SelfTest(_)) => {}
+                Err(error) => return Err(error),
+            }
         }
         // 坏了的状态文件不挡着修：照没有处理
         let wanted = match self.state() {
@@ -840,7 +870,7 @@ impl Components {
         }
         let target = self.root.join(format!("yt-dlp-{version}"));
         self.replace_dir(&staging, &target).await?;
-        // 重装同一版本时上一个照旧；换了 Python 时上一个是用旧 Python 装的（带按解释器版本编译的扩展模块），不再算
+        // 重装同一版本时上一个照旧；Python 的 ABI 变了时上一个是按旧的装的（带按 ABI 编译的扩展模块），不再算
         let previous = match self.state() {
             Ok(Some(state)) if state.python != self.bundle.python_abi => None,
             Ok(Some(state)) if state.yt_dlp == version => state.previous,
@@ -939,9 +969,11 @@ pub(crate) fn proxy_for(proxy: &Proxy, url: &Url) -> Result<Option<Url>, Error> 
     }
 }
 
-/// 起子进程的命令：不读环境变量里的代理（代理只照应用的设置给）；Windows 上不弹控制台窗口。
+/// 起子进程的命令：不读环境变量里的代理（代理只照应用的设置给）、yt-dlp 不加载本机装的插件（`YTDLP_NO_PLUGINS`，
+/// `-I` 挡不住它的插件目录）；Windows 上不弹控制台窗口。
 pub(crate) fn command(program: &Path) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(program);
+    command.env("YTDLP_NO_PLUGINS", "1");
     for name in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"] {
         command.env_remove(name);
         command.env_remove(name.to_ascii_lowercase());
@@ -994,8 +1026,8 @@ async fn run_driver(
     run_with(script, Some(input), PIP_TIMEOUT, cancel).await
 }
 
-/// 自检：驱动脚本导入 `site` 里的 yt-dlp 与解 JavaScript 挑战的 yt-dlp-ejs，`quickjs` 算出一个式子；返回 yt-dlp 规范化的
-/// 版本。
+/// 自检：驱动脚本导入 `site` 里的 yt-dlp 与解 JavaScript 挑战的 yt-dlp-ejs、核对 yt-dlp 认得 `quickjs`，`quickjs` 算出
+/// 一个式子；返回 yt-dlp 规范化的版本。
 async fn self_test(
     python: &Path,
     driver: &Path,

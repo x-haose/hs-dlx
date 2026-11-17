@@ -214,7 +214,8 @@ pub fn failure(kind: FailureKind) -> (String, &'static str) {
         FailureKind::WebGeo => ("地区".into(), "网站按地区限制：换个代理出口后继续"),
         FailureKind::WebBlocked => (
             "拦截".into(),
-            "网站拦下了这个出口，多为代理的 IP 被风控（国内网站常拦境外出口）：在设置里改直连或换个代理节点后继续",
+            "网站拦下了请求：走代理时多为出口 IP 被风控（国内网站常拦境外出口），在设置里改直连或换个代理节点；直连时多为要\
+             登录，或网站改了、要在设置里更新 yt-dlp",
         ),
         FailureKind::WebExtract => (
             "解析".into(),

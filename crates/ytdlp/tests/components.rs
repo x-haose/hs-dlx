@@ -560,6 +560,55 @@ async fn a_new_python_reinstalls_yt_dlp() {
     assert!(!root.join("python-3.13.18-test").exists());
 }
 
+/// 应用升级只换了随带的运行时、Python 的 ABI 没变：装着的 yt-dlp 照用，解出随带的即可（启动时在后台解，可取消；没解成
+/// 时再装），都不联网。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_build_of_the_same_python_is_unpacked_without_reinstalling() {
+    let mut newer = bundle();
+    newer.python.id = "3.13.19-test".to_owned();
+    newer.quickjs.id = "0.18.1-test".to_owned();
+    for (name, after_failure) in [("unpack", false), ("unpack-install", true)] {
+        let root = test_dir(name);
+        let (server, base) = start(&["2026.10.21"]).await;
+        let old = install(&components(&root, bundle(), &base), Channel::Stable)
+            .await
+            .unwrap();
+        // 服务器上什么都没有了：联网的一步都会失败
+        server.files.lock().unwrap().clear();
+        let components = components(&root, newer.clone(), &base);
+        assert_eq!(components.installed().unwrap(), None);
+        assert!(components.bundled_missing());
+        let installed = if after_failure {
+            install(&components, Channel::Stable).await.unwrap()
+        } else {
+            let cancelled = CancellationToken::new();
+            cancelled.cancel();
+            assert!(matches!(
+                components.unpack_bundled(&cancelled).await,
+                Err(Error::Cancelled)
+            ));
+            components
+                .unpack_bundled(&CancellationToken::new())
+                .await
+                .unwrap()
+        };
+        assert_eq!(installed.version, old.version);
+        assert_eq!(installed.site, old.site);
+        assert!(
+            installed
+                .python
+                .starts_with(root.join("python-3.13.19-test"))
+        );
+        assert!(
+            installed
+                .quickjs
+                .starts_with(root.join("quickjs-0.18.1-test"))
+        );
+        assert!(!components.bundled_missing());
+        assert_eq!(components.installed().unwrap(), Some(installed));
+    }
+}
+
 /// 状态文件坏了：读已装的报出，安装修好它（重装最新的）。
 #[tokio::test(flavor = "multi_thread")]
 async fn a_broken_state_file_is_repaired_by_installing() {

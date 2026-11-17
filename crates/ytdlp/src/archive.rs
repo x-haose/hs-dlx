@@ -39,15 +39,16 @@ pub(crate) fn sha256_of(path: &Path) -> Result<String, Error> {
 pub(crate) fn unpack_tar_zst(bytes: &[u8], into: &Path) -> Result<(), Error> {
     let broken =
         |error: &dyn std::fmt::Display| Error::Archive(format!("随应用带的 Python：{error}"));
-    // 写文件出错（磁盘满、没有权限、被杀毒软件拦下）是本机的事，带着系统的错误码；别的是包的内容不对
+    // 写文件出错（磁盘满、没有权限、被杀毒软件拦下）是本机的事，链里有系统的错误码；别的是包的内容不对
     let failed = |error: std::io::Error| {
-        if error.raw_os_error().is_some() {
+        let (described, os) = chain(&error);
+        if os {
             Error::Disk(format!(
-                "解出随应用带的 Python 到 {}：{error}",
+                "解出随应用带的 Python 到 {}：{described}",
                 into.display()
             ))
         } else {
-            broken(&error)
+            broken(&described)
         }
     };
     let decoder = ruzstd::decoding::StreamingDecoder::new(bytes).map_err(|error| broken(&error))?;
@@ -62,6 +63,32 @@ pub(crate) fn unpack_tar_zst(bytes: &[u8], into: &Path) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// `error` 连同它包着的各层错误的说明（以「：」接起来），与其中有没有一层是带系统错误码的 `io::Error`。tar 把写文件的
+/// 错误包成自己的错误再包进 `io::Error`：最外层没有错误码，说明里也没有系统的原因。
+fn chain(error: &std::io::Error) -> (String, bool) {
+    let mut described = error.to_string();
+    let mut os = error.raw_os_error().is_some();
+    // io::Error 的 source() 跳过它包着的那一层（直接给那一层的 source），所以先取 get_ref
+    let mut next: Option<&(dyn std::error::Error + 'static)> = error
+        .get_ref()
+        .map(|inner| inner as &(dyn std::error::Error + 'static));
+    while let Some(inner) = next {
+        let text = inner.to_string();
+        if !described.ends_with(&text) {
+            described = format!("{described}：{text}");
+        }
+        let io = inner.downcast_ref::<std::io::Error>();
+        os |= io.is_some_and(|io| io.raw_os_error().is_some());
+        next = match io {
+            Some(io) => io
+                .get_ref()
+                .map(|inner| inner as &(dyn std::error::Error + 'static)),
+            None => inner.source(),
+        };
+    }
+    (described, os)
 }
 
 #[cfg(test)]
@@ -139,5 +166,25 @@ mod tests {
             unpack_tar_zst(b"not zstd", &into),
             Err(Error::Archive(_))
         ));
+    }
+
+    /// 写不进去（这里是只读目录）是本机的事：报磁盘，说明里有系统给的原因。
+    #[cfg(unix)]
+    #[test]
+    fn a_write_that_the_system_refuses_is_a_disk_error_with_its_reason() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = dir("readonly");
+        let into = dir.join("out");
+        std::fs::create_dir(&into).unwrap();
+        std::fs::set_permissions(&into, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = unpack_tar_zst(&tar_zst("python/bin/python3"), &into);
+        std::fs::set_permissions(&into, std::fs::Permissions::from_mode(0o755)).unwrap();
+        match result {
+            Err(Error::Disk(message)) => assert!(
+                message.contains(&std::io::Error::from_raw_os_error(13).to_string()),
+                "{message}"
+            ),
+            other => panic!("{other:?}"),
+        }
     }
 }

@@ -366,7 +366,6 @@ impl Extractor {
             .arg(&installed.site)
             .arg(&installed.quickjs)
             .arg(&self.cache)
-            .env("YTDLP_NO_PLUGINS", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
