@@ -152,3 +152,31 @@ def test_lone_surrogates_and_nan_still_make_valid_json() -> None:
     line = json.dumps(info, ensure_ascii=True, allow_nan=False)
     assert json.loads(line)["title"] == "半个表情�"
     assert json.loads(line)["duration"] is None
+
+
+def test_yt_dlp_downloads_a_format_itself_with_progress(site: str, tmp_path: Path) -> None:
+    [reply] = serve([{"id": 1, "url": f"{site}/video.html", "proxy": "", "cookies": None, "generic": True}], tmp_path)
+    info = driver.mapping(reply["ok"]) or {}
+    [fmt] = [driver.mapping(item) or {} for item in driver.items(info["formats"])]
+    output = tmp_path / "下载 100%" / "clip.mp4"
+    replies = io.StringIO()
+    request = {
+        "url": f"{site}/video.html",
+        "format": fmt["format_id"],
+        "output": str(output),
+        "proxy": "",
+        "cookies": None,
+    }
+    final = driver.download(importlib.import_module("yt_dlp"), request, "deno", str(tmp_path / "cache"), replies)
+    assert final == {"ok": {}}
+    assert output.read_bytes() == (tmp_path / "clip.mp4").read_bytes()
+    lines = [json.loads(line) for line in replies.getvalue().splitlines()]
+    assert lines, "应有进度"
+    assert all("progress" in line for line in lines)
+
+
+def test_a_missing_format_is_an_error_not_a_silent_skip(site: str, tmp_path: Path) -> None:
+    request = {"url": f"{site}/video.html", "format": "no-such", "output": str(tmp_path / "x"), "proxy": ""}
+    final = driver.download(importlib.import_module("yt_dlp"), request, "deno", str(tmp_path / "cache"), io.StringIO())
+    assert "error" in final
+    assert not (tmp_path / "x").exists()

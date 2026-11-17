@@ -221,3 +221,46 @@ async fn concurrent_extractions_share_the_workers() {
         assert_eq!(task.await.unwrap().unwrap().formats.len(), 1);
     }
 }
+
+/// 交回 yt-dlp 自己下：先解析出格式编号，再让 yt-dlp 把它下到给的路径，报进度。
+#[tokio::test(flavor = "multi_thread")]
+async fn yt_dlp_downloads_a_format_itself() {
+    let (installed, cache) = installed("download");
+    let base = start(Arc::new(Notify::new()), Arc::new(AtomicUsize::new(0))).await;
+    let extractor = Extractor::new(installed, cache.clone(), Duration::from_secs(60));
+    let request = request(&base, "video");
+    let info = extractor
+        .extract(&request, &Proxy::Direct, &CancellationToken::new())
+        .await
+        .unwrap();
+    let output = cache.join("下载").join("clip.mp4");
+    let seen = std::sync::Mutex::new(Vec::new());
+    extractor
+        .download(
+            &request,
+            &info.formats[0].id,
+            &output,
+            &Proxy::Direct,
+            &|bytes, total| seen.lock().unwrap().push((bytes, total)),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&output).unwrap(), vec![0u8; 64]);
+    assert!(!seen.into_inner().unwrap().is_empty(), "应有进度");
+    // 没有的格式：报失败，不留文件
+    let missing = cache.join("missing.mp4");
+    let error = extractor
+        .download(
+            &request,
+            "no-such",
+            &missing,
+            &Proxy::Direct,
+            &|_, _| {},
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(!matches!(error, ExtractError::Crashed(_)), "{error}");
+    assert!(!missing.exists());
+}

@@ -13,6 +13,11 @@
   - 回应 `{"id": 同请求, "ok": 结果}` 或 `{"id": 同请求, "error": {"kind": 种类, "message": 说明}}`，种类见
     `classify`。yt-dlp 自己的输出都转到标准错误，标准输出只有回应（纯 ASCII 的 JSON）。
   - 结果见 `trimmed`。
+- `download <site> <deno> <cache>`：用 yt-dlp 自己的下载器下一个格式（要模拟浏览器 TLS 指纹的、DASH 分片等应用的引擎
+  下不了的）。标准输入的第一行为请求
+  `{"url": 网页地址, "format": 格式编号, "output": 输出文件的路径, "proxy", "cookies"}`；
+  标准输出先是若干行进度 `{"progress": {"bytes": 已下字节, "total": 总字节或估算，不知道时为 null}}`，最后一行为
+  `{"ok": {}}` 或 `{"error": ...}`（同 `serve`）。中断后再下同一输出时接着 `.part` 续传。
 """
 
 from __future__ import annotations
@@ -337,6 +342,46 @@ def pick(files: Mapping[str, object]) -> dict[str, str]:
     return chosen
 
 
+def download(yt_dlp: ModuleType, request: Mapping[str, object], deno: str, cache: str, replies: TextIO) -> Info:
+    """用 yt-dlp 自己的下载器下请求里的一个格式到 `output`，进度逐行写进 `replies`，返回最后的回应。
+
+    只下这一个格式、不合并、不做修复（没有 ffmpeg 程序）；已有的 `.part` 接着下，已下完的不覆盖。
+    """
+    logger = Logger()
+    output = text(request.get("output")) or ""
+
+    def hook(status: object) -> None:
+        state = mapping(status) or {}
+        if state.get("status") != "downloading":
+            return
+        total = number(state.get("total_bytes")) or number(state.get("total_bytes_estimate"))
+        line = {"progress": {"bytes": number(state.get("downloaded_bytes")), "total": total}}
+        replies.write(json.dumps(line, ensure_ascii=True, allow_nan=False) + "\n")
+        replies.flush()
+
+    options = params(text(request.get("proxy")) or "", text(request.get("cookies")), deno, cache, logger)
+    options.update(
+        {
+            "format": text(request.get("format")) or "",
+            "ignore_no_formats_error": False,
+            "extract_flat": False,
+            # 输出模板里的 % 是占位符的开头，路径里的要写成 %%
+            "outtmpl": {"default": output.replace("%", "%%")},
+            "progress_hooks": [hook],
+            "continuedl": True,
+            "overwrites": False,
+            "fixup": "never",
+        }
+    )
+    with yt_dlp.YoutubeDL(options) as ydl:
+        try:
+            ydl.extract_info(text(request.get("url")) or "", download=True)
+        except yt_dlp.utils.YoutubeDLError as error:
+            kind, message = classify(error)
+            return {"error": {"kind": kind, "message": message}}
+    return {"ok": {}}
+
+
 def selftest(site: str) -> None:
     """导入 yt-dlp 与解 YouTube 的 JavaScript 挑战用的 yt-dlp-ejs，报出 yt-dlp 安装元数据里的版本。
 
@@ -361,6 +406,19 @@ def main() -> None:
             json.dump(pick(mapping(json.load(sys.stdin)) or {}), sys.stdout)
         case ["selftest", site]:
             selftest(site)
+        case ["download", site, deno, cache]:
+            replies = sys.stdout
+            sys.stdout = sys.stderr
+            sys.path.insert(0, site)
+            # 只读一行：应用写完请求不关管道
+            request = mapping(json.loads(sys.stdin.readline())) or {}
+            try:
+                reply = download(importlib.import_module("yt_dlp"), request, deno, cache, replies)
+            except Exception as error:
+                stack = traceback.format_exc()[-TRACEBACK_TAIL:]
+                reply = {"error": {"kind": "other", "message": clean(f"{type(error).__name__}：{error}\n{stack}")}}
+            replies.write(json.dumps(reply, ensure_ascii=True, allow_nan=False) + "\n")
+            replies.flush()
         case ["serve", site, deno, cache]:
             # 回应独占标准输出：yt-dlp 与依赖往标准输出写的都转到标准错误
             replies = sys.stdout
@@ -368,7 +426,7 @@ def main() -> None:
             serve(site, deno, cache, sys.stdin, replies)
         case _:
             sys.exit(
-                f"用法：driver.py requirements | pick | selftest <site> | serve <site> <deno> <cache>，"
+                "用法：driver.py requirements | pick | selftest <site> | serve|download <site> <deno> <cache>，"
                 f"收到 {sys.argv[1:]}"
             )
 

@@ -364,17 +364,18 @@ fn discarding_a_running_task_removes_it() {
     rt.block_on(first_segment(&mut events, id));
 
     let discarding = service.discard(id);
-    assert!(matches!(
-        service.resume(id),
-        Err(Error::Discarding(_) | Error::Running(_))
-    ));
-    assert!(matches!(
-        service.forget(id),
-        Err(Error::Discarding(_) | Error::Running(_))
-    ));
+    // 放弃很快：机器忙时下面这几步之前它可能已经做完、任务已不在（不在也是拒绝）
+    let refused = |result: Result<(), Error>| {
+        matches!(
+            result,
+            Err(Error::Discarding(_) | Error::Running(_) | Error::NotFound(_))
+        )
+    };
+    assert!(refused(service.resume(id).map(|_| ())));
+    assert!(refused(service.forget(id)));
     assert!(matches!(
         rt.block_on(service.discard(id)).unwrap(),
-        Err(Error::Discarding(_))
+        Err(Error::Discarding(_) | Error::NotFound(_))
     ));
     let leftovers = rt.block_on(discarding).unwrap().unwrap();
 

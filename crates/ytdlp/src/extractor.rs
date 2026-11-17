@@ -3,7 +3,7 @@
 //! 下次另起一个（Python 里打断不了正在跑的解析）。
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,6 +23,8 @@ pub const WORKERS: usize = 2;
 const STDERR_TAIL: usize = 8192;
 /// 一行回应最多多少字节：YouTube 一个视频的结果约 100 KB（格式多、请求头长）。
 const REPLY_LIMIT: usize = 64 << 20;
+/// 交回 yt-dlp 下载时多久没有进度算卡住：yt-dlp 自己有连接与读取的超时（20 秒）与重试。
+const STALL: Duration = Duration::from_secs(5 * 60);
 /// 进程退出后等读标准错误的任务读完最多多久：管道里剩下的很快读完。
 const STDERR_WAIT: Duration = Duration::from_secs(1);
 
@@ -180,7 +182,7 @@ impl Extractor {
             .and_then(|mut worker| matches!(worker.child.try_wait(), Ok(None)).then_some(worker));
         let mut worker = match alive {
             Some(worker) => worker,
-            None => self.spawn()?,
+            None => self.spawn("serve")?,
         };
         let line = serde_json::json!({
             "id": worker.next_id,
@@ -236,7 +238,7 @@ impl Extractor {
     /// 起一个解析进程：隔离模式（不读 PYTHON* 环境变量与用户的 site-packages）、标准输入输出用 UTF-8（隔离模式不读
     /// PYTHONIOENCODING，Windows 上管道默认按系统的 ANSI 代码页），不加载 yt-dlp 的插件，不读环境变量里的代理；Unix 上
     /// 自成一个进程组，释放时连同子进程一起杀。
-    fn spawn(&self) -> Result<Worker, ExtractError> {
+    fn spawn(&self, mode: &str) -> Result<Worker, ExtractError> {
         let installed = &self.installed;
         let mut command = command(&installed.python);
         #[cfg(unix)]
@@ -246,7 +248,7 @@ impl Extractor {
             .arg("-X")
             .arg("utf8")
             .arg(&installed.driver)
-            .arg("serve")
+            .arg(mode)
             .arg(&installed.site)
             .arg(&installed.deno)
             .arg(&self.cache)
@@ -290,6 +292,102 @@ impl Extractor {
             next_id: 1,
         })
     }
+}
+
+impl Extractor {
+    /// 交回 yt-dlp 自己下：经 `proxy` 解析 `request` 的网页、用 yt-dlp 的下载器把格式 `format` 下到 `output`（自己的
+    /// 引擎下不了的：要模拟浏览器 TLS 指纹的、DASH 分片等），进度经 `progress`（已下的、总的或估算的字节）。另起一个
+    /// 进程，不占解析的名额；超过 5 分钟没有进度算卡住（报 [`ExtractError::TimedOut`]），取消或出错时连同子进程
+    /// 杀掉，留下的 `.part` 下次接着下。
+    pub async fn download(
+        &self,
+        request: &Request,
+        format: &str,
+        output: &Path,
+        proxy: &Proxy,
+        progress: &(dyn Fn(u64, Option<u64>) + Sync),
+        cancel: &CancellationToken,
+    ) -> Result<(), ExtractError> {
+        let proxy = proxy_for(proxy, &request.url)
+            .map_err(|error| ExtractError::Proxy(error.to_string()))?
+            .map_or_else(String::new, |proxy| proxy.to_string());
+        let mut worker = self.spawn("download")?;
+        let line = serde_json::json!({
+            "url": request.url.as_str(),
+            "format": format,
+            "output": output.to_string_lossy(),
+            "proxy": proxy,
+            "cookies": (!request.cookies.is_empty()).then(|| netscape(&request.cookies)),
+        });
+        let sent = async {
+            worker
+                .stdin
+                .write_all(format!("{line}\n").as_bytes())
+                .await?;
+            worker.stdin.flush().await
+        };
+        if let Err(error) = sent.await {
+            return Err(ExtractError::Crashed(with_stderr(
+                &format!("写不进请求：{error}"),
+                &worker,
+            )));
+        }
+        loop {
+            let mut reply = String::new();
+            let mut limited = (&mut worker.stdout).take(REPLY_LIMIT as u64);
+            let read = limited.read_line(&mut reply);
+            let read = tokio::select! {
+                read = tokio::time::timeout(STALL, read) => match read {
+                    Ok(read) => read,
+                    Err(_) => return Err(ExtractError::TimedOut(STALL.as_secs())),
+                },
+                () = cancel.cancelled() => return Err(ExtractError::Cancelled),
+            };
+            match read {
+                Ok(0) | Err(_) => {
+                    let _read = tokio::time::timeout(STDERR_WAIT, &mut worker.reading).await;
+                    return Err(ExtractError::Crashed(with_stderr("进程退出了", &worker)));
+                }
+                Ok(_) => {}
+            }
+            let parsed: DownloadReply = serde_json::from_str(&reply).map_err(|error| {
+                ExtractError::Crashed(with_stderr(&format!("回应认不出：{error}"), &worker))
+            })?;
+            match parsed {
+                DownloadReply::Progress { progress: now } => {
+                    progress(
+                        now.bytes.unwrap_or(0.0).max(0.0) as u64,
+                        now.total.map(|t| t.max(0.0) as u64),
+                    );
+                }
+                DownloadReply::Ok { .. } => return Ok(()),
+                DownloadReply::Error { error } => return Err(error.into_error()),
+            }
+        }
+    }
+}
+
+/// 下载时进程回的一行。
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DownloadReply {
+    Progress {
+        progress: DownloadProgress,
+    },
+    /// 下完了（内容为空的对象）
+    Ok {
+        #[serde(rename = "ok")]
+        _done: serde::de::IgnoredAny,
+    },
+    Error {
+        error: Failure,
+    },
+}
+
+#[derive(Deserialize)]
+struct DownloadProgress {
+    bytes: Option<f64>,
+    total: Option<f64>,
 }
 
 /// 写一行请求、读一行回应；进程退出、管道断了时为原因。
