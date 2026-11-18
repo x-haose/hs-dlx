@@ -25,6 +25,9 @@ pub const WORKERS: usize = 2;
 const STDERR_TAIL: usize = 8192;
 /// 一行回应最多多少字节：YouTube 一个视频的结果约 100 KB（格式多、请求头长）。
 const REPLY_LIMIT: usize = 64 << 20;
+/// 从浏览器读 Cookie 最多等多久（之后才起算解析的时限）：macOS 上读 Chromium 系的要用户点钥匙串的授权，Linux 上
+/// 可能在等密钥环解锁。
+const COOKIE_WAIT: Duration = Duration::from_secs(3 * 60);
 /// 交回 yt-dlp 下载时多久没有进度算卡住：yt-dlp 自己有连接与读取的超时（20 秒）与重试。
 const STALL: Duration = Duration::from_secs(5 * 60);
 /// 进程退出后等读标准错误的任务读完最多多久：管道里剩下的很快读完。
@@ -326,46 +329,29 @@ impl Extractor {
         });
         let id = worker.next_id;
         worker.next_id += 1;
-        let replied = {
-            let exchange = exchange(&mut worker, line.to_string());
-            tokio::select! {
-                reply = tokio::time::timeout(self.timeout, exchange) => Some(reply),
-                () = cancel.cancelled() => None,
-            }
+        // 先等开始解析网页的那一行：从浏览器读 Cookie 时可能在等用户点授权，另算时限
+        let reading = request.browser.as_ref().map(|source| {
+            ExtractError::Cookies(cookie_trouble(
+                Some(source),
+                Some("stalled"),
+                &format!("等了 {} 秒", COOKIE_WAIT.as_secs()),
+            ))
+        });
+        let first_wait = if reading.is_some() {
+            COOKIE_WAIT
+        } else {
+            self.timeout
         };
-        let reply = match replied {
-            Some(Ok(reply)) => reply,
-            Some(Err(_elapsed)) => {
-                worker.stop().await;
-                return Err(ExtractError::TimedOut(self.timeout.as_secs()));
-            }
-            None => {
-                worker.stop().await;
-                return Err(ExtractError::Cancelled);
-            }
+        let waited = match send(&mut worker, &line.to_string()).await {
+            Ok(()) => wait_line(&mut worker, first_wait, cancel).await,
+            Err(reason) => Waited::Line(Err(reason)),
         };
-        let reply = match reply {
-            Ok(reply) => reply,
-            Err(reason) => {
-                // 进程退出了：等读标准错误的任务读完（一会儿）再取原因
-                let _read = tokio::time::timeout(STDERR_WAIT, &mut worker.reading).await;
-                return Err(ExtractError::Crashed(with_stderr(&reason, &worker)));
-            }
-        };
-        let parsed: Reply = match serde_json::from_str(&reply) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                return Err(ExtractError::Crashed(with_stderr(
-                    &format!("回应认不出：{error}"),
-                    &worker,
-                )));
-            }
-        };
-        if parsed.id != id {
-            return Err(ExtractError::Crashed(format!(
-                "回应的编号 {} 不是请求的 {id}",
-                parsed.id
-            )));
+        let timed_out = reading.unwrap_or(ExtractError::TimedOut(self.timeout.as_secs()));
+        let (mut parsed, mut worker) = reply_of(waited, worker, id, timed_out).await?;
+        if parsed.stage.is_some() {
+            let waited = wait_line(&mut worker, self.timeout, cancel).await;
+            let timed_out = ExtractError::TimedOut(self.timeout.as_secs());
+            (parsed, worker) = reply_of(waited, worker, id, timed_out).await?;
         }
         self.idle.lock().expect("锁里不会 panic").push_back(worker);
         match (parsed.ok, parsed.error) {
@@ -567,7 +553,8 @@ struct DownloadProgress {
 }
 
 /// 写一行请求、读一行回应；进程退出、管道断了时为原因。
-async fn exchange(worker: &mut Worker, line: String) -> Result<String, String> {
+/// 把一行请求写给解析进程；写不进为原因。
+async fn send(worker: &mut Worker, line: &str) -> Result<(), String> {
     worker
         .stdin
         .write_all(format!("{line}\n").as_bytes())
@@ -577,7 +564,66 @@ async fn exchange(worker: &mut Worker, line: String) -> Result<String, String> {
         .stdin
         .flush()
         .await
-        .map_err(|error| format!("写不进请求：{error}"))?;
+        .map_err(|error| format!("写不进请求：{error}"))
+}
+
+/// 等解析进程的一行回应的结果。
+enum Waited {
+    /// 读到的一行，或读不出的原因（进程退出、超长）
+    Line(Result<String, String>),
+    TimedOut,
+    Cancelled,
+}
+
+/// 至多等 `limit` 读一行回应，`cancel` 时不再等。
+async fn wait_line(worker: &mut Worker, limit: Duration, cancel: &CancellationToken) -> Waited {
+    tokio::select! {
+        line = tokio::time::timeout(limit, read_line(worker)) => match line {
+            Ok(line) => Waited::Line(line),
+            Err(_elapsed) => Waited::TimedOut,
+        },
+        () = cancel.cancelled() => Waited::Cancelled,
+    }
+}
+
+/// 等到的一行认成编号为 `id` 的回应，连同进程交回；超时（报 `timed_out`）与取消时先停下进程，进程退出、回应认不出
+/// 或编号不对时为 [`ExtractError::Crashed`]，带标准错误的末尾。
+async fn reply_of(
+    waited: Waited,
+    mut worker: Worker,
+    id: u64,
+    timed_out: ExtractError,
+) -> Result<(Reply, Worker), ExtractError> {
+    let line = match waited {
+        Waited::Line(Ok(line)) => line,
+        Waited::Line(Err(reason)) => {
+            // 进程退出了：等读标准错误的任务读完（一会儿）再取原因
+            let _read = tokio::time::timeout(STDERR_WAIT, &mut worker.reading).await;
+            return Err(ExtractError::Crashed(with_stderr(&reason, &worker)));
+        }
+        Waited::TimedOut => {
+            worker.stop().await;
+            return Err(timed_out);
+        }
+        Waited::Cancelled => {
+            worker.stop().await;
+            return Err(ExtractError::Cancelled);
+        }
+    };
+    let parsed: Reply = serde_json::from_str(&line).map_err(|error| {
+        ExtractError::Crashed(with_stderr(&format!("回应认不出：{error}"), &worker))
+    })?;
+    if parsed.id != id {
+        return Err(ExtractError::Crashed(format!(
+            "回应的编号 {} 不是请求的 {id}",
+            parsed.id
+        )));
+    }
+    Ok((parsed, worker))
+}
+
+/// 读解析进程的一行回应；进程退出或一行超过 [`REPLY_LIMIT`] 时为原因。
+async fn read_line(worker: &mut Worker) -> Result<String, String> {
     let mut reply = String::new();
     let read = (&mut worker.stdout)
         .take(REPLY_LIMIT as u64)
@@ -631,6 +677,8 @@ fn netscape(cookies: &[Cookie]) -> String {
 #[derive(Deserialize)]
 struct Reply {
     id: u64,
+    /// 开始解析网页时的那一行（`resolving`），之后才是结果或失败
+    stage: Option<String>,
     ok: Option<Wire>,
     error: Option<Failure>,
 }
@@ -706,6 +754,13 @@ fn cookie_trouble(source: Option<&CookieSource>, reason: Option<&str>, detail: &
         (Some("keychain"), _) => format!(
             "没拿到解开 {name} 的 Cookie 的钥匙：macOS 弹出钥匙串的授权时点「允许」后再试；不想每次弹，改用 Firefox"
         ),
+        (Some("stalled"), _) if cfg!(target_os = "macos") => format!(
+            "一直没读出 {name} 的 Cookie：多为 macOS 弹出的钥匙串授权还没点，点「允许」后再试"
+        ),
+        (Some("stalled"), _) if cfg!(target_os = "linux") => format!(
+            "一直没读出 {name} 的 Cookie：多为系统的密钥环（GNOME 密钥环或 KWallet）在等解锁，解锁后再试"
+        ),
+        (Some("stalled"), _) => format!("一直没读出 {name} 的 Cookie：关掉 {name} 再试"),
         (Some("keyring"), _) => format!(
             "没从系统的密钥环拿到解开 {name} 的 Cookie 的钥匙：解开密钥环（GNOME 密钥环或 KWallet）后再试，或改用 Firefox"
         ),

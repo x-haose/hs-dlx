@@ -18,7 +18,7 @@ import pytest
 import driver
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping
+    from collections.abc import Callable, Iterator, Mapping
     from types import ModuleType
 
 
@@ -55,12 +55,17 @@ def site(tmp_path: Path) -> Iterator[str]:
     server.server_close()
 
 
-def serve(requests: list[Mapping[str, object]], tmp_path: Path) -> list[dict[str, object]]:
-    """把 `requests` 逐行交给驱动脚本的常驻解析，返回逐行的回应。"""
+def serve_lines(requests: list[Mapping[str, object]], tmp_path: Path) -> list[dict[str, object]]:
+    """把 `requests` 逐行交给驱动脚本的常驻解析，返回它写出的每一行（含开始解析网页的那行）。"""
     replies = io.StringIO()
     lines = "".join(json.dumps(request) + "\n" for request in requests)
     driver.serve(SITE, "qjs", str(tmp_path / "cache"), io.StringIO(lines), replies)
     return [json.loads(line) for line in replies.getvalue().splitlines()]
+
+
+def serve(requests: list[Mapping[str, object]], tmp_path: Path) -> list[dict[str, object]]:
+    """同 `serve_lines`，只要回应（结果或失败）。"""
+    return [line for line in serve_lines(requests, tmp_path) if "stage" not in line]
 
 
 def test_a_page_with_a_video_is_extracted_with_its_format(site: str, tmp_path: Path) -> None:
@@ -134,12 +139,14 @@ def test_an_unexpected_error_is_answered_and_the_next_request_still_runs(
     real = driver.extract
     calls: list[str] = []
 
-    def flaky(yt_dlp: ModuleType, request: Mapping[str, object], quickjs: str, cache: str) -> dict[str, object]:
+    def flaky(
+        yt_dlp: ModuleType, request: Mapping[str, object], quickjs: str, cache: str, resolving: Callable[[], None]
+    ) -> dict[str, object]:
         calls.append(str(request["url"]))
         if len(calls) == 1:
             message = "网站改版"
             raise TypeError(message)
-        return real(yt_dlp, request, quickjs, cache)
+        return real(yt_dlp, request, quickjs, cache, resolving)
 
     monkeypatch.setattr(driver, "extract", flaky)
     replies = serve(
@@ -153,6 +160,24 @@ def test_an_unexpected_error_is_answered_and_the_next_request_still_runs(
     assert error["kind"] == "other"
     assert "TypeError" in str(error["message"])
     assert "ok" in replies[1]
+
+
+def test_resolving_is_announced_only_once_the_cookies_are_read(
+    site: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 读完 Cookie 才开始算解析的时限：先报开始解析，再回结果；读浏览器没成的没有这一行
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    page = {"id": 1, "url": f"{site}/video.html", "proxy": "", "cookies": None, "generic": True}
+    stuck = {"id": 2, "url": YOUTUBE, "proxy": "", "browser": "firefox", "generic": False}
+    lines = serve_lines([page, stuck], tmp_path)
+    assert [(line["id"], sorted(line)) for line in lines] == [
+        (1, ["id", "stage"]),
+        (1, ["id", "ok"]),
+        (2, ["error", "id"]),
+    ]
+    assert lines[0]["stage"] == "resolving"
 
 
 def test_cookies_the_browser_cannot_give_fail_before_the_page_is_asked(

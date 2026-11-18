@@ -16,8 +16,10 @@
     `generic` 为假时只认得通用解析器的网址不发请求，直接回 `unsupported`；视频没有格式时照网站说的原因（要登录、人机
     验证、限流、地区限制、不可用）回错误
   - 回应 `{"id": 同请求, "ok": 结果}` 或 `{"id": 同请求, "error": {"kind": 种类, "message": 说明}}`，种类见
-    `classify`；从浏览器读 Cookie 没成时种类为 `cookies`，另有 `reason`（见 `browser_cookies`）。yt-dlp 自己的输出
-    都转到标准错误，标准输出只有回应（纯 ASCII 的 JSON）。
+    `classify`；从浏览器读 Cookie 没成时种类为 `cookies`，另有 `reason`（见 `browser_cookies`）。读完 Cookie（含从
+    浏览器读）、开始解析网页时先回一行 `{"id": 同请求, "stage": "resolving"}`：应用从这时起算解析的时限（读浏览器的
+    Cookie 可能在等用户点钥匙串的授权），没走到这一步的失败没有这一行。yt-dlp 自己的输出都转到标准错误，标准输出
+    只有回应（纯 ASCII 的 JSON）。
   - 结果见 `trimmed`，另有 `site_cookies`（见 `site_cookies`）。
 - `download <site> <quickjs> <cache>`：用 yt-dlp 自己的下载器下一个格式（要模拟浏览器 TLS 指纹的、DASH 分片等应用的引擎
   下不了的）。标准输入的第一行为请求 `{"url": 网页地址, "format": 要的格式（`key_of` 的各项）,
@@ -460,8 +462,10 @@ def matched(url: str) -> str:
     return "Generic"
 
 
-def extract(yt_dlp: ModuleType, request: Mapping[str, object], quickjs: str, cache: str) -> Info:
-    """解析请求里的网址，返回回应（结果或归了类的失败）。"""
+def extract(
+    yt_dlp: ModuleType, request: Mapping[str, object], quickjs: str, cache: str, resolving: Callable[[], None]
+) -> Info:
+    """解析请求里的网址，返回回应（结果或归了类的失败）；读完 Cookie、开始解析网页时调 `resolving`。"""
     url = text(request.get("url")) or ""
     if request.get("generic") is not True and matched(url) == "Generic":
         return {"error": {"kind": "unsupported", "message": "没有专门认这个网址的解析器"}}
@@ -472,6 +476,7 @@ def extract(yt_dlp: ModuleType, request: Mapping[str, object], quickjs: str, cac
         failed = browser_cookies(yt_dlp, ydl, browser, logger)
         if failed is not None:
             return failed
+        resolving()
         try:
             info = ydl.extract_info(url, download=False)
         except yt_dlp.utils.YoutubeDLError as error:
@@ -516,14 +521,21 @@ def serve(site: str, quickjs: str, cache: str, requests: TextIO, replies: TextIO
         if not line.strip():
             continue
         request = json.loads(line)
+
+        def write(reply: Info) -> None:
+            replies.write(json.dumps(reply, ensure_ascii=True, allow_nan=False) + "\n")
+            replies.flush()
+
+        def resolving(request: Mapping[str, object] = request) -> None:
+            write({"id": request.get("id"), "stage": "resolving"})
+
         try:
-            reply = extract(yt_dlp, request, quickjs, cache)
+            reply = extract(yt_dlp, request, quickjs, cache, resolving)
         except Exception as error:
             stack = traceback.format_exc()[-TRACEBACK_TAIL:]
             reply = {"error": {"kind": "other", "message": clean(f"{type(error).__name__}：{error}\n{stack}")}}
         reply["id"] = request.get("id")
-        replies.write(json.dumps(reply, ensure_ascii=True, allow_nan=False) + "\n")
-        replies.flush()
+        write(reply)
 
 
 def requirements(requires_dist: list[object]) -> list[Info]:
