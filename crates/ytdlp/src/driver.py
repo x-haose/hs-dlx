@@ -11,7 +11,8 @@
   `{"yt_dlp": 规范化的版本}`。
 - `serve <site> <quickjs> <cache>`：常驻解析。标准输入每行一个请求，标准输出每行一个回应，一次只处理一个：
   - 请求 `{"id": 整数, "url": 网址, "proxy": 代理地址（空串为直连）, "cookies": Netscape 格式的 Cookie 或 null,
-    "generic": 只有通用解析器认得时也解析, "browser": 另从这个浏览器读 Cookie（yt-dlp 的浏览器名）或 null}`；
+    "generic": 只有通用解析器认得时也解析, "browser": 另从这个浏览器读 Cookie（yt-dlp 的浏览器名）或 null,
+    "profile": 读它的这个用户资料（目录的绝对路径）或 null（浏览器没有用户资料之分时）}`；
     `generic` 为假时只认得通用解析器的网址不发请求，直接回 `unsupported`；视频没有格式时照网站说的原因（要登录、人机
     验证、限流、地区限制、不可用）回错误
   - 回应 `{"id": 同请求, "ok": 结果}` 或 `{"id": 同请求, "error": {"kind": 种类, "message": 说明}}`，种类见
@@ -20,7 +21,7 @@
   - 结果见 `trimmed`。
 - `download <site> <quickjs> <cache>`：用 yt-dlp 自己的下载器下一个格式（要模拟浏览器 TLS 指纹的、DASH 分片等应用的引擎
   下不了的）。标准输入的第一行为请求 `{"url": 网页地址, "format": 要的格式（`key_of` 的各项）,
-  "dir": 输出所在的目录, "name": 输出的文件名, "proxy", "cookies", "browser"}`；标准输出先是若干行进度
+  "dir": 输出所在的目录, "name": 输出的文件名, "proxy", "cookies", "browser", "profile"}`；标准输出先是若干行进度
   `{"progress": {"bytes": 已下字节, "total": 总字节或估算，不知道时为 null}}`，最后一行为 `{"ok": {}}` 或
   `{"error": ...}`（同 `serve`，格式编号找不到或属性对不上时种类为 `changed`）。中断后再下同一输出时接着 `.part` 续传；
   缺了的片段不跳过，报错。读到标准输入的结尾（应用退出了）即退出。
@@ -319,8 +320,8 @@ def params(request: Mapping[str, object], quickjs: str, cache: str, logger: Logg
 
     只解析不下载；播放列表只列条目（至多 `PLAYLIST_LIMIT` 条），带视频的播放列表网址取视频；格式全要（应用自己从
     `formats` 里选）；视频没有格式时照网站说的原因抛出（yt-dlp 的默认，`classify` 按原因归类）；代理只照应用给的；
-    Cookie 只在内存里；`browser`（yt-dlp 的浏览器名）为 Some 时另从它读 Cookie，与给的合并；QuickJS-NG 解 YouTube 的
-    JavaScript 挑战；缓存放在应用的目录；不查自己是不是太旧。
+    Cookie 只在内存里；有 `browser`（yt-dlp 的浏览器名）时另从它的 `profile` 读 Cookie，与给的合并；QuickJS-NG 解
+    YouTube 的 JavaScript 挑战；缓存放在应用的目录；不查自己是不是太旧。
     """
     cookies = text(request.get("cookies"))
     browser = browser_of(request)
@@ -334,15 +335,15 @@ def params(request: Mapping[str, object], quickjs: str, cache: str, logger: Logg
         "proxy": text(request.get("proxy")) or "",
         "socket_timeout": SOCKET_TIMEOUT,
         "cookiefile": io.StringIO(cookies) if cookies is not None else None,
-        "cookiesfrombrowser": (browser,) if browser else None,
+        "cookiesfrombrowser": browser,
         "js_runtimes": {"quickjs": {"path": quickjs}},
         "cachedir": cache,
         "warn_when_outdated": False,
     }
 
 
-def browser_of(request: Mapping[str, object]) -> str | None:
-    """要从哪个浏览器读 Cookie：请求里的，网址只有通用解析器认得时不读。
+def browser_of(request: Mapping[str, object]) -> tuple[str, str | None] | None:
+    """要从哪个浏览器的哪个用户资料读 Cookie（`cookiesfrombrowser` 的前两项）：请求里的，网址只有通用解析器认得时不读。
 
     通用解析器会顺着网页去请求别的网站，带上浏览器里那些网站的 Cookie 等于替网页发了带登录的跨站请求（浏览器按
     SameSite 不会带）。
@@ -350,7 +351,7 @@ def browser_of(request: Mapping[str, object]) -> str | None:
     browser = text(request.get("browser"))
     if browser is None or matched(text(request.get("url")) or "") == "Generic":
         return None
-    return browser
+    return (browser, text(request.get("profile")))
 
 
 # 读浏览器 Cookie 时 yt-dlp 的警告里，说明整罐加密的 Cookie 都解不开的（钥匙串或密钥环没给钥匙、钥匙不对）；别的
@@ -362,7 +363,9 @@ KEYCHAIN_FUNCTION = "_get_mac_keyring_password"
 KEYRING_ERRORS = ("secretstorage", "keyring", "kwallet")
 
 
-def browser_cookies(yt_dlp: ModuleType, ydl: WithCookies, browser: str | None, logger: Logger) -> Info | None:
+def browser_cookies(
+    yt_dlp: ModuleType, ydl: WithCookies, browser: tuple[str, str | None] | None, logger: Logger
+) -> Info | None:
     """`ydl` 要从浏览器读 Cookie 时先读：读不出或加密的都解不开时为归了类的失败，否则为 None。
 
     yt-dlp 读一次后留着。原因：`missing`（没找到这个浏览器的 Cookie 文件）、`denied`（系统不让读，macOS 上 Safari

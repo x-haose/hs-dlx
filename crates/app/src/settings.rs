@@ -26,8 +26,8 @@ pub struct Settings {
     pub web_channel: hs_dlx_ytdlp::Channel,
     /// 网页视频的画质选项按什么挑（见 [`crate::web::choices`]）
     pub web_preference: crate::web::Preference,
-    /// 解析网页视频时另从这个浏览器读登录后的 Cookie；None 为不读
-    pub web_browser: Option<hs_dlx_ytdlp::Browser>,
+    /// 解析网页视频时另从这个浏览器的这个用户资料读登录后的 Cookie；None 为不读
+    pub web_browser: Option<hs_dlx_ytdlp::CookieSource>,
 }
 
 impl Default for Settings {

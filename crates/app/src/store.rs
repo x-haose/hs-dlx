@@ -646,8 +646,8 @@ fn rebuild_with_cloud(tx: &Transaction<'_>) -> Result<(), Error> {
 /// - 失败的种类加 `web-login`、`web-geo`、`web-extract`、`web-gone`、`web-changed`、`web-denied`、`web-blocked`、
 ///   `web-cookies`、`web-components`。其余约束不变，已有的行原样搬过来。
 /// - 设置加网页视频的 yt-dlp 渠道（`web_channel`：`stable`、`nightly`）、画质取向（`web_preference`：`compatible`、
-///   `quality`）与读 Cookie 的浏览器（`web_browser`：yt-dlp 的浏览器名，NULL 为不读），没设过为稳定版、兼容优先、
-///   不读。
+///   `quality`）与读 Cookie 的浏览器（`web_browser`：yt-dlp 的浏览器名，NULL 为不读）及它的用户资料
+///   （`web_browser_profile`：目录的绝对路径，浏览器没有用户资料之分时为 NULL），没设过为稳定版、兼容优先、不读。
 fn rebuild_with_web(tx: &Transaction<'_>) -> Result<(), Error> {
     let counter = task_counter(tx)?;
     tx.execute_batch(
@@ -755,7 +755,9 @@ fn rebuild_with_web(tx: &Transaction<'_>) -> Result<(), Error> {
             CHECK (web_preference IN ('compatible', 'quality'));
         ALTER TABLE settings ADD COLUMN web_browser TEXT
             CHECK (web_browser IN ('chrome', 'edge', 'firefox', 'safari', 'brave', 'chromium', 'opera', 'vivaldi',
-                                   'whale'));",
+                                   'whale'));
+        ALTER TABLE settings ADD COLUMN web_browser_profile TEXT
+            CHECK (web_browser_profile IS NULL OR (web_browser_profile != '' AND web_browser IS NOT NULL));",
     )?;
     keep_task_counter(tx, counter)
 }
@@ -1968,6 +1970,7 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
         String,
         String,
         Option<String>,
+        Option<String>,
     );
     let (
         folder,
@@ -1982,9 +1985,10 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
         web_channel,
         web_preference,
         web_browser,
+        web_browser_profile,
     ): Columns = tx.query_row(
             "SELECT folder, proxy, theme, seed, seed_ratio_percent, seed_minutes, upload_limit, check_updates,
-                    torrent_proxy, web_channel, web_preference, web_browser
+                    torrent_proxy, web_channel, web_preference, web_browser, web_browser_profile
              FROM settings WHERE id = 1",
             [],
             |row| {
@@ -2001,6 +2005,7 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
                     row.get(9)?,
                     row.get(10)?,
                     row.get(11)?,
+                    row.get(12)?,
                 ))
             },
         )?;
@@ -2057,21 +2062,34 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
         },
         web_browser: web_browser
             .map(|code| {
-                hs_dlx_ytdlp::Browser::from_code(&code)
-                    .ok_or_else(|| Error::Corrupt("设置里读 Cookie 的浏览器".to_owned()))
+                let browser = hs_dlx_ytdlp::Browser::from_code(&code)
+                    .ok_or_else(|| Error::Corrupt("设置里读 Cookie 的浏览器".to_owned()))?;
+                Ok::<_, Error>(hs_dlx_ytdlp::CookieSource {
+                    browser,
+                    profile: web_browser_profile.map(PathBuf::from),
+                })
             })
             .transpose()?,
     })
 }
 
-/// 记下解析网页视频时从哪个浏览器读 Cookie（None 为不读）。
+/// 记下解析网页视频时从哪个浏览器的哪个用户资料读 Cookie（None 为不读）。用户资料的目录不是 UTF-8 时报
+/// [`Error::InvalidInput`]。
 pub fn set_web_browser(
     tx: &Transaction<'_>,
-    browser: Option<hs_dlx_ytdlp::Browser>,
+    source: Option<&hs_dlx_ytdlp::CookieSource>,
 ) -> Result<(), Error> {
+    let profile = source
+        .and_then(|source| source.profile.as_ref())
+        .map(|dir| {
+            dir.to_str().map(str::to_owned).ok_or_else(|| {
+                Error::InvalidInput(format!("用户资料的目录不是 UTF-8：{}", dir.display()))
+            })
+        })
+        .transpose()?;
     tx.execute(
-        "UPDATE settings SET web_browser = ?1 WHERE id = 1",
-        [browser.map(hs_dlx_ytdlp::Browser::code)],
+        "UPDATE settings SET web_browser = ?1, web_browser_profile = ?2 WHERE id = 1",
+        rusqlite::params![source.map(|source| source.browser.code()), profile],
     )?;
     Ok(())
 }
@@ -3483,6 +3501,22 @@ mod tests {
         );
         set_torrent_proxy(&tx, None).unwrap();
         assert_eq!(settings(&tx).unwrap().torrent_proxy, None);
+        // 读 Cookie 的浏览器与用户资料一起存、一起清；有用户资料没有浏览器的由表拦下
+        let source = hs_dlx_ytdlp::CookieSource {
+            browser: hs_dlx_ytdlp::Browser::Chrome,
+            profile: Some(m("Chrome/Profile 2")),
+        };
+        set_web_browser(&tx, Some(&source)).unwrap();
+        assert_eq!(settings(&tx).unwrap().web_browser, Some(source));
+        set_web_browser(&tx, None).unwrap();
+        assert_eq!(settings(&tx).unwrap().web_browser, None);
+        assert!(
+            tx.execute(
+                "UPDATE settings SET web_browser_profile = '/p' WHERE id = 1",
+                []
+            )
+            .is_err()
+        );
         // 做种：改成不做种再改回时分享率与时长照旧；只按时长
         assert_eq!(read.seeding, Seeding::default());
         set_seeding(&tx, Seeding::Off).unwrap();

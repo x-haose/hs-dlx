@@ -1,14 +1,37 @@
 //! 解析时从哪个浏览器读登录后的 Cookie（yt-dlp 的 `cookiesfrombrowser`）。每次解析现读：浏览器里登录着、Cookie 轮换
 //! 了也是新的。
 //!
+//! 浏览器有多个用户资料时读哪一个由用户选（见 [`CookieSource`]、[`Browser::profiles`]），不交给 yt-dlp 挑：它挑最近
+//! 改过 Cookie 文件的那个，几个资料都开着时每次可能不同。
+//!
 //! 能不能读因平台而异：macOS 上 Chromium 系读时系统弹钥匙串的授权（一个解析进程里给过一次即留着），Safari 与受系统
-//! 保护的浏览器数据目录要给应用完全磁盘访问权限（见 [`Browser::access`]）；Linux 上 Chromium 系的钥匙在系统的密钥环里；Windows 上 Chrome、Edge、Brave 把 Cookie 加密成只有
-//! 它们自己解得开的（app-bound encryption），yt-dlp 读不了，不列出；Firefox 各平台都能读。读不了时解析报
-//! [`crate::ExtractError::Cookies`]。
+//! 保护的浏览器数据目录要给应用完全磁盘访问权限（见 [`Browser::access`]）；Linux 上 Chromium 系的钥匙在系统的密钥环
+//! 里；Windows 上 Chrome、Edge、Brave 把 Cookie 加密成只有它们自己解得开的（app-bound encryption），yt-dlp 读不了，
+//! 不列出；Firefox 各平台都能读。读不了时解析报 [`crate::ExtractError::Cookies`]。
 
 use std::fmt;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// 解析时从哪里读 Cookie：浏览器与它的一个用户资料。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CookieSource {
+    pub browser: Browser,
+    /// 用户资料的目录（绝对路径，见 [`Profile::dir`]）；浏览器没有用户资料之分（Safari、Opera）或一个也没列出来时为
+    /// None，由 yt-dlp 在数据目录里找
+    pub profile: Option<PathBuf>,
+}
+
+/// 浏览器的一个用户资料。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Profile {
+    /// 资料的目录（绝对路径），交给 yt-dlp 时作 `cookiesfrombrowser` 的 profile
+    pub dir: PathBuf,
+    /// 浏览器里显示的名字
+    pub name: String,
+    /// 登录在这个资料里的浏览器账号（Chromium 系为 Google 等账号的邮箱）；没登录或浏览器不记时为 None
+    pub account: Option<String>,
+}
 
 /// yt-dlp 能从中读 Cookie 的浏览器。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -116,6 +139,40 @@ impl Browser {
         }
     }
 
+    /// 它的各个用户资料，按浏览器里的次序；没有用户资料之分（Safari、Opera）或还没用过时为空。Chromium 系读用户数据
+    /// 目录里的 `Local State`（`profile.info_cache` 与 `profile.profiles_order`），Firefox 读各个配置目录里的
+    /// `profiles.ini`；目录已不在的资料不列。读不出（没有权限、格式认不出）时报原因。
+    pub fn profiles(self) -> Result<Vec<Profile>, String> {
+        match self {
+            Browser::Safari | Browser::Opera => Ok(Vec::new()),
+            Browser::Firefox => {
+                let mut profiles = Vec::new();
+                for dir in self.data_dirs() {
+                    // Windows 与 macOS 上 yt-dlp 找的是 Profiles 子目录，profiles.ini 在它的上一级
+                    let root = if dir.file_name().is_some_and(|name| name == "Profiles") {
+                        dir.parent().map_or(dir.clone(), Path::to_path_buf)
+                    } else {
+                        dir
+                    };
+                    let ini = root.join("profiles.ini");
+                    if let Some(text) = read_optional(&ini)? {
+                        profiles.extend(firefox_profiles(&root, &text));
+                    }
+                }
+                Ok(profiles.into_iter().filter(|p| p.dir.is_dir()).collect())
+            }
+            _ => {
+                let mut profiles = Vec::new();
+                for root in self.data_dirs() {
+                    if let Some(text) = read_optional(&root.join("Local State"))? {
+                        profiles.extend(chromium_profiles(&root, &text)?);
+                    }
+                }
+                Ok(profiles.into_iter().filter(|p| p.dir.is_dir()).collect())
+            }
+        }
+    }
+
     fn present(self) -> bool {
         if self == Browser::Safari {
             return cfg!(target_os = "macos");
@@ -202,5 +259,165 @@ pub struct Denied {
 impl fmt::Display for Denied {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "列不出 {}：{}", self.dir.display(), self.error)
+    }
+}
+
+/// 读 `path` 的全文；不在时为 None。
+fn read_optional(path: &Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("读不出 {}：{error}", path.display())),
+    }
+}
+
+/// Chromium 系用户数据目录 `root` 里 `Local State`（`text`）列的用户资料：按 `profile.profiles_order`，它没列的接在
+/// 后面按目录名排。
+fn chromium_profiles(root: &Path, text: &str) -> Result<Vec<Profile>, String> {
+    let state: serde_json::Value = serde_json::from_str(text)
+        .map_err(|error| format!("{} 认不出：{error}", root.join("Local State").display()))?;
+    let Some(cache) = state
+        .pointer("/profile/info_cache")
+        .and_then(|v| v.as_object())
+    else {
+        return Ok(Vec::new());
+    };
+    let mut order: Vec<&str> = state
+        .pointer("/profile/profiles_order")
+        .and_then(|v| v.as_array())
+        .map(|order| order.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    order.retain(|dir| cache.contains_key(*dir));
+    let mut rest: Vec<&str> = cache
+        .keys()
+        .map(String::as_str)
+        .filter(|dir| !order.contains(dir))
+        .collect();
+    rest.sort_unstable();
+    order.extend(rest);
+    Ok(order
+        .into_iter()
+        .map(|dir| {
+            let info = &cache[dir];
+            let field = |key: &str| {
+                info.get(key)
+                    .and_then(|v| v.as_str())
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_owned)
+            };
+            Profile {
+                dir: root.join(dir),
+                name: field("name").unwrap_or_else(|| dir.to_owned()),
+                account: field("user_name"),
+            }
+        })
+        .collect())
+}
+
+/// Firefox 配置目录 `root` 里 `profiles.ini`（`text`）列的用户资料（`[Profile*]` 各节），按文件里的次序。`Path` 在
+/// `IsRelative=1` 时相对 `root`。
+fn firefox_profiles(root: &Path, text: &str) -> Vec<Profile> {
+    #[derive(Default)]
+    struct Section {
+        name: Option<String>,
+        path: Option<String>,
+        relative: bool,
+    }
+    let mut sections: Vec<Section> = Vec::new();
+    let mut current: Option<Section> = None;
+    for line in text.lines().map(str::trim) {
+        if let Some(header) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            sections.extend(current.take());
+            current = header.starts_with("Profile").then(Section::default);
+        } else if let (Some(section), Some((key, value))) = (current.as_mut(), line.split_once('='))
+        {
+            match key.trim() {
+                "Name" => section.name = Some(value.trim().to_owned()),
+                "Path" => section.path = Some(value.trim().to_owned()),
+                "IsRelative" => section.relative = value.trim() == "1",
+                _ => {}
+            }
+        }
+    }
+    sections.extend(current);
+    sections
+        .into_iter()
+        .filter_map(|section| {
+            let path = section.path?;
+            let dir = if section.relative {
+                root.join(&path)
+            } else {
+                PathBuf::from(&path)
+            };
+            Some(Profile {
+                name: section.name.unwrap_or(path),
+                dir,
+                account: None,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 按 profiles_order 排，它没列的按目录名接在后面；空的名字与账号不算。
+    #[test]
+    fn chromium_profiles_follow_the_browser_order() {
+        let text = r#"{"profile": {
+            "info_cache": {
+                "Default": {"name": "个人", "user_name": "a@example.com"},
+                "Profile 2": {"name": "工作", "user_name": ""},
+                "Profile 9": {"user_name": "c@example.com"},
+                "Profile 1": {"name": "旧的"}
+            },
+            "profiles_order": ["Profile 2", "Default", "Gone"]
+        }}"#;
+        let root = Path::new("/u/Chrome");
+        let profiles = chromium_profiles(root, text).unwrap();
+        let shown: Vec<(&str, &str, Option<&str>)> = profiles
+            .iter()
+            .map(|p| {
+                (
+                    p.dir.file_name().unwrap().to_str().unwrap(),
+                    p.name.as_str(),
+                    p.account.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("Profile 2", "工作", None),
+                ("Default", "个人", Some("a@example.com")),
+                ("Profile 1", "旧的", None),
+                ("Profile 9", "Profile 9", Some("c@example.com")),
+            ]
+        );
+        assert!(chromium_profiles(root, "{}").unwrap().is_empty());
+        assert!(chromium_profiles(root, "not json").is_err());
+    }
+
+    /// 只取 [Profile*] 各节；相对路径接在配置目录下，绝对的原样。
+    #[test]
+    fn firefox_profiles_come_from_profile_sections() {
+        let text = "[Install4F96D1932A9F858E]\nDefault=Profiles/b.default-release\nLocked=1\n\n\
+                    [Profile1]\nName=default\nIsRelative=1\nPath=Profiles/a.default\nDefault=1\n\n\
+                    [Profile0]\nName=work\nIsRelative=0\nPath=/elsewhere/w.work\n\n\
+                    [General]\nStartWithLastProfile=1\n";
+        let root = Path::new("/u/Firefox");
+        let profiles = firefox_profiles(root, text);
+        let shown: Vec<(&str, PathBuf)> = profiles
+            .iter()
+            .map(|p| (p.name.as_str(), p.dir.clone()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("default", root.join("Profiles/a.default")),
+                ("work", PathBuf::from("/elsewhere/w.work")),
+            ]
+        );
     }
 }

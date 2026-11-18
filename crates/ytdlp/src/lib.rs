@@ -11,7 +11,7 @@ mod info;
 
 use std::path::Path;
 
-pub use crate::browser::{Browser, Denied};
+pub use crate::browser::{Browser, CookieSource, Denied, Profile};
 pub use crate::bundle::{Bundle, Bundled};
 pub use crate::components::{Channel, Components, InstallProgress, Installed, Sources, Stage};
 pub use crate::extractor::{Cookie, ExtractError, Extractor, Request, WORKERS};

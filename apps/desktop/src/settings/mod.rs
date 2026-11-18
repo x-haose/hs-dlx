@@ -224,6 +224,11 @@ impl SettingsView {
             state: web_states.borrow().clone(),
             channel: settings.web_channel,
             preference: settings.web_preference,
+            shown: settings.web_browser.as_ref().map(|source| source.browser),
+            listing: settings
+                .web_browser
+                .as_ref()
+                .map(|source| web::Listing::of(source.browser)),
             browser: settings.web_browser,
             browsers: tasks.read(cx).service().web_browsers(),
             latest: None,

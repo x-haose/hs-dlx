@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use axum::response::{Html, IntoResponse as _, Response};
 use axum::routing::get;
-use hs_dlx_ytdlp::{Browser, Cookie, ExtractError, Extractor, Installed, Protocol, Request, Track};
+use hs_dlx_ytdlp::{
+    Browser, Cookie, CookieSource, ExtractError, Extractor, Installed, Protocol, Request, Track,
+};
 use hs_m3u8_core::{CancellationToken, Proxy, Url};
 use tokio::sync::Notify;
 
@@ -200,25 +202,39 @@ print(json.dumps(dirs))
 #[tokio::test(flavor = "multi_thread")]
 async fn cookies_a_browser_cannot_give_fail_before_any_request() {
     let (installed, cache) = installed("cookies");
-    let extractor = Extractor::new(installed, cache, Duration::from_secs(60));
+    let extractor = Extractor::new(installed, cache.clone(), Duration::from_secs(60));
     // 有专门解析器的网址（只有通用解析器认得的不读浏览器的 Cookie）：读不出即回，不联网
     let url = Url::parse("https://www.youtube.com/watch?v=V8dKO3snMG8").unwrap();
+    let request = |profile: Option<PathBuf>| Request {
+        url: url.clone(),
+        cookies: Vec::new(),
+        generic: false,
+        browser: Some(CookieSource {
+            browser: Browser::Whale,
+            profile,
+        }),
+    };
+    let token = CancellationToken::new();
     let error = extractor
-        .extract(
-            &Request {
-                url,
-                cookies: Vec::new(),
-                generic: false,
-                browser: Some(Browser::Whale),
-            },
-            &Proxy::Direct,
-            &CancellationToken::new(),
-        )
+        .extract(&request(None), &Proxy::Direct, &token)
         .await
         .unwrap_err();
     match error {
         ExtractError::Cookies(message) => {
             assert!(message.starts_with("没找到 Whale 的 Cookie"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // 指定的用户资料交到 yt-dlp：不在时说明里写它
+    let gone = cache.join("Whale").join("Profile 2");
+    let error = extractor
+        .extract(&request(Some(gone.clone())), &Proxy::Direct, &token)
+        .await
+        .unwrap_err();
+    match error {
+        ExtractError::Cookies(message) => {
+            let shown = format!("没找到 Whale 的用户资料 {} 的 Cookie", gone.display());
+            assert!(message.starts_with(&shown), "{message}");
         }
         other => panic!("{other:?}"),
     }

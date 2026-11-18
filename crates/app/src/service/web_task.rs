@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hs_dlx_ytdlp::{
-    Browser, Cookie, ExtractError, Extractor, Format, FormatKey, Info, Protocol, Request, Track,
+    Cookie, CookieSource, ExtractError, Extractor, Format, FormatKey, Info, Protocol, Request,
+    Track,
 };
 use hs_m3u8_core::remux::{FileInput, Streams, WriteProgress};
 use hs_m3u8_core::{
@@ -174,13 +175,13 @@ struct Position {
 }
 
 impl Shared {
-    /// 开始网页视频任务 `task`（经代理 `proxy`，解析时另从 `browser` 读 Cookie）；解析组件没装好时报
+    /// 开始网页视频任务 `task`（经代理 `proxy`，解析时另从 `browser` 读 Cookie，见 [`CookieSource`]）；解析组件没装好时报
     /// [`crate::Error::WebNotReady`]。调用方须在运行时里。
     pub(super) fn launch_web(
         self: &Arc<Self>,
         task: &Task,
         proxy: Proxy,
-        browser: Option<Browser>,
+        browser: Option<CookieSource>,
     ) -> Result<WebRun, crate::Error> {
         let extractor = lock(&self.web.extractor)
             .clone()
@@ -215,7 +216,7 @@ impl Shared {
         task: &Task,
         extractor: &Extractor,
         proxy: &Proxy,
-        browser: Option<Browser>,
+        browser: Option<CookieSource>,
         cancel: &CancellationToken,
         leftovers: &Mutex<Vec<Leftover>>,
     ) -> Result<Finished, Stop> {

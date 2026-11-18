@@ -14,7 +14,7 @@ use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, Buf
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Semaphore;
 
-use crate::Browser;
+use crate::{Browser, CookieSource};
 
 use crate::components::{Installed, command, proxy_for};
 use crate::info::{FormatKey, Info, Track, Wire};
@@ -55,8 +55,9 @@ pub struct Request {
     pub cookies: Vec<Cookie>,
     /// 只有通用解析器认得的网址也解析；为假时这样的网址不发请求、直接报 [`ExtractError::Unsupported`]
     pub generic: bool,
-    /// 另从这个浏览器读 Cookie（与 `cookies` 合并）；读不出或没读全时报 [`ExtractError::Cookies`]，不发请求
-    pub browser: Option<Browser>,
+    /// 另从这个浏览器的这个用户资料读 Cookie（与 `cookies` 合并）；读不出或没读全时报 [`ExtractError::Cookies`]，不发
+    /// 请求
+    pub browser: Option<CookieSource>,
 }
 
 /// 解析失败。
@@ -302,7 +303,8 @@ impl Extractor {
             "proxy": proxy,
             "cookies": (!request.cookies.is_empty()).then(|| netscape(&request.cookies)),
             "generic": request.generic,
-            "browser": request.browser.map(Browser::code),
+            "browser": request.browser.as_ref().map(|source| source.browser.code()),
+            "profile": profile_wire(request.browser.as_ref()),
         });
         let id = worker.next_id;
         worker.next_id += 1;
@@ -350,7 +352,7 @@ impl Extractor {
         self.idle.lock().expect("锁里不会 panic").push_back(worker);
         match (parsed.ok, parsed.error) {
             (Some(wire), None) => Ok(wire.into_info()),
-            (None, Some(failure)) => Err(failure.into_error(request.browser)),
+            (None, Some(failure)) => Err(failure.into_error(request.browser.as_ref())),
             _ => Err(ExtractError::Crashed(
                 "回应里结果与失败不是恰好一个".to_owned(),
             )),
@@ -464,7 +466,8 @@ impl Extractor {
             "name": name.to_string_lossy(),
             "proxy": proxy,
             "cookies": (!request.cookies.is_empty()).then(|| netscape(&request.cookies)),
-            "browser": request.browser.map(Browser::code),
+            "browser": request.browser.as_ref().map(|source| source.browser.code()),
+            "profile": profile_wire(request.browser.as_ref()),
         });
         let sent = async {
             worker
@@ -505,7 +508,9 @@ impl Extractor {
                     );
                 }
                 Ok(DownloadReply::Ok { .. }) => break Ok(()),
-                Ok(DownloadReply::Error { error }) => break Err(error.into_error(request.browser)),
+                Ok(DownloadReply::Error { error }) => {
+                    break Err(error.into_error(request.browser.as_ref()));
+                }
                 Err(error) => {
                     break Err(ExtractError::Crashed(with_stderr(
                         &format!("回应认不出：{error}"),
@@ -621,8 +626,9 @@ struct Failure {
 }
 
 impl Failure {
-    /// `browser` 为请求里读 Cookie 的浏览器（`cookies` 的说明里写它的名字）。
-    fn into_error(self, browser: Option<Browser>) -> ExtractError {
+    /// `source` 为请求里读 Cookie 的浏览器与用户资料（`cookies` 的说明里写它们）。
+    fn into_error(self, source: Option<&CookieSource>) -> ExtractError {
+        let browser = source.map(|source| source.browser);
         let message = self.message;
         match self.kind.as_str() {
             "cookies" => {
@@ -632,8 +638,8 @@ impl Failure {
                     _ => None,
                 };
                 ExtractError::Cookies(match denied {
-                    Some(denied) => cookie_trouble(browser, Some("denied"), &denied.to_string()),
-                    None => cookie_trouble(browser, self.reason.as_deref(), &message),
+                    Some(denied) => cookie_trouble(source, Some("denied"), &denied.to_string()),
+                    None => cookie_trouble(source, self.reason.as_deref(), &message),
                 })
             }
             "unsupported" => ExtractError::Unsupported(message),
@@ -650,24 +656,39 @@ impl Failure {
     }
 }
 
-/// 从 `browser` 读 Cookie 没成的说明：原因 `reason`（见驱动脚本的 `browser_cookies`）与怎么办，后接 yt-dlp 的
+/// 交给驱动脚本的用户资料目录；不指定时为 null。
+fn profile_wire(source: Option<&CookieSource>) -> Option<String> {
+    source
+        .and_then(|source| source.profile.as_ref())
+        .map(|dir| dir.to_string_lossy().into_owned())
+}
+
+/// 从 `source` 读 Cookie 没成的说明：原因 `reason`（见驱动脚本的 `browser_cookies`）与怎么办，后接 yt-dlp 的
 /// `detail`。
-fn cookie_trouble(browser: Option<Browser>, reason: Option<&str>, detail: &str) -> String {
+fn cookie_trouble(source: Option<&CookieSource>, reason: Option<&str>, detail: &str) -> String {
+    let browser = source.map(|source| source.browser);
     let name = browser.map_or("浏览器", Browser::label);
-    let what = match reason {
-        Some("missing") => format!("没找到 {name} 的 Cookie：这台电脑上没装它，或没用它打开过网页"),
-        Some("denied") => browser.map_or_else(
+    let profile = source.and_then(|source| source.profile.as_ref());
+    let what = match (reason, profile) {
+        (Some("missing"), Some(dir)) => format!(
+            "没找到 {name} 的用户资料 {} 的 Cookie：它可能被删了，在设置的「网页视频 → 登录信息」里重选",
+            dir.display()
+        ),
+        (Some("missing"), None) => {
+            format!("没找到 {name} 的 Cookie：这台电脑上没装它，或没用它打开过网页")
+        }
+        (Some("denied"), _) => browser.map_or_else(
             || "系统不让读浏览器的 Cookie".to_owned(),
             Browser::denied_hint,
         ),
-        Some("encrypted") => format!(
+        (Some("encrypted"), _) => format!(
             "{name} 把 Cookie 加密成了只有它自己解得开的（Windows 上 Chrome 127 起），读不了：改用 Firefox 登录，在设置里选 Firefox"
         ),
-        Some("locked") => format!("{name} 开着时它的 Cookie 文件被锁着：关掉 {name} 再试"),
-        Some("keychain") => format!(
+        (Some("locked"), _) => format!("{name} 开着时它的 Cookie 文件被锁着：关掉 {name} 再试"),
+        (Some("keychain"), _) => format!(
             "没拿到解开 {name} 的 Cookie 的钥匙：macOS 弹出钥匙串的授权时点「允许」后再试；不想每次弹，改用 Firefox"
         ),
-        Some("keyring") => format!(
+        (Some("keyring"), _) => format!(
             "没从系统的密钥环拿到解开 {name} 的 Cookie 的钥匙：解开密钥环（GNOME 密钥环或 KWallet）后再试，或改用 Firefox"
         ),
         _ => format!("读不出 {name} 的 Cookie"),

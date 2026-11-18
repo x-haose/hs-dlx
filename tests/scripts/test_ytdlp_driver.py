@@ -177,15 +177,19 @@ def test_cookies_the_browser_cannot_give_fail_before_the_page_is_asked(
     [reply] = serve([{**request, "url": f"{site}/video.html", "generic": True}], tmp_path)
     assert "ok" in reply
 
-    # 加密的都解不开（钥匙串没给钥匙时 yt-dlp 只警告、跳过）：没读成
+    # 加密的都解不开（钥匙串没给钥匙时 yt-dlp 只警告、跳过）：没读成；读的是请求里指定的用户资料
     cookies = importlib.import_module("yt_dlp.cookies")
+    profiles: list[str | None] = []
 
-    def keyless(_browser: str, _profile: str | None, logger: Warns, **_options: object) -> object:
+    def keyless(_browser: str, profile: str | None, logger: Warns, **_options: object) -> object:
+        profiles.append(profile)
         logger.warning("cannot decrypt v10 cookies: no key found", only_once=True)
         return cookies.YoutubeDLCookieJar()
 
     monkeypatch.setattr(cookies, "extract_cookies_from_browser", keyless)
-    [reply] = serve([{**request, "browser": "chrome"}], tmp_path)
+    profile = str(tmp_path / "Chrome" / "Profile 2")
+    [reply] = serve([{**request, "browser": "chrome", "profile": profile}], tmp_path)
+    assert profiles == [profile]
     error = driver.mapping(reply["error"]) or {}
     assert error["kind"] == "cookies"
     assert error["reason"] == ("keychain" if sys.platform == "darwin" else "keyring")
@@ -206,7 +210,7 @@ def test_warnings_that_leave_the_other_cookies_readable_do_not_fail(monkeypatch:
     logger = driver.Logger()
     options = driver.params({"url": YOUTUBE, "browser": "firefox"}, "qjs", "", logger)
     with yt_dlp.YoutubeDL(options) as ydl:
-        assert driver.browser_cookies(yt_dlp, ydl, "firefox", logger) is None
+        assert driver.browser_cookies(yt_dlp, ydl, ("firefox", None), logger) is None
 
 
 def test_lone_surrogates_and_nan_still_make_valid_json() -> None:

@@ -572,7 +572,7 @@ impl Tasks {
     /// 重查设置里选的浏览器的数据读不读得了，变了时通知窗口重画；读不出设置时提示原因。
     pub fn check_cookie_access(&mut self, cx: &mut Context<Self>) {
         let browser = match self.service.settings() {
-            Ok(settings) => settings.web_browser,
+            Ok(settings) => settings.web_browser.map(|source| source.browser),
             Err(error) => {
                 self.tell(
                     format!("读不出设置，查不了能不能读浏览器的登录信息：{error}"),

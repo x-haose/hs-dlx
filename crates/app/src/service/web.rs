@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hs_dlx_ytdlp::{
-    Browser, Bundle, Channel, Components, ExtractError, Extractor, Info, InstallProgress, Request,
-    Sources, Stage,
+    Browser, Bundle, Channel, Components, CookieSource, ExtractError, Extractor, Info,
+    InstallProgress, Request, Sources, Stage,
 };
 use hs_m3u8_core::{CancellationToken, Engine, Url};
 use tokio::sync::watch;
@@ -195,9 +195,11 @@ impl Service {
         self.shared.write(|tx| store::set_web_channel(tx, channel))
     }
 
-    /// 记下解析时从哪个浏览器读 Cookie（None 为不读）：之后的解析与任务开始、继续照它。
-    pub fn set_web_browser(&self, browser: Option<Browser>) -> Result<(), Error> {
-        self.shared.write(|tx| store::set_web_browser(tx, browser))
+    /// 记下解析时从哪个浏览器的哪个用户资料读 Cookie（None 为不读）：之后的解析与任务开始、继续照它。用户资料的目录
+    /// 不是 UTF-8 时报 [`Error::InvalidInput`]。
+    pub fn set_web_browser(&self, browser: Option<CookieSource>) -> Result<(), Error> {
+        self.shared
+            .write(|tx| store::set_web_browser(tx, browser.as_ref()))
     }
 
     /// 这台机器上有数据目录、读得了的浏览器（见 [`Browser::installed`]）。
