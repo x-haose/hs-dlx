@@ -406,6 +406,7 @@ mod tests {
             has_drm: false,
             entries: None,
             warnings: Vec::new(),
+            site_cookies: Vec::new(),
         }
     }
 

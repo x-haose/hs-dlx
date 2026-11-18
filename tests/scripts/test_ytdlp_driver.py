@@ -192,7 +192,7 @@ def test_cookies_the_browser_cannot_give_fail_before_the_page_is_asked(
     assert profiles == [profile]
     error = driver.mapping(reply["error"]) or {}
     assert error["kind"] == "cookies"
-    assert error["reason"] == ("keychain" if sys.platform == "darwin" else "keyring")
+    assert error["reason"] == {"darwin": "keychain", "win32": "encrypted"}.get(sys.platform, "keyring")
     assert "no key found" in str(error["message"])
 
 
@@ -203,6 +203,10 @@ def test_warnings_that_leave_the_other_cookies_readable_do_not_fail(monkeypatch:
 
     def partly(_browser: str, _profile: str | None, logger: Warns, **_options: object) -> object:
         logger.warning("Possibly unsupported firefox cookies database version: 18", only_once=True)
+        logger.warning(
+            "failed to decrypt cookie (AES-GCM) because the MAC check failed. Possibly the key is wrong?",
+            only_once=True,
+        )
         logger.warning("failed to parse Safari cookie because UTF-8 decoding failed", only_once=True)
         return cookies.YoutubeDLCookieJar()
 
@@ -211,6 +215,30 @@ def test_warnings_that_leave_the_other_cookies_readable_do_not_fail(monkeypatch:
     options = driver.params({"url": YOUTUBE, "browser": "firefox"}, "qjs", "", logger)
     with yt_dlp.YoutubeDL(options) as ydl:
         assert driver.browser_cookies(yt_dlp, ydl, ("firefox", None), logger) is None
+
+
+def test_only_the_cookies_for_the_page_go_back_to_the_app() -> None:
+    # 浏览器里别的网站的 Cookie 不交出去；带子域的以点开头
+    cookies = importlib.import_module("yt_dlp.cookies")
+    jar = cookies.YoutubeDLCookieJar()
+    jar.load(
+        io.StringIO(
+            "# Netscape HTTP Cookie File\n"
+            ".youtube.com\tTRUE\t/\tTRUE\t4102444800\tSID\tabc\n"
+            "bank.example\tFALSE\t/\tTRUE\t4102444800\tsession\tsecret\n"
+        )
+    )
+    assert driver.site_cookies(jar, YOUTUBE) == [
+        {
+            "domain": ".youtube.com",
+            "include_subdomains": True,
+            "path": "/",
+            "secure": True,
+            "expires": 4102444800,
+            "name": "SID",
+            "value": "abc",
+        }
+    ]
 
 
 def test_lone_surrogates_and_nan_still_make_valid_json() -> None:

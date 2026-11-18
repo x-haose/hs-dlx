@@ -33,7 +33,7 @@ const STDERR_WAIT: Duration = Duration::from_secs(1);
 const STOP_WAIT: Duration = Duration::from_secs(5);
 
 /// 发往网站的一个 Cookie（Netscape cookies.txt 的各列）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Cookie {
     /// 域名；`include_subdomains` 时子域也带
     pub domain: String,
@@ -58,6 +58,24 @@ pub struct Request {
     /// 另从这个浏览器的这个用户资料读 Cookie（与 `cookies` 合并）；读不出或没读全时报 [`ExtractError::Cookies`]，不发
     /// 请求
     pub browser: Option<CookieSource>,
+}
+
+impl Request {
+    /// 交回 yt-dlp 下载时用的请求：解析时从浏览器读过的，不再读浏览器，改带那次读到的、发往这个网页的 Cookie（`info`
+    /// 的 [`Info::site_cookies`]）；没读浏览器的原样。
+    pub fn for_download(&self, info: &Info) -> Request {
+        if self.browser.is_none() {
+            return self.clone();
+        }
+        let mut cookies = self.cookies.clone();
+        cookies.extend(info.site_cookies.iter().cloned());
+        Request {
+            url: self.url.clone(),
+            cookies,
+            generic: self.generic,
+            browser: None,
+        }
+    }
 }
 
 /// 解析失败。
@@ -671,7 +689,7 @@ fn cookie_trouble(source: Option<&CookieSource>, reason: Option<&str>, detail: &
     let profile = source.and_then(|source| source.profile.as_ref());
     let what = match (reason, profile) {
         (Some("missing"), Some(dir)) => format!(
-            "没找到 {name} 的用户资料 {} 的 Cookie：它可能被删了，在设置的「网页视频 → 登录信息」里重选",
+            "没找到 {name} 的用户资料 {} 的 Cookie：它可能被删了，要重选用户资料",
             dir.display()
         ),
         (Some("missing"), None) => {
@@ -682,7 +700,7 @@ fn cookie_trouble(source: Option<&CookieSource>, reason: Option<&str>, detail: &
             Browser::denied_hint,
         ),
         (Some("encrypted"), _) => format!(
-            "{name} 把 Cookie 加密成了只有它自己解得开的（Windows 上 Chrome 127 起），读不了：改用 Firefox 登录，在设置里选 Firefox"
+            "{name} 把 Cookie 加密成了只有它自己解得开的（Windows 上 Chrome 127 起），读不了：改用 Firefox 登录、读 Firefox 的"
         ),
         (Some("locked"), _) => format!("{name} 开着时它的 Cookie 文件被锁着：关掉 {name} 再试"),
         (Some("keychain"), _) => format!(
@@ -719,6 +737,52 @@ fn key_wire(key: &FormatKey) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 解析时读过浏览器的，交回 yt-dlp 下载时改带读到的发往网页的 Cookie、不再读浏览器；没读的原样。
+    #[test]
+    fn downloads_carry_the_cookies_read_instead_of_reading_the_browser_again() {
+        let cookie = |name: &str| Cookie {
+            domain: ".youtube.com".to_owned(),
+            include_subdomains: true,
+            path: "/".to_owned(),
+            secure: true,
+            expires: None,
+            name: name.to_owned(),
+            value: "v".to_owned(),
+        };
+        let info = Info {
+            extractor: "Youtube".to_owned(),
+            id: "x".to_owned(),
+            title: String::new(),
+            page: None,
+            duration: None,
+            thumbnail: None,
+            live: crate::Live::No,
+            uploader: None,
+            formats: Vec::new(),
+            has_drm: false,
+            entries: None,
+            warnings: Vec::new(),
+            site_cookies: vec![cookie("SID")],
+        };
+        let request = Request {
+            url: Url::parse("https://www.youtube.com/watch?v=x").unwrap(),
+            cookies: vec![cookie("given")],
+            generic: false,
+            browser: Some(CookieSource {
+                browser: Browser::Chrome,
+                profile: None,
+            }),
+        };
+        let download = request.for_download(&info);
+        assert_eq!(download.browser, None);
+        assert_eq!(download.cookies, [cookie("given"), cookie("SID")]);
+        let plain = Request {
+            browser: None,
+            ..request
+        };
+        assert_eq!(plain.for_download(&info), plain);
+    }
 
     #[test]
     fn cookies_are_written_in_the_netscape_layout() {

@@ -21,8 +21,10 @@ pub(super) struct WebSettings {
     pub browser: Option<CookieSource>,
     /// 点选着的浏览器：存着的，或点了、有多个用户资料、还没选资料的；None 为不读
     pub shown: Option<Browser>,
-    /// 点选着的浏览器的用户资料（打开设置页与点浏览器时查）
+    /// 点选着的浏览器的用户资料：打开设置页与点浏览器时在后台查，还没查完时为 None
     pub listing: Option<Listing>,
+    /// 在后台查 `listing`：释放即取消（又点了别的浏览器时换掉）
+    pub listing_task: Option<Task<()>>,
     /// 这台机器上有的浏览器（打开设置页时找）
     pub browsers: Vec<Browser>,
     /// 查到的：有新版时为它，已是最新为 None；没查过时整个为 None，没查成为原因
@@ -267,25 +269,38 @@ impl SettingsView {
         )
     }
 
-    /// 点了一个浏览器（None 为不读）：没有用户资料之分或只有一个资料的随即存下；有多个的等选了资料再存（见
-    /// [`SettingsView::pick_profile`]），已存着它的照旧；读不了它的数据或列不出资料的不存。
+    /// 点了一个浏览器（None 为不读，随即存下）：查完它的用户资料后，没有用户资料之分或只有一个资料的存下；有多个的
+    /// 等选了资料再存（见 [`SettingsView::pick_profile`]），已存着它的照旧；读不了它的数据或列不出资料的不存。
     fn pick_browser(&mut self, browser: Option<Browser>, cx: &mut Context<Self>) {
         self.web.shown = browser;
-        self.web.listing = browser.map(Listing::of);
-        let source = match (browser, &self.web.listing) {
-            (None, _) => Some(None),
-            (Some(browser), Some(Listing::Profiles(profiles))) if profiles.len() <= 1 => {
-                Some(Some(CookieSource {
-                    browser,
-                    profile: profiles.first().map(|profile| profile.dir.clone()),
-                }))
-            }
-            _ => None,
-        };
-        if let Some(source) = source {
-            self.save_browser(source, cx);
+        self.web.listing = None;
+        self.web.listing_task = browser.map(|browser| Self::list_profiles(browser, true, cx));
+        if browser.is_none() {
+            self.save_browser(None, cx);
         }
         cx.notify();
+    }
+
+    /// 在后台查 `browser` 的用户资料，查完放进 [`WebSettings::listing`]；`save` 时没有或只有一个资料的随即存下。
+    pub(super) fn list_profiles(browser: Browser, save: bool, cx: &mut Context<Self>) -> Task<()> {
+        let listing = cx
+            .background_executor()
+            .spawn(async move { Listing::of(browser) });
+        cx.spawn(async move |this, cx| {
+            let listing = listing.await;
+            // 设置页关了时不再需要结果
+            let _closed = this.update(cx, |this, cx| {
+                if save
+                    && let Listing::Profiles(profiles) = &listing
+                    && profiles.len() <= 1
+                {
+                    let profile = profiles.first().map(|profile| profile.dir.clone());
+                    this.save_browser(Some(CookieSource { browser, profile }), cx);
+                }
+                this.web.listing = Some(listing);
+                cx.notify();
+            });
+        })
     }
 
     /// 选了点选着的浏览器的用户资料 `dir`：存下。
@@ -362,15 +377,28 @@ impl SettingsView {
         )
     }
 
-    /// 点选着的浏览器的用户资料：读不了它的数据时是怎么开权限，列不出时是原因，有多个时逐个列出供选（还没选时写明选
-    /// 了才生效）；没有或只有一个时没有这一块。
+    /// 点选着的浏览器的用户资料：读不了它的数据时是怎么开权限（开了、重开后要回来再点它），列不出时是原因；有多个、
+    /// 或存着的资料已不在时逐个列出供选，还没选时写明选了才生效与现在生效的是哪个。没有或只有一个（且是存着的）时没有
+    /// 这一块。
     fn render_listing(&self, cx: &mut Context<Self>) -> Option<Div> {
         let browser = self.web.shown?;
         let profiles = match self.web.listing.as_ref()? {
-            Listing::Denied => return Some(disk_access::card(browser)),
+            Listing::Denied => {
+                return Some(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.))
+                        .child(disk_access::card(browser))
+                        .child(ui::caption(format!(
+                            "重开后回到这里再点 {}（现在{}）",
+                            browser.label(),
+                            self.in_effect()
+                        ))),
+                );
+            }
             Listing::Failed(reason) => return Some(ui::error_text(reason.clone())),
-            Listing::Profiles(profiles) if profiles.len() > 1 => profiles,
-            Listing::Profiles(_) => return None,
+            Listing::Profiles(profiles) => profiles,
         };
         let saved = self
             .web
@@ -378,6 +406,10 @@ impl SettingsView {
             .as_ref()
             .filter(|source| source.browser == browser)
             .and_then(|source| source.profile.as_ref());
+        let gone = saved.filter(|dir| !profiles.iter().any(|profile| &profile.dir == *dir));
+        if profiles.len() <= 1 && gone.is_none() {
+            return None;
+        }
         let chips = profiles.iter().enumerate().map(|(index, profile)| {
             let label = match &profile.account {
                 Some(account) => format!("{} · {account}", profile.name),
@@ -391,13 +423,19 @@ impl SettingsView {
                 cx.listener(move |this, _, _, cx| this.pick_profile(dir.clone(), cx)),
             )
         });
-        let chosen = saved.is_some_and(|dir| profiles.iter().any(|profile| &profile.dir == dir));
-        let hint = (!chosen).then(|| {
-            ui::caption(format!(
-                "{} 有多个用户资料：选你登录了要下载的网站的那个，选了才生效",
-                browser.label()
-            ))
-        });
+        let hint = match (gone, saved) {
+            (Some(dir), _) => Some(format!(
+                "存着的用户资料 {} 已不在了：重选一个",
+                dir.display()
+            )),
+            (None, Some(_)) => None,
+            (None, None) => Some(format!(
+                "{} 有多个用户资料：选你登录了要下载的网站的那个，选了才生效（现在{}）",
+                browser.label(),
+                self.in_effect()
+            )),
+        };
+        let hint = hint.map(ui::caption);
         Some(
             div()
                 .flex()
@@ -406,6 +444,28 @@ impl SettingsView {
                 .children(hint)
                 .child(div().flex().flex_wrap().gap(px(8.)).children(chips)),
         )
+    }
+
+    /// 现在生效的读法，接在「现在」后面：不读，或读哪个浏览器的哪个用户资料。
+    fn in_effect(&self) -> String {
+        match &self.web.browser {
+            None => "不读".to_owned(),
+            Some(CookieSource {
+                browser,
+                profile: None,
+            }) => format!("读 {}", browser.label()),
+            Some(CookieSource {
+                browser,
+                profile: Some(dir),
+            }) => format!(
+                "读 {} 的 {}",
+                browser.label(),
+                dir.file_name().map_or_else(
+                    || dir.display().to_string(),
+                    |name| name.to_string_lossy().into_owned()
+                )
+            ),
+        }
     }
 
     /// 画质一行：兼容优先与画质优先。
@@ -451,8 +511,8 @@ pub(super) enum Listing {
 }
 
 impl Listing {
-    /// 现查 `browser`：先看读不读得了它的数据，再列用户资料。
-    pub(super) fn of(browser: Browser) -> Listing {
+    /// 现查 `browser`：先看读不读得了它的数据，再列用户资料。要读盘，不在界面线程上调。
+    fn of(browser: Browser) -> Listing {
         if browser.access().is_err() {
             return Listing::Denied;
         }

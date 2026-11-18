@@ -172,16 +172,14 @@ impl Shell {
         body.push(signals(&row.signals).into_any_element());
         let Foot { primary, rest } = self.foot(row, cx);
         let mut foot: Vec<AnyElement> = Vec::new();
-        let denied = self.tasks.read(cx).cookies_denied();
-        match (&row.task.status, denied) {
-            (Status::Failed(failure), Some(browser)) if failure.kind == FailureKind::WebCookies => {
-                foot.push(disk_access::card(browser).into_any_element());
-            }
-            _ => {
-                if let Some(hint) = look.hint {
-                    foot.push(ui::note(hint, true).into_any_element());
-                }
-            }
+        if let Some(hint) = look.hint {
+            foot.push(ui::note(hint, true).into_any_element());
+        }
+        // 读不了浏览器的数据：失败的说明里已写了怎么开权限，这里给直达的按钮
+        if matches!(&row.task.status, Status::Failed(failure) if failure.kind == FailureKind::WebCookies)
+            && self.tasks.read(cx).cookies_denied().is_some()
+        {
+            foot.extend(disk_access::button().map(IntoElement::into_any_element));
         }
         foot.extend(primary.map(IntoElement::into_any_element));
         if !rest.is_empty() {

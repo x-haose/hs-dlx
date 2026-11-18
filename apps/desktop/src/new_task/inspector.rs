@@ -120,15 +120,13 @@ impl NewTask {
         let login = needs_login && !self.from_sniff;
         let again = headers || failure.kind.retry_helps();
         let mut body = vec![ui::note(failure.message.clone(), true).into_any_element()];
-        let denied = self.tasks.read(cx).cookies_denied();
-        match denied {
-            Some(browser) if failure.kind == FailureKind::WebCookies => {
-                body.push(disk_access::card(browser).into_any_element());
-            }
-            _ if !needs_login => {
-                body.push(ui::note(format::failure(failure.kind).1, false).into_any_element());
-            }
-            _ => {}
+        if !needs_login {
+            body.push(ui::note(format::failure(failure.kind).1, false).into_any_element());
+        }
+        // 读不了浏览器的数据：失败的说明里已写了怎么开权限，这里给直达的按钮
+        if failure.kind == FailureKind::WebCookies && self.tasks.read(cx).cookies_denied().is_some()
+        {
+            body.extend(disk_access::button().map(IntoElement::into_any_element));
         }
         if let PageCheck::NotPage(note) = &self.page_check {
             body.push(ui::note(note.clone(), false).into_any_element());

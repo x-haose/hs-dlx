@@ -91,6 +91,8 @@ pub struct Tasks {
     /// 设置里选的、本进程没有权限读它的数据的浏览器（见 [`Browser::access`]）；没选或读得了时为 None。打开应用与改了
     /// 选的浏览器时查（见 [`Tasks::check_cookie_access`]）：macOS 上给了权限的进程要重开才拿得到，开着时不会变
     cookies_denied: Option<Browser>,
+    /// 在后台查 `cookies_denied`：释放即取消（再查时换掉）
+    _cookie_check: Task<()>,
     /// 收得了后打开的实例转交来的（再次打开应用会回到窗口）；macOS 上总能点程序坞回到窗口，用不到
     #[cfg(not(target_os = "macos"))]
     receives_handoffs: bool,
@@ -183,6 +185,7 @@ impl Tasks {
             free_space: None,
             pikpak: PikPak::default(),
             cookies_denied: None,
+            _cookie_check: Task::ready(()),
             #[cfg(not(target_os = "macos"))]
             receives_handoffs,
             _events: receiving,
@@ -569,7 +572,7 @@ impl Tasks {
         self.cookies_denied
     }
 
-    /// 重查设置里选的浏览器的数据读不读得了，变了时通知窗口重画；读不出设置时提示原因。
+    /// 在后台重查设置里选的浏览器的数据读不读得了，变了时通知窗口重画；读不出设置时提示原因。
     pub fn check_cookie_access(&mut self, cx: &mut Context<Self>) {
         let browser = match self.service.settings() {
             Ok(settings) => settings.web_browser.map(|source| source.browser),
@@ -581,11 +584,19 @@ impl Tasks {
                 return;
             }
         };
-        let denied = browser.filter(|browser| browser.access().is_err());
-        if denied != self.cookies_denied {
-            self.cookies_denied = denied;
-            cx.notify();
-        }
+        let checking = cx
+            .background_executor()
+            .spawn(async move { browser.filter(|browser| browser.access().is_err()) });
+        self._cookie_check = cx.spawn(async move |this, cx| {
+            let denied = checking.await;
+            // 应用在退出时不再需要结果
+            let _closed = this.update(cx, |this, cx| {
+                if denied != this.cookies_denied {
+                    this.cookies_denied = denied;
+                    cx.notify();
+                }
+            });
+        });
     }
 
     pub fn notices(&self) -> &[Notice] {

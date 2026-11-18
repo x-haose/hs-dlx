@@ -235,6 +235,9 @@ async fn cookies_a_browser_cannot_give_fail_before_any_request() {
         ExtractError::Cookies(message) => {
             let shown = format!("没找到 Whale 的用户资料 {} 的 Cookie", gone.display());
             assert!(message.starts_with(&shown), "{message}");
+            // 括号里是 yt-dlp 的原话：它在这个目录里找过
+            let searched = format!("in \"{}\"", gone.display());
+            assert!(message.contains(&searched), "{message}");
         }
         other => panic!("{other:?}"),
     }

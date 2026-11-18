@@ -180,8 +180,8 @@ impl Browser {
         self.data_dirs().iter().any(|dir| dir.is_dir())
     }
 
-    /// yt-dlp 在这个平台上找它的 Cookie 的目录（Chromium 系为用户数据目录，Firefox 为几处放配置的目录）；Safari 与
-    /// 这个平台上没有的为空。
+    /// yt-dlp 在这个平台上找它的 Cookie 的目录（Chromium 系为用户数据目录，Firefox 为几处放配置的目录，Safari 为放
+    /// Cookies.binarycookies 的两处）；这个平台上没有的为空。
     pub fn data_dirs(self) -> Vec<PathBuf> {
         let home = dirs::home_dir();
         let join = |base: Option<PathBuf>, path: &str| base.map(|base| base.join(path));
@@ -206,19 +206,25 @@ impl Browser {
                 Browser::Safari => Vec::new(),
             }
         } else if cfg!(target_os = "macos") {
-            let support = join(home, "Library/Application Support");
-            let path = match self {
-                Browser::Firefox => "Firefox/Profiles",
-                Browser::Chrome => "Google/Chrome",
-                Browser::Edge => "Microsoft Edge",
-                Browser::Brave => "BraveSoftware/Brave-Browser",
-                Browser::Chromium => "Chromium",
-                Browser::Opera => "com.operasoftware.Opera",
-                Browser::Vivaldi => "Vivaldi",
-                Browser::Whale => "Naver/Whale",
-                Browser::Safari => return Vec::new(),
-            };
-            vec![join(support, path)]
+            let support =
+                |path: &str| join(home.clone(), &format!("Library/Application Support/{path}"));
+            match self {
+                Browser::Safari => vec![
+                    join(home.clone(), "Library/Cookies"),
+                    join(
+                        home,
+                        "Library/Containers/com.apple.Safari/Data/Library/Cookies",
+                    ),
+                ],
+                Browser::Firefox => vec![support("Firefox/Profiles")],
+                Browser::Chrome => vec![support("Google/Chrome")],
+                Browser::Edge => vec![support("Microsoft Edge")],
+                Browser::Brave => vec![support("BraveSoftware/Brave-Browser")],
+                Browser::Chromium => vec![support("Chromium")],
+                Browser::Opera => vec![support("com.operasoftware.Opera")],
+                Browser::Vivaldi => vec![support("Vivaldi")],
+                Browser::Whale => vec![support("Naver/Whale")],
+            }
         } else {
             let config = dirs::config_dir();
             match self {

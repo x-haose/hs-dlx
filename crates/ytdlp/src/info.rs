@@ -25,6 +25,8 @@ pub struct Info {
     pub entries: Option<Vec<Entry>>,
     /// yt-dlp 的警告，如缺 JavaScript 运行时、部分格式取不到
     pub warnings: Vec<String>,
+    /// 从浏览器读了 Cookie 时，其中发往这个网页的（见 [`crate::Request::for_download`]）；没读浏览器时为空
+    pub site_cookies: Vec<crate::Cookie>,
 }
 
 /// 是不是直播。
@@ -182,6 +184,7 @@ pub(crate) struct Wire {
     has_drm: bool,
     entries: Option<Vec<WireEntry>>,
     warnings: Vec<String>,
+    site_cookies: Vec<crate::Cookie>,
 }
 
 #[derive(Deserialize)]
@@ -253,6 +256,7 @@ impl Wire {
                     .collect()
             }),
             warnings: self.warnings,
+            site_cookies: self.site_cookies,
         }
     }
 }
@@ -339,7 +343,7 @@ mod tests {
     fn wire_formats_translate_to_tracks_sizes_and_limits() {
         let wire: Wire = serde_json::from_value(serde_json::json!({
             "extractor": "Youtube", "id": "abc", "title": "t", "webpage_url": null, "duration": 12.5,
-            "thumbnail": null, "live_status": "was_live", "uploader": null, "has_drm": false, "entries": null, "warnings": [],
+            "thumbnail": null, "live_status": "was_live", "uploader": null, "has_drm": false, "entries": null, "warnings": [], "site_cookies": [],
             "formats": [
                 {
                     "format_id": "137", "url": "https://r.googlevideo.com/v", "protocol": "https", "ext": "mp4",

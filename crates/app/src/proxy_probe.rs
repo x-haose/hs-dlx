@@ -97,12 +97,14 @@ pub async fn identify(
     let at = format!("{bracketed}:{port}");
     let protocol = match wanted {
         // 两种都试：只说 HTTP 的端口报出是 HTTP，而不是笼统的「不是 SOCKS5」
-        ProxyWanted::Only(ProxyProtocol::Socks5) => match either(&at, login).await? {
-            ProxyProtocol::Socks5 => ProxyProtocol::Socks5,
-            ProxyProtocol::Http => return Err(ProxyProbeError::HttpOnly),
-        },
+        ProxyWanted::Only(ProxyProtocol::Socks5) => {
+            match either(&at, login, ProxyProtocol::Socks5).await? {
+                ProxyProtocol::Socks5 => ProxyProtocol::Socks5,
+                ProxyProtocol::Http => return Err(ProxyProbeError::HttpOnly),
+            }
+        }
         ProxyWanted::Only(ProxyProtocol::Http) => http(&at, login).await?,
-        ProxyWanted::Any => either(&at, login).await?,
+        ProxyWanted::Any => either(&at, login, ProxyProtocol::Http).await?,
     };
     let scheme = match protocol {
         ProxyProtocol::Socks5 => "socks5h",
@@ -120,8 +122,13 @@ pub async fn identify(
     Ok(url)
 }
 
-/// 两种同时试：SOCKS5 通了即取它，否则看 HTTP。两种都不通时报更说明问题的那个（连不上、要登录优先于不像代理）。
-async fn either(at: &str, login: Option<&ProxyLogin>) -> Result<ProxyProtocol, ProxyProbeError> {
+/// 两种同时试：SOCKS5 通了即取它，否则看 HTTP。两种都不通时报更说明问题的那个（连不上、要登录优先于不像代理），
+/// 一样有用时报 `ties` 那一种的（见 [`worse`]）。
+async fn either(
+    at: &str,
+    login: Option<&ProxyLogin>,
+    ties: ProxyProtocol,
+) -> Result<ProxyProtocol, ProxyProbeError> {
     let socks = socks5(at, login);
     let http = http(at, login);
     tokio::pin!(socks, http);
@@ -139,15 +146,16 @@ async fn either(at: &str, login: Option<&ProxyLogin>) -> Result<ProxyProtocol, P
         if let (Some(socks), Some(http)) = (&socks_failed, &http_result) {
             return match http {
                 Ok(protocol) => Ok(*protocol),
-                Err(http) => Err(worse(socks.clone(), http.clone())),
+                Err(http) => Err(worse(socks.clone(), http.clone(), ties)),
             };
         }
     }
 }
 
-/// 两种都没认出时报哪个：要登录与登录被拒说明是代理，连不上说明端口没人听，都比「不像代理」有用；一样有用时报 HTTP
-/// 的（它带着回的状态，SOCKS5 的只有「不是 SOCKS5」）。
-fn worse(socks: ProxyProbeError, http: ProxyProbeError) -> ProxyProbeError {
+/// 两种都没认出时报哪个：要登录与登录被拒说明是代理，连不上说明端口没人听，都比「不像代理」有用；一样有用时报
+/// `ties` 那一种的：哪种都行时报 HTTP 的（它带着回的状态，SOCKS5 的只有「不是 SOCKS5」），只要 SOCKS5 时报 SOCKS5 的
+/// （用户要找的是它）。
+fn worse(socks: ProxyProbeError, http: ProxyProbeError, ties: ProxyProtocol) -> ProxyProbeError {
     let rank = |error: &ProxyProbeError| match error {
         ProxyProbeError::LoginRefused => 0,
         ProxyProbeError::LoginNeeded => 1,
@@ -155,10 +163,13 @@ fn worse(socks: ProxyProbeError, http: ProxyProbeError) -> ProxyProbeError {
         ProxyProbeError::Invalid(_) | ProxyProbeError::HttpOnly => 3,
         ProxyProbeError::NotProxy(_) => 4,
     };
-    if rank(&socks) < rank(&http) {
-        socks
-    } else {
-        http
+    match rank(&socks).cmp(&rank(&http)) {
+        std::cmp::Ordering::Less => socks,
+        std::cmp::Ordering::Greater => http,
+        std::cmp::Ordering::Equal => match ties {
+            ProxyProtocol::Socks5 => socks,
+            ProxyProtocol::Http => http,
+        },
     }
 }
 
@@ -447,6 +458,19 @@ mod tests {
             identify("127.0.0.1", web, None, ProxyWanted::Any).await,
             Err(ProxyProbeError::NotProxy(format!(
                 "127.0.0.1:{web} 对 CONNECT 回了 HTTP 405：不是代理"
+            )))
+        );
+        // 只要 SOCKS5（BT）时报 SOCKS5 那一路的
+        assert_eq!(
+            identify(
+                "127.0.0.1",
+                web,
+                None,
+                ProxyWanted::Only(ProxyProtocol::Socks5)
+            )
+            .await,
+            Err(ProxyProbeError::NotProxy(format!(
+                "127.0.0.1:{web} 不是 SOCKS5 代理"
             )))
         );
         // 开过又关掉的端口：没人在听

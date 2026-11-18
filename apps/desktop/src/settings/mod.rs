@@ -225,10 +225,11 @@ impl SettingsView {
             channel: settings.web_channel,
             preference: settings.web_preference,
             shown: settings.web_browser.as_ref().map(|source| source.browser),
-            listing: settings
+            listing: None,
+            listing_task: settings
                 .web_browser
                 .as_ref()
-                .map(|source| web::Listing::of(source.browser)),
+                .map(|source| Self::list_profiles(source.browser, false, cx)),
             browser: settings.web_browser,
             browsers: tasks.read(cx).service().web_browsers(),
             latest: None,

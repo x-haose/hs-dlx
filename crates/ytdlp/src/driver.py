@@ -18,7 +18,7 @@
   - 回应 `{"id": 同请求, "ok": 结果}` 或 `{"id": 同请求, "error": {"kind": 种类, "message": 说明}}`，种类见
     `classify`；从浏览器读 Cookie 没成时种类为 `cookies`，另有 `reason`（见 `browser_cookies`）。yt-dlp 自己的输出
     都转到标准错误，标准输出只有回应（纯 ASCII 的 JSON）。
-  - 结果见 `trimmed`。
+  - 结果见 `trimmed`，另有 `site_cookies`（见 `site_cookies`）。
 - `download <site> <quickjs> <cache>`：用 yt-dlp 自己的下载器下一个格式（要模拟浏览器 TLS 指纹的、DASH 分片等应用的引擎
   下不了的）。标准输入的第一行为请求 `{"url": 网页地址, "format": 要的格式（`key_of` 的各项）,
   "dir": 输出所在的目录, "name": 输出的文件名, "proxy", "cookies", "browser", "profile"}`；标准输出先是若干行进度
@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Any, Protocol, TextIO, cast
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sized
+    from http.cookiejar import Cookie
     from types import ModuleType
 
 # yt-dlp 的解析结果：任意结构的 JSON 式字典
@@ -79,6 +80,14 @@ class CookieJar(Protocol):
 
     def get_cookie_header(self, url: str) -> str | None:
         """发往 `url` 的请求该带的 Cookie 请求头；没有时为 None。"""
+        ...
+
+
+class SiteJar(Protocol):
+    """yt-dlp 的 Cookie 罐里取发往某个网址的 Cookie 的部分。"""
+
+    def get_cookies_for_url(self, url: str) -> list[Cookie]:
+        """发往 `url` 的请求该带的各个 Cookie。"""
         ...
 
 
@@ -354,9 +363,9 @@ def browser_of(request: Mapping[str, object]) -> tuple[str, str | None] | None:
     return (browser, text(request.get("profile")))
 
 
-# 读浏览器 Cookie 时 yt-dlp 的警告里，说明整罐加密的 Cookie 都解不开的（钥匙串或密钥环没给钥匙、钥匙不对）；别的
-# 警告（某一条解不开、数据库版本较新）不影响其余的，缺的若正是要用的，网站照样回要登录
-KEYLESS = ("no key found", "MAC check failed")
+# 读浏览器 Cookie 时 yt-dlp 的警告里，说明整罐加密的 Cookie 都解不开的（没拿到钥匙）；别的警告（某一条解不开、
+# 数据库版本较新）不影响其余的，缺的若正是要用的，网站照样回要登录
+KEYLESS = ("no key found",)
 # yt-dlp 的 cookies 模块里向 macOS 钥匙串要密码的函数
 KEYCHAIN_FUNCTION = "_get_mac_keyring_password"
 # 读 Linux 密钥环出错时 yt-dlp 报的错误里的字样
@@ -369,15 +378,15 @@ def browser_cookies(
     """`ydl` 要从浏览器读 Cookie 时先读：读不出或加密的都解不开时为归了类的失败，否则为 None。
 
     yt-dlp 读一次后留着。原因：`missing`（没找到这个浏览器的 Cookie 文件）、`denied`（系统不让读，macOS 上 Safari
-    要完全磁盘访问权限）、`encrypted`（Windows 上的 Chrome 等加密成了只有它自己解得开的，DPAPI 解不开）、`locked`
-    （浏览器开着、Windows 上文件被锁）、`keychain`（macOS 钥匙串没给解开的钥匙）、`keyring`（Linux 密钥环没给钥匙或
-    读不了）、`other`。失败时把 `cookiefile` 去掉：退出 `with` 时 yt-dlp 存 cookiefile 要再取 cookiejar，会再读一遍
-    浏览器、再抛一次，盖掉这里的结果。
+    要完全磁盘访问权限）、`encrypted`（Windows 上没拿到解密的钥匙：Chrome 等加密成了只有它自己解得开的，DPAPI 解不
+    开）、`locked`（浏览器开着、Windows 上文件被锁）、`keychain`（macOS 钥匙串没给解开的钥匙）、`keyring`（Linux 密钥环
+    没给钥匙或读不了）、`other`。失败时把 `cookiefile` 去掉：退出 `with` 时 yt-dlp 存 cookiefile 要再取 cookiejar，
+    会再读一遍浏览器、再抛一次，盖掉这里的结果。
     """
     if not browser:
         return None
     before = len(logger.warnings)
-    keyring = "keychain" if sys.platform == "darwin" else "keyring"
+    keyring = {"darwin": "keychain", "win32": "encrypted"}.get(sys.platform, "keyring")
     try:
         # 第一次取 cookiejar 时读，读出的留在上面，解析与下载都用它
         len(ydl.cookiejar)
@@ -459,7 +468,8 @@ def extract(yt_dlp: ModuleType, request: Mapping[str, object], quickjs: str, cac
     logger = Logger()
     options = params(request, quickjs, cache, logger)
     with yt_dlp.YoutubeDL(options) as ydl:
-        failed = browser_cookies(yt_dlp, ydl, browser_of(request), logger)
+        browser = browser_of(request)
+        failed = browser_cookies(yt_dlp, ydl, browser, logger)
         if failed is not None:
             return failed
         try:
@@ -468,7 +478,29 @@ def extract(yt_dlp: ModuleType, request: Mapping[str, object], quickjs: str, cac
             kind, message = classify(error)
             return {"error": {"kind": kind, "message": message}}
         sanitized = yt_dlp.YoutubeDL.sanitize_info(info)
-        return {"ok": trimmed(sanitized, ydl.cookiejar, logger.warnings)}
+        result = trimmed(sanitized, ydl.cookiejar, logger.warnings)
+        result["site_cookies"] = site_cookies(ydl.cookiejar, url) if browser else []
+        return {"ok": result}
+
+
+def site_cookies(jar: SiteJar, url: str) -> list[Info]:
+    """罐里发往 `url` 的 Cookie，各项同应用的 Cookie（Netscape cookies.txt 的各列）。
+
+    从浏览器读过 Cookie 时交给应用：交回 yt-dlp 下载时带上它们，不再读浏览器（读 Chromium 系的要钥匙串授权，每个下载
+    进程都会再弹一次）。
+    """
+    return [
+        {
+            "domain": cookie.domain,
+            "include_subdomains": cookie.domain.startswith("."),
+            "path": cookie.path,
+            "secure": bool(cookie.secure),
+            "expires": cookie.expires,
+            "name": cookie.name,
+            "value": cookie.value or "",
+        }
+        for cookie in jar.get_cookies_for_url(url)
+    ]
 
 
 def serve(site: str, quickjs: str, cache: str, requests: TextIO, replies: TextIO) -> None:

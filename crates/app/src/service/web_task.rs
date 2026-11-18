@@ -369,7 +369,7 @@ impl Shared {
                     total,
                     received,
                 };
-                match self.fetch_part(ctx, at, lane, format, file).await {
+                match self.fetch_part(ctx, at, lane, &info, format, file).await {
                     Ok(read) => {
                         received += read;
                         break;
@@ -392,13 +392,15 @@ impl Shared {
         Ok(())
     }
 
-    /// 下一路 `lane`（这次解析里认出的格式为 `format`）到 `file`（这一路下完时由核心或 yt-dlp 装上），返回这次从网络
-    /// 读到的字节数（交回 yt-dlp 下时按它报的已下字节、减去开始时已有的算）。
+    /// 下一路 `lane`（这次解析的结果 `info` 里认出的格式为 `format`）到 `file`（这一路下完时由核心或 yt-dlp 装上），
+    /// 返回这次从网络读到的字节数（交回 yt-dlp 下时按它报的已下字节、减去开始时已有的算；它带这次解析从浏览器读到的
+    /// Cookie，不再读浏览器）。
     async fn fetch_part(
         &self,
         ctx: Ctx<'_>,
         at: Position,
         lane: &Lane<'_>,
+        info: &Info,
         format: &Format,
         file: &Path,
     ) -> Result<u64, Stop> {
@@ -415,9 +417,10 @@ impl Shared {
             Route::YtDlp => {
                 // yt-dlp 报的已下字节含 `.part` 里原有的：以第一次报的为起点
                 let read = Mutex::new(None::<(u64, u64)>);
+                let request = ctx.request.for_download(info);
                 ctx.extractor
                     .download(
-                        ctx.request,
+                        &request,
                         lane.key,
                         file,
                         ctx.proxy,
