@@ -359,9 +359,9 @@ def test_hls_that_needs_more_than_the_playlist_is_marked(
         "id": "x",
         "title": "t",
         "formats": [
-            {**hls, "format_id": "plain", "tbr": 1},
-            {**hls, "format_id": "keyed", "tbr": 2, "hls_aes": {"key": "0x" + "00" * 16}},
-            # 最后选中的格式：yt-dlp 把它的字段并进视频
+            # 排在最差的：`format: all` 由好到差选，最后选中它，yt-dlp 把它的字段并进视频
+            {**hls, "format_id": "keyed", "tbr": 1, "hls_aes": {"key": "0x" + "00" * 16}},
+            {**hls, "format_id": "plain", "tbr": 2},
             {**hls, "format_id": "listed", "tbr": 3, "hls_media_playlist_data": "#EXTM3U\n"},
         ],
     }
@@ -472,6 +472,16 @@ def login_after_reset() -> None:
         raise utils.ExtractorError(message, expected=True) from None
 
 
+def missing_field_after_reset() -> None:
+    """解析器在处理一次被掐断时取不到字段：抛出的 KeyError 的 `__context__` 是那次被掐断。"""
+    networking = importlib.import_module("yt_dlp.networking")
+    try:
+        reset_by_peer()
+    except networking.exceptions.TransportError:
+        fields: dict[str, str] = {}
+        fields["data"]
+
+
 def unavailable(cause: OSError) -> BaseException:
     """yt-dlp 写文件失败时抛的 UnavailableVideoError（引起它的错误在 `__context__` 里）。"""
     utils = importlib.import_module("yt_dlp.utils")
@@ -515,6 +525,10 @@ def test_failures_are_classified_by_what_the_site_said_and_where_they_happened()
     with pytest.raises(utils.ExtractorError) as login:
         login_after_reset()
     assert driver.classify(report_error(login.value))[0] == "login"
+    # 解析器没包住的错误由 yt-dlp 包成 ExtractorError（原来的在 `cause`）
+    with pytest.raises(KeyError) as missing:
+        missing_field_after_reset()
+    assert driver.classify(report_error(utils.ExtractorError("x", cause=missing.value)))[0] == "other"
     # 证书不受信任不算被掐断
     untrusted = networking.exceptions.CertificateVerifyError(cause=ssl.SSLCertVerificationError("bad"))
     assert driver.classify(report_error(utils.ExtractorError("x", cause=untrusted)))[0] == "network"

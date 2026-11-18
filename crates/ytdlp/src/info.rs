@@ -25,7 +25,7 @@ pub struct Info {
     pub entries: Option<Vec<Entry>>,
     /// yt-dlp 的警告，如缺 JavaScript 运行时、部分格式取不到
     pub warnings: Vec<String>,
-    /// 罐里属于这个网站（网页的可注册域名及其子域）的 Cookie：请求里给的，与从浏览器读的（读了时）；见
+    /// 罐里属于这个网站（网页的可注册域名及其子域）的 Cookie：请求里给的、从浏览器读的（读了时）与解析时网站设下的；见
     /// [`crate::Request::for_download`]
     pub site_cookies: Vec<crate::Cookie>,
 }
@@ -114,8 +114,8 @@ pub struct Format {
     pub drm_maybe: bool,
     /// 要模拟浏览器的 TLS 指纹才下得了
     pub impersonate: bool,
-    /// HLS 下载要播放列表地址、请求头与 Cookie 之外的东西：网站另给的密钥、每个分片或密钥的地址要加的参数、直接给的
-    /// 播放列表内容；只有 yt-dlp 自己的 HLS 下载器认得
+    /// 格式或视频带着 yt-dlp 的 HLS 下载器另外认的字段：网站另给的密钥、每个分片或密钥的地址要加的参数、直接给的播放
+    /// 列表内容；对 HLS 格式即下载要播放列表地址、请求头与 Cookie 之外的东西，别的协议不看它
     pub hls_extras: bool,
 }
 

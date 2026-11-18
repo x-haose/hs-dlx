@@ -230,6 +230,7 @@ class HlsExtrasSeen:
     """yt-dlp 的 `match_filter`：记下自己（不算格式）带着 `HLS_EXTRAS` 里的字段的视频的编号，不拦下任何视频。
 
     yt-dlp 在选格式之前对每个视频调它；选完后把最后选中的格式的字段并进视频，返回的结果里分不出哪些是视频自己的。
+    前提是参数里没设 yt-dlp 在它之前判的过滤（下载存档、标题、日期、观看数、年龄）：被那些滤掉的视频不调它。
     """
 
     def __init__(self) -> None:
@@ -347,9 +348,9 @@ def status_kind(status: object, *, downloading: bool) -> str:
 def cut_off(root: BaseException) -> bool:
     """`root` 是不是连上之后被对方掐断：连接被重置，或 TLS 读到一半对方断开（握手时被掐也是这样）。
 
-    沿 `cause`（yt-dlp）与 `__cause__` 找；yt-dlp 之外的异常另沿 `__context__`、`reason`（urllib3 的 MaxRetryError）与
-    `args` 找：requests 包 urllib3 的错误时不用 `from`，原来的只在那里。yt-dlp 自己的错误不沿 `__context__` 找：解析器
-    在处理一次被掐断时另抛的（如要登录）不算被掐断。证书不受信任、协议版本不合等别的 TLS 错误不算。
+    沿 `cause`（yt-dlp）与 `__cause__` 找；yt-dlp 之外的异常另沿 `reason`（urllib3 的 MaxRetryError）与 `args` 找：
+    requests 包 urllib3 的错误时不用 `from`，原来的只在 `args` 里。不沿 `__context__` 找：解析器在处理一次被掐断时
+    另抛的（要登录、取不到字段的 KeyError 等）不算被掐断。证书不受信任、协议版本不合等别的 TLS 错误不算。
     """
     pending: list[object] = [root]
     seen: set[int] = set()
@@ -364,7 +365,7 @@ def cut_off(root: BaseException) -> bool:
             return True
         pending.extend((getattr(error, "cause", None), error.__cause__))
         if "YoutubeDLError" not in lineage(error):
-            pending.extend((error.__context__, getattr(error, "reason", None), *error.args))
+            pending.extend((getattr(error, "reason", None), *error.args))
     return False
 
 
@@ -548,9 +549,9 @@ def extract(
 def site_cookies(jar: Iterable[Cookie], site: str) -> list[Info]:
     """罐里属于网站 `site`（可注册域名，含各个子域）的 Cookie，各项同应用的 Cookie（Netscape cookies.txt 的各列）。
 
-    罐里有请求给的与从浏览器读的（读了时）。交回 yt-dlp 下载时它要重新解析网页，带上它们就不再读浏览器（读 Chromium
-    系的要钥匙串授权，每个下载进程都会再弹一次）。不按路径与 secure 筛：解析时请求的接口常在别的子域与路径下（B 站的
-    api.bilibili.com）。别的网站的不交出去。
+    罐里有请求给的、从浏览器读的（读了时）与解析时网站设下的。交回 yt-dlp 下载时它要重新解析网页，带上它们就不再读
+    浏览器（读 Chromium 系的要钥匙串授权，每个下载进程都会再弹一次）。不按路径与 secure 筛：解析时请求的接口常在别的
+    子域与路径下（B 站的 api.bilibili.com）。别的网站的不交出去。
     """
     return [
         {

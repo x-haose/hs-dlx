@@ -1,6 +1,7 @@
 //! 网页视频（yt-dlp 解析出的）的画质选项：每档清晰度挑一个视频、配一条音轨，另有只要音频的；每一路定下由谁下载。
 
 use hs_dlx_ytdlp::{Format, FormatKey, Info, Protocol, Size, Track};
+use hs_m3u8_core::Url;
 
 /// 视频的编码。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,8 +85,9 @@ impl AudioCodec {
 pub enum Route {
     /// 自己的引擎：http(s) 文件走分段下载，HLS 走 HLS 引擎
     Own,
-    /// 交回 yt-dlp 自己下：要模拟浏览器 TLS 指纹的、可能有 DRM 的（yt-dlp 会试）、HLS 要另给密钥或参数的（见
-    /// [`Format::hls_extras`]）、DASH 分片与其余 yt-dlp 能下而我们没有引擎的协议
+    /// 交回 yt-dlp 自己下：要模拟浏览器 TLS 指纹的、可能有 DRM 的（yt-dlp 会试）、地址不是 http(s) 的（如解析器只给了
+    /// 播放列表内容时的 `data:` 地址）、HLS 要另给密钥或参数的（见 [`Format::hls_extras`]）、DASH 分片与其余 yt-dlp
+    /// 能下而我们没有引擎的协议
     YtDlp,
     /// 这一版下不了：原因
     Unsupported(&'static str),
@@ -100,10 +102,16 @@ pub fn route(format: &Format) -> Route {
         Protocol::Other(protocol) if protocol.starts_with("rtmp") => {
             Route::Unsupported("RTMP 这一版还不支持")
         }
-        Protocol::Http if !format.impersonate => Route::Own,
-        Protocol::Hls if !format.impersonate && !format.hls_extras => Route::Own,
+        _ if format.impersonate || !web_address(&format.url) => Route::YtDlp,
+        Protocol::Http => Route::Own,
+        Protocol::Hls if !format.hls_extras => Route::Own,
         _ => Route::YtDlp,
     }
+}
+
+/// `url` 是不是 http(s) 地址：自己的两个引擎只认这两种。
+fn web_address(url: &str) -> bool {
+    Url::parse(url).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
 }
 
 /// 输出的容器：两路时合并成它，一路时转封装成它（交回 yt-dlp 下的 HLS 写出的是各分片接起来的）或保持原样。
@@ -312,15 +320,9 @@ fn choice_of(main: &Format, audio: Option<&Format>) -> Choice {
                 (Container::Matroska, "mkv".to_owned())
             }
         }
-        // 自己的 HLS 引擎写的是 MP4；yt-dlp 给 HLS 的扩展名可能是 `m3u8`。交回 yt-dlp 下的 HLS 写出的是各分片接起来的
-        // （多为 TS），下完再转封装成 MP4
-        None if main.protocol == Protocol::Hls => {
-            if route(main) == Route::Own {
-                (Container::Original, "mp4".to_owned())
-            } else {
-                (Container::Mp4, "mp4".to_owned())
-            }
-        }
+        // HLS 下完的内容随下载方式不同：自己的引擎写 MP4，交回 yt-dlp 的是各分片接起来的（多为 TS）；下载方式每次运行
+        // 按重新解析的结果定，建任务时定不下来，所以一律转封装成 MP4（yt-dlp 给 HLS 的扩展名可能是 `m3u8`）
+        None if main.protocol == Protocol::Hls => (Container::Mp4, "mp4".to_owned()),
         None => (
             Container::Original,
             main.ext.clone().unwrap_or_else(|| "bin".to_owned()),
@@ -517,12 +519,20 @@ mod tests {
         assert_eq!(route(&own), Route::Own);
         own.protocol = Protocol::Hls;
         assert_eq!(route(&own), Route::Own);
+        // 单路 HLS 不管谁下都转封装：下载方式每次运行重新定
+        assert_eq!(
+            choices(&info(vec![own.clone()]), Preference::Compatible)[0].container,
+            Container::Mp4
+        );
         own.impersonate = true;
         assert_eq!(route(&own), Route::YtDlp);
         own.impersonate = false;
         own.hls_extras = true;
         assert_eq!(route(&own), Route::YtDlp);
         own.hls_extras = false;
+        own.url = "data:application/x-mpegurl;base64,I0VYVE0zVQ==".to_owned();
+        assert_eq!(route(&own), Route::YtDlp);
+        own.url = "https://e.test/v".to_owned();
         own.protocol = Protocol::Dash;
         assert_eq!(route(&own), Route::YtDlp);
         own.protocol = Protocol::Other("rtmp".to_owned());

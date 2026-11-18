@@ -65,7 +65,8 @@ pub struct Request {
 
 impl Request {
     /// 交回 yt-dlp 下载时用的请求：要从浏览器读的，不再读浏览器，改带那次解析时罐里属于这个网站的 Cookie（`info` 的
-    /// [`Info::site_cookies`]，含请求里给的；只有通用解析器认得、没读浏览器时就是请求里给的）；不读浏览器的原样。
+    /// [`Info::site_cookies`]，含请求里给的与解析时网站设下的；只有通用解析器认得、没读浏览器时没有从浏览器读的）；不读
+    /// 浏览器的原样。
     pub fn for_download(&self, info: &Info) -> Request {
         if self.browser.is_none() {
             return self.clone();
