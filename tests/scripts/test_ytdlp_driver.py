@@ -7,6 +7,7 @@ import importlib
 import importlib.metadata
 import io
 import json
+import ssl
 import sys
 import threading
 from functools import partial
@@ -378,6 +379,14 @@ def test_failures_are_classified_by_what_the_site_said_and_where_they_happened()
         downloading = "rate_limited" if status == driver.TOO_MANY_REQUESTS else "network"
         assert driver.classify(report_error(cause), downloading=True)[0] == downloading, status
     assert driver.classify(report_error(utils.ContentTooShortError(1, 2)))[0] == "network"
+    # 连上后被掐断（TLS 读到一半没了、连接被重置）单列；证书不受信任不算
+    exceptions = networking.exceptions
+    eof = exceptions.SSLError(cause=ssl.SSLEOFError(8, "EOF occurred in violation of protocol"))
+    assert driver.classify(report_error(utils.ExtractorError("x", cause=eof)))[0] == "reset"
+    reset = exceptions.TransportError(cause=ConnectionResetError(54, "Connection reset by peer"))
+    assert driver.classify(report_error(utils.ExtractorError("x", cause=reset)))[0] == "reset"
+    untrusted = exceptions.CertificateVerifyError(cause=ssl.SSLCertVerificationError("bad"))
+    assert driver.classify(report_error(utils.ExtractorError("x", cause=untrusted)))[0] == "network"
     full = OSError(28, "No space left on device")
     assert driver.classify(report_error(full))[0] == "disk"
     assert driver.classify(unavailable(full))[0] == "disk"

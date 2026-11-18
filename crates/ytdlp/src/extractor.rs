@@ -356,7 +356,9 @@ impl Extractor {
         self.idle.lock().expect("锁里不会 panic").push_back(worker);
         match (parsed.ok, parsed.error) {
             (Some(wire), None) => Ok(wire.into_info()),
-            (None, Some(failure)) => Err(failure.into_error(request.browser.as_ref())),
+            (None, Some(failure)) => {
+                Err(failure.into_error(request.browser.as_ref(), proxy.is_empty()))
+            }
             _ => Err(ExtractError::Crashed(
                 "回应里结果与失败不是恰好一个".to_owned(),
             )),
@@ -513,7 +515,7 @@ impl Extractor {
                 }
                 Ok(DownloadReply::Ok { .. }) => break Ok(()),
                 Ok(DownloadReply::Error { error }) => {
-                    break Err(error.into_error(request.browser.as_ref()));
+                    break Err(error.into_error(request.browser.as_ref(), proxy.is_empty()));
                 }
                 Err(error) => {
                     break Err(ExtractError::Crashed(with_stderr(
@@ -692,8 +694,9 @@ struct Failure {
 }
 
 impl Failure {
-    /// `source` 为请求里读 Cookie 的浏览器与用户资料（`cookies` 的说明里写它们）。
-    fn into_error(self, source: Option<&CookieSource>) -> ExtractError {
+    /// `source` 为请求里读 Cookie 的浏览器与用户资料（`cookies` 的说明里写它们），`direct` 为没走代理（`reset` 的
+    /// 说明按它写怎么办）。
+    fn into_error(self, source: Option<&CookieSource>, direct: bool) -> ExtractError {
         let browser = source.map(|source| source.browser);
         let message = self.message;
         match self.kind.as_str() {
@@ -714,6 +717,13 @@ impl Failure {
             "rate_limited" => ExtractError::RateLimited(message),
             "blocked" => ExtractError::Blocked(message),
             "network" => ExtractError::Network(message),
+            // 连上后被掐断：直连时多为网站在本地网络被拦，走代理时多为这个出口被网站拦了
+            "reset" if direct => ExtractError::Network(format!(
+                "直连时连接被掐断，多为这个网站在本地网络被拦：改走代理再试（{message}）"
+            )),
+            "reset" => ExtractError::Network(format!(
+                "经代理时连接被掐断：代理的出口可能被这个网站拦了，换个节点或改直连再试（{message}）"
+            )),
             "unavailable" => ExtractError::Unavailable(message),
             "changed" => ExtractError::Changed(message),
             "disk" => ExtractError::Disk(message),
@@ -837,6 +847,20 @@ mod tests {
             ..request
         };
         assert_eq!(plain.for_download(&info), plain);
+    }
+
+    /// 连上后被掐断：直连时说改走代理，走代理时说换节点。
+    #[test]
+    fn a_cut_off_connection_says_what_to_change_by_the_route() {
+        let reset = || Failure {
+            kind: "reset".to_owned(),
+            message: "SSLError".to_owned(),
+            reason: None,
+        };
+        let direct = reset().into_error(None, true).to_string();
+        assert!(direct.contains("改走代理"), "{direct}");
+        let proxied = reset().into_error(None, false).to_string();
+        assert!(proxied.contains("换个节点"), "{proxied}");
     }
 
     #[test]

@@ -281,8 +281,9 @@ def classify(error: BaseException, *, downloading: bool = False) -> tuple[str, s
     """yt-dlp 的失败归类：种类与说明。
 
     种类：`unsupported`（没有专门的解析器认得这个网址）、`geo`（地区限制）、`login`（要登录或 Cookie）、
-    `rate_limited`（429）、`blocked`（网站拦下了这个出口）、`network`（连不上、超时、TLS；下载时服务器回的错误状态与
-    没下完整）、`disk`（下载时写不了文件）、`unavailable`（网站说视频不可用：私密、删了、未开播等）、`other`（其余，
+    `rate_limited`（429）、`blocked`（网站拦下了这个出口）、`reset`（连上后被掐断：TLS 握手或读到一半连接没了、被
+    重置，证书不受信任不算；直连时多为网站在本地网络被拦）、`network`（其余连不上、超时、TLS；下载时服务器回的错误
+    状态与没下完整）、`disk`（下载时写不了文件）、`unavailable`（网站说视频不可用：私密、删了、未开播等）、`other`（其余，
     多为网站改了、yt-dlp 要更新）。
     网站回的错误状态：429 为限流；解析时请求网页与接口回的 401 为要登录，403、412 为拦截（`blocked`：多为出口 IP 被
     风控，如 B 站对境外代理回 412；换直连或别的出口、登录后再试），404、410 为不可用；其余（5xx 等，与 `downloading` 时
@@ -298,21 +299,50 @@ def classify(error: BaseException, *, downloading: bool = False) -> tuple[str, s
         kind = "unsupported"
     elif "GeoRestrictedError" in names:
         kind = "geo"
-    elif status == TOO_MANY_REQUESTS:
-        kind = "rate_limited"
-    elif status == UNAUTHORIZED and not downloading:
-        kind = "login"
-    elif status in BLOCKED and not downloading:
-        kind = "blocked"
-    elif status in GONE and not downloading:
-        kind = "unavailable"
-    elif status is not None or "TransportError" in causes or "ContentTooShortError" in names:
+    elif status is not None:
+        kind = status_kind(status, downloading=downloading)
+    elif cut_off(root):
+        kind = "reset"
+    elif "TransportError" in causes or "ContentTooShortError" in names:
         kind = "network"
     elif isinstance(original, OSError):
         kind = "disk"
     elif "ExtractorError" in names and getattr(original, "expected", False) is True:
         kind = said(message)
     return kind, message
+
+
+def status_kind(status: object, *, downloading: bool) -> str:
+    """网站回的错误状态 `status` 的种类（见 `classify`）。"""
+    if status == TOO_MANY_REQUESTS:
+        return "rate_limited"
+    if downloading:
+        return "network"
+    if status == UNAUTHORIZED:
+        return "login"
+    if status in BLOCKED:
+        return "blocked"
+    if status in GONE:
+        return "unavailable"
+    return "network"
+
+
+def cut_off(root: BaseException) -> bool:
+    """`root` 是不是连上之后被对方掐断。
+
+    yt-dlp 的 SSLError（证书校验失败的 CertificateVerifyError 除外），或沿 `cause`、`__cause__` 找得到
+    ConnectionResetError。
+    """
+    if "SSLError" in lineage(root) and "CertificateVerifyError" not in lineage(root):
+        return True
+    seen: set[int] = set()
+    error: object = root
+    while isinstance(error, BaseException) and id(error) not in seen:
+        if isinstance(error, ConnectionResetError):
+            return True
+        seen.add(id(error))
+        error = getattr(error, "cause", None) or error.__cause__
+    return False
 
 
 def said(message: str) -> str:
