@@ -5,6 +5,7 @@
 mod backdrop;
 mod clock;
 mod dial;
+mod disk_access;
 mod dock;
 mod format;
 mod headers;

@@ -33,6 +33,7 @@ use crate::dock::Dock;
 use crate::format;
 use crate::headers::HeadersEditor;
 use crate::route::Route;
+use crate::tasks::Tasks;
 use crate::ui::{self, GAP, INSPECTOR_MIN_WIDTH};
 
 /// 新建页的最小宽：整个同心环区域与收到最窄的检查面板（放得下一行「MP4 · 本地 HLS · 两者」三个选项）。
@@ -196,6 +197,8 @@ fn torrent_title(url: &Url) -> String {
 }
 
 pub struct NewTask {
+    /// 任务列表：读设置里选的浏览器能不能读（见 [`Tasks::cookies_denied`]）
+    tasks: Entity<Tasks>,
     service: Rc<Service>,
     url: Url,
     /// 任务的标题，开始时与已有的重名会加编号
@@ -244,16 +247,19 @@ pub struct NewTask {
 impl EventEmitter<NewTaskEvent> for NewTask {}
 
 impl NewTask {
-    /// 打开 `link` 的新建页；`from_sniff` 为从嗅探页来的，`dock` 为放在舞台底部的粘贴栏。
+    /// 打开 `link` 的新建页，保存到任务列表的默认目录；`from_sniff` 为从嗅探页来的，`dock` 为放在舞台底部的粘贴栏。
     pub fn new(
-        service: Rc<Service>,
+        tasks: Entity<Tasks>,
         link: Link,
         from_sniff: bool,
-        folder: PathBuf,
         dock: Entity<Dock>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let (service, folder) = {
+            let tasks = tasks.read(cx);
+            (tasks.service().clone(), tasks.folder().clone())
+        };
         let Link {
             url,
             title: page_title,
@@ -284,6 +290,7 @@ impl NewTask {
             task_title(&url, page_title.as_deref())
         };
         let mut view = NewTask {
+            tasks,
             service,
             title,
             page_title,

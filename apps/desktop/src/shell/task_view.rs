@@ -9,7 +9,7 @@ use gpui_kit::{
     linear_color_stop, linear_gradient, px,
 };
 use hs_dlx_app::web::Container;
-use hs_dlx_app::{Check, TaskId};
+use hs_dlx_app::{Check, FailureKind, TaskId};
 use hs_dlx_app::{Status, TorrentPhase};
 use hs_m3u8_core::bare_url;
 
@@ -19,7 +19,7 @@ use super::{Shell, live_view};
 use crate::signals::{Level, Signal};
 use crate::tasks::{Amount, Disk, FileAmount, Row, main_output, resume_label, saved_as};
 use crate::ui::{self, GAP, INSPECTOR_MIN_WIDTH, Solid, Tone};
-use crate::{dial, format, motion, ring, theme};
+use crate::{dial, disk_access, format, motion, ring, theme};
 
 /// 在系统的文件管理器里显示输出：各平台的叫法。
 const REVEAL: &str = if cfg!(target_os = "macos") {
@@ -172,8 +172,16 @@ impl Shell {
         body.push(signals(&row.signals).into_any_element());
         let Foot { primary, rest } = self.foot(row, cx);
         let mut foot: Vec<AnyElement> = Vec::new();
-        if let Some(hint) = look.hint {
-            foot.push(ui::note(hint, true).into_any_element());
+        let denied = self.tasks.read(cx).cookies_denied();
+        match (&row.task.status, denied) {
+            (Status::Failed(failure), Some(browser)) if failure.kind == FailureKind::WebCookies => {
+                foot.push(disk_access::card(browser).into_any_element());
+            }
+            _ => {
+                if let Some(hint) = look.hint {
+                    foot.push(ui::note(hint, true).into_any_element());
+                }
+            }
         }
         foot.extend(primary.map(IntoElement::into_any_element));
         if !rest.is_empty() {

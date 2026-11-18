@@ -52,10 +52,8 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let tasks = self.tasks.read(cx);
-        let (service, folder) = (tasks.service().clone(), tasks.folder().clone());
-        let dock = self.dock.clone();
-        let view = cx.new(|cx| NewTask::new(service, link, from_sniff, folder, dock, window, cx));
+        let (tasks, dock) = (self.tasks.clone(), self.dock.clone());
+        let view = cx.new(|cx| NewTask::new(tasks, link, from_sniff, dock, window, cx));
         let subscription = cx.subscribe_in(
             &view,
             window,

@@ -109,7 +109,7 @@ impl Browser {
         let name = self.label();
         if cfg!(target_os = "macos") {
             format!(
-                "macOS 不让 hs-dlx 读 {name} 的数据：到「系统设置 → 隐私与安全性 → 完全磁盘访问权限」里打开 hs-dlx，重开 hs-dlx 后再试"
+                "macOS 不让 hs-dlx 读 {name} 的数据：在「系统设置 → 隐私与安全性 → 完全磁盘访问权限」里打开 hs-dlx（列表里没有时点「+」加上）"
             )
         } else {
             format!("没有权限读 {name} 的数据目录")

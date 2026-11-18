@@ -226,7 +226,6 @@ impl SettingsView {
             preference: settings.web_preference,
             browser: settings.web_browser,
             browsers: tasks.read(cx).service().web_browsers(),
-            denied: web::denial(settings.web_browser),
             latest: None,
             checking: None,
             previous: tasks.read(cx).service().web_previous(),

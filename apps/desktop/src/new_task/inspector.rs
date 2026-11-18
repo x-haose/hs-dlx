@@ -15,6 +15,7 @@ use super::{NewTask, NewTaskEvent, PageCheck, Probing, Route, TorrentChoice, dur
 
 /// 磁力链接取种子信息多久还没有节点时提示去检测网络。
 const NO_PEERS_HINT: std::time::Duration = std::time::Duration::from_secs(60);
+use crate::disk_access;
 use crate::format;
 use crate::theme;
 use crate::ui::{self, Solid, Step, Tone};
@@ -119,8 +120,15 @@ impl NewTask {
         let login = needs_login && !self.from_sniff;
         let again = headers || failure.kind.retry_helps();
         let mut body = vec![ui::note(failure.message.clone(), true).into_any_element()];
-        if !needs_login {
-            body.push(ui::note(format::failure(failure.kind).1, false).into_any_element());
+        let denied = self.tasks.read(cx).cookies_denied();
+        match denied {
+            Some(browser) if failure.kind == FailureKind::WebCookies => {
+                body.push(disk_access::card(browser).into_any_element());
+            }
+            _ if !needs_login => {
+                body.push(ui::note(format::failure(failure.kind).1, false).into_any_element());
+            }
+            _ => {}
         }
         if let PageCheck::NotPage(note) = &self.page_check {
             body.push(ui::note(note.clone(), false).into_any_element());
