@@ -324,9 +324,9 @@ def status_kind(status: object, *, downloading: bool) -> str:
 def cut_off(root: BaseException) -> bool:
     """`root` 是不是连上之后被对方掐断：连接被重置，或 TLS 读到一半对方断开（握手时被掐也是这样）。
 
-    沿 `cause`（yt-dlp）、`__cause__`、`__context__`、`reason`（urllib3 的 MaxRetryError）与 `args` 里的异常找：
-    requests 包 urllib3 的错误时不用 `from`，原来的只在 `__context__` 与 `args` 里。证书不受信任、协议版本不合等别的
-    TLS 错误不算。
+    沿 `cause`（yt-dlp）与 `__cause__` 找；yt-dlp 之外的异常另沿 `__context__`、`reason`（urllib3 的 MaxRetryError）与
+    `args` 找：requests 包 urllib3 的错误时不用 `from`，原来的只在那里。yt-dlp 自己的错误不沿 `__context__` 找：解析器
+    在处理一次被掐断时另抛的（如要登录）不算被掐断。证书不受信任、协议版本不合等别的 TLS 错误不算。
     """
     pending: list[object] = [root]
     seen: set[int] = set()
@@ -339,10 +339,9 @@ def cut_off(root: BaseException) -> bool:
             return True
         if any(mark in str(error).lower() for mark in CUT_OFF):
             return True
-        pending.extend(
-            (getattr(error, "cause", None), error.__cause__, error.__context__, getattr(error, "reason", None))
-        )
-        pending.extend(error.args)
+        pending.extend((getattr(error, "cause", None), error.__cause__))
+        if "YoutubeDLError" not in lineage(error):
+            pending.extend((error.__context__, getattr(error, "reason", None), *error.args))
     return False
 
 
@@ -518,15 +517,15 @@ def extract(
         sanitized = yt_dlp.YoutubeDL.sanitize_info(info)
         result = trimmed(sanitized, ydl.cookiejar, logger.warnings)
         site = text(request.get("site")) or ""
-        result["site_cookies"] = site_cookies(cast("Iterable[Cookie]", ydl.cookiejar), site) if browser else []
+        result["site_cookies"] = site_cookies(cast("Iterable[Cookie]", ydl.cookiejar), site)
         return {"ok": result}
 
 
 def site_cookies(jar: Iterable[Cookie], site: str) -> list[Info]:
     """罐里属于网站 `site`（可注册域名，含各个子域）的 Cookie，各项同应用的 Cookie（Netscape cookies.txt 的各列）。
 
-    从浏览器读过 Cookie 时交给应用：交回 yt-dlp 下载时它要重新解析网页，带上它们就不再读浏览器（读 Chromium 系的要
-    钥匙串授权，每个下载进程都会再弹一次）。不按路径与 secure 筛：解析时请求的接口常在别的子域与路径下（B 站的
+    罐里有请求给的与从浏览器读的（读了时）。交回 yt-dlp 下载时它要重新解析网页，带上它们就不再读浏览器（读 Chromium
+    系的要钥匙串授权，每个下载进程都会再弹一次）。不按路径与 secure 筛：解析时请求的接口常在别的子域与路径下（B 站的
     api.bilibili.com）。别的网站的不交出去。
     """
     return [

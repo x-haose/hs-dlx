@@ -205,9 +205,22 @@ def test_cookies_the_browser_cannot_give_fail_before_the_page_is_asked(
     error = driver.mapping(reply["error"]) or {}
     assert (error["kind"], error["reason"]) == ("cookies", "missing")
 
-    # 只有通用解析器认得的网址不读浏览器的 Cookie：照常解析出本地网页
-    [reply] = serve([{**request, "url": f"{site}/video.html", "generic": True}], tmp_path)
-    assert "ok" in reply
+    # 只有通用解析器认得的网址不读浏览器的 Cookie：照常解析出本地网页；交回的仍有请求给的（交回 yt-dlp 下载时用）
+    given = "# Netscape HTTP Cookie File\n127.0.0.1\tFALSE\t/\tFALSE\t0\tsession\tabc\n"
+    generic = {**request, "url": f"{site}/video.html", "generic": True, "cookies": given, "site": "127.0.0.1"}
+    [reply] = serve([generic], tmp_path)
+    info = driver.mapping(reply["ok"]) or {}
+    assert [driver.mapping(cookie) for cookie in driver.items(info["site_cookies"])] == [
+        {
+            "domain": "127.0.0.1",
+            "include_subdomains": False,
+            "path": "/",
+            "secure": False,
+            "expires": None,
+            "name": "session",
+            "value": "abc",
+        }
+    ]
 
     # 加密的都解不开（钥匙串没给钥匙时 yt-dlp 只警告、跳过）：没读成；读的是请求里指定的用户资料
     cookies = importlib.import_module("yt_dlp.cookies")
@@ -310,13 +323,16 @@ def test_a_connection_cut_off_after_it_was_made_is_told_apart(scheme: str, how: 
     yt_dlp = importlib.import_module("yt_dlp")
     utils = importlib.import_module("yt_dlp.utils")
     port = answer_once(how)
-    with yt_dlp.YoutubeDL({"quiet": True, "retries": 0}) as ydl:
+    # 不走本机的系统代理（同应用）
+    with yt_dlp.YoutubeDL({"quiet": True, "retries": 0, "proxy": ""}) as ydl:
         try:
             ydl.urlopen(f"{scheme}://127.0.0.1:{port}/")
         except utils.YoutubeDLError as error:
             refused = error
         else:
             pytest.fail("连接被掐断却拿到了回应")
+    # 经的是 requests 处理器（应用装的也是它）：错误包着 requests 的异常
+    assert type(getattr(refused, "cause", None)).__module__.startswith("requests")
     assert driver.classify(report_error(utils.ExtractorError("x", cause=refused)))[0] == kind
 
 
@@ -405,6 +421,23 @@ def report_error(error: BaseException) -> BaseException:
     return wrapped
 
 
+def reset_by_peer() -> None:
+    """yt-dlp 的请求处理器在连接被重置时抛的错误。"""
+    networking = importlib.import_module("yt_dlp.networking")
+    raise networking.exceptions.TransportError(cause=ConnectionResetError(54, "Connection reset by peer"))
+
+
+def login_after_reset() -> None:
+    """解析器在处理一次被掐断时另报要登录（如 yt-dlp 的 Viu 解析器）：要登录的错误的 `__context__` 是那次被掐断。"""
+    networking = importlib.import_module("yt_dlp.networking")
+    utils = importlib.import_module("yt_dlp.utils")
+    try:
+        reset_by_peer()
+    except networking.exceptions.TransportError:
+        message = "Please log in to watch this"
+        raise utils.ExtractorError(message, expected=True) from None
+
+
 def unavailable(cause: OSError) -> BaseException:
     """yt-dlp 写文件失败时抛的 UnavailableVideoError（引起它的错误在 `__context__` 里）。"""
     utils = importlib.import_module("yt_dlp.utils")
@@ -444,6 +477,10 @@ def test_failures_are_classified_by_what_the_site_said_and_where_they_happened()
         downloading = "rate_limited" if status == driver.TOO_MANY_REQUESTS else "network"
         assert driver.classify(report_error(cause), downloading=True)[0] == downloading, status
     assert driver.classify(report_error(utils.ContentTooShortError(1, 2)))[0] == "network"
+    # 解析器在处理一次被掐断时另报要登录：照它说的归类
+    with pytest.raises(utils.ExtractorError) as login:
+        login_after_reset()
+    assert driver.classify(report_error(login.value))[0] == "login"
     # 证书不受信任不算被掐断
     untrusted = networking.exceptions.CertificateVerifyError(cause=ssl.SSLCertVerificationError("bad"))
     assert driver.classify(report_error(utils.ExtractorError("x", cause=untrusted)))[0] == "network"
