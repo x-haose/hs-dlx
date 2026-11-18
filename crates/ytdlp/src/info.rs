@@ -114,6 +114,9 @@ pub struct Format {
     pub drm_maybe: bool,
     /// 要模拟浏览器的 TLS 指纹才下得了
     pub impersonate: bool,
+    /// HLS 下载要播放列表地址、请求头与 Cookie 之外的东西：网站另给的密钥、每个分片或密钥的地址要加的参数、直接给的
+    /// 播放列表内容；只有 yt-dlp 自己的 HLS 下载器认得
+    pub hls_extras: bool,
 }
 
 /// 认出一个格式用的属性：重新解析后按它找回同一个格式（与驱动脚本的 `key_of` 一一对应）。
@@ -212,6 +215,7 @@ struct WireFormat {
     available_at: Option<f64>,
     drm_maybe: bool,
     impersonate: bool,
+    hls_extras: bool,
 }
 
 #[derive(Deserialize)]
@@ -318,6 +322,7 @@ impl WireFormat {
                 .map(|at| at as i64),
             drm_maybe: self.drm_maybe,
             impersonate: self.impersonate,
+            hls_extras: self.hls_extras,
         }
     }
 }
@@ -352,7 +357,8 @@ mod tests {
                     "tbr": 4000.0, "filesize": null, "filesize_approx": 1234.4, "format_note": "1080p",
                     "language": null, "language_preference": -1.0, "dynamic_range": "SDR",
                     "http_headers": {"User-Agent": "x", "Cookie": "leak=1"}, "cookie": "",
-                    "chunk_size": 10485760.0, "available_at": 1763400000.0, "drm_maybe": false, "impersonate": false
+                    "chunk_size": 10485760.0, "available_at": 1763400000.0, "drm_maybe": false, "impersonate": false,
+                    "hls_extras": false
                 },
                 {
                     "format_id": "hls-1", "url": "https://e/x.m3u8", "protocol": "m3u8_native", "ext": "mp4",
@@ -360,7 +366,7 @@ mod tests {
                     "filesize": 99.0, "filesize_approx": null, "format_note": null, "language": "ja",
                     "language_preference": 10.0,
                     "dynamic_range": null, "http_headers": {}, "cookie": "a=b", "chunk_size": null,
-                    "available_at": null, "drm_maybe": true, "impersonate": true
+                    "available_at": null, "drm_maybe": true, "impersonate": true, "hls_extras": true
                 }
             ]
         }))
@@ -403,6 +409,7 @@ mod tests {
             (video.language_preference, hls.language_preference),
             (Some(-1), Some(10))
         );
-        assert!(hls.drm_maybe && hls.impersonate);
+        assert!(hls.drm_maybe && hls.impersonate && hls.hls_extras);
+        assert!(!video.hls_extras);
     }
 }

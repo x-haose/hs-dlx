@@ -73,6 +73,9 @@ UNAUTHORIZED = 401
 BLOCKED = frozenset({403, 412})
 # 下载进度至多多久报一次（秒）
 PROGRESS_INTERVAL = 0.2
+# yt-dlp 的 HLS 下载器另外认的字段（在格式上或整个视频上）：网站另给的密钥与 IV（`hls_aes`）、每个分片与密钥的地址要加
+# 的参数、直接给的播放列表内容。应用的 HLS 引擎只认播放列表地址、请求头与 Cookie
+HLS_EXTRAS = ("hls_aes", "extra_param_to_segment_url", "extra_param_to_key_url", "hls_media_playlist_data")
 # 用 yt-dlp 锁定版本的这两组依赖：默认的依赖与模拟浏览器 TLS 指纹的 curl-cffi
 PIN_EXTRAS = ("pin", "pin-curl-cffi", *(("pin-secretstorage",) if sys.platform.startswith("linux") else ()))
 # 不装的：mutagen 只用于往文件里嵌封面（GPL）
@@ -144,12 +147,13 @@ def safe_ext(value: object) -> str | None:
     return ext if ext.lower() in allowed and ext.lower() not in INTERNAL_EXTENSIONS else None
 
 
-def format_of(fmt: Mapping[str, object], jar: CookieJar) -> Info:
-    """一个格式里下载要用的。
+def format_of(fmt: Mapping[str, object], jar: CookieJar, *, video_hls_extras: bool) -> Info:
+    """一个格式里下载要用的，`video_hls_extras` 为视频自己（不算格式）带着 `HLS_EXTRAS` 里的字段。
 
     地址、协议、编码与画面、大小、请求头；按地址算出的 Cookie 请求头（与 yt-dlp 自己下载时带的一样）；每个请求的字节
     上限（`chunk_size`，YouTube 为 10 MiB）；可开始下载的时刻（`available_at`，Unix 秒）；可能有 DRM（`drm_maybe`：确定
-    有的 yt-dlp 已滤掉，可能有的它会试着下）；要不要模拟浏览器的 TLS 指纹（`impersonate`）。
+    有的 yt-dlp 已滤掉，可能有的它会试着下）；要不要模拟浏览器的 TLS 指纹（`impersonate`）；HLS 下载要不要 `HLS_EXTRAS`
+    里的字段（`hls_extras`：yt-dlp 下载时把视频自己的字段并进格式，两处有一处有就算）。
     """
     url = text(fmt.get("url")) or ""
     options = mapping(fmt.get("downloader_options")) or {}
@@ -177,6 +181,7 @@ def format_of(fmt: Mapping[str, object], jar: CookieJar) -> Info:
         "available_at": number(fmt.get("available_at")),
         "drm_maybe": fmt.get("has_drm") == "maybe",
         "impersonate": bool(fmt.get("impersonate")),
+        "hls_extras": video_hls_extras or any(fmt.get(key) for key in HLS_EXTRAS),
     }
 
 
@@ -190,16 +195,18 @@ def entry_of(entry: Mapping[str, object]) -> Info:
     }
 
 
-def trimmed(info: Mapping[str, object], jar: CookieJar, warnings: list[str]) -> Info:
-    """应用要用的部分。
+def trimmed(info: Mapping[str, object], jar: CookieJar, warnings: list[str], seen: HlsExtrasSeen) -> Info:
+    """应用要用的部分；`seen` 为解析时记下的、自己带着 `HLS_EXTRAS` 的视频。
 
     `extractor`（解析器）、`id`、`title`、`webpage_url`、`duration`（秒）、`thumbnail`、`live_status`、`uploader`、
     `formats`（见 `format_of`；只有一个格式、没有格式列表时为它本身）、`has_drm`（有格式因 DRM 被滤掉）、`entries`
     （播放列表或分成几段的视频的条目，不是时为 null）、`warnings`（yt-dlp 的警告）。
     """
-    formats = [format_of(fmt, jar) for fmt in map(mapping, items(info.get("formats"))) if fmt is not None]
+    shared = (text(info.get("id")) or "") in seen.videos
+    listed = [fmt for fmt in map(mapping, items(info.get("formats"))) if fmt is not None]
+    formats = [format_of(fmt, jar, video_hls_extras=shared) for fmt in listed]
     if not formats and info.get("url"):
-        formats = [format_of(info, jar)]
+        formats = [format_of(info, jar, video_hls_extras=shared)]
     entries = None
     if info.get("_type") in ("playlist", "multi_video"):
         entries = [entry_of(entry) for entry in map(mapping, items(info.get("entries"))) if entry is not None]
@@ -217,6 +224,22 @@ def trimmed(info: Mapping[str, object], jar: CookieJar, warnings: list[str]) -> 
         "entries": entries,
         "warnings": [clean(warning) for warning in warnings],
     }
+
+
+class HlsExtrasSeen:
+    """yt-dlp 的 `match_filter`：记下自己（不算格式）带着 `HLS_EXTRAS` 里的字段的视频的编号，不拦下任何视频。
+
+    yt-dlp 在选格式之前对每个视频调它；选完后把最后选中的格式的字段并进视频，返回的结果里分不出哪些是视频自己的。
+    """
+
+    def __init__(self) -> None:
+        """从没有记下的视频开始。"""
+        self.videos: set[str] = set()
+
+    def __call__(self, info: Mapping[str, object], **_flags: object) -> None:
+        """看一个视频（`_flags` 为 yt-dlp 另给的 `incomplete`，不用）。"""
+        if any(info.get(key) for key in HLS_EXTRAS):
+            self.videos.add(text(info.get("id")) or "")
 
 
 class Logger:
@@ -502,7 +525,8 @@ def extract(
     if request.get("generic") is not True and matched(url) == "Generic":
         return {"error": {"kind": "unsupported", "message": "没有专门认这个网址的解析器"}}
     logger = Logger()
-    options = params(request, quickjs, cache, logger)
+    seen = HlsExtrasSeen()
+    options = {**params(request, quickjs, cache, logger), "match_filter": seen}
     with yt_dlp.YoutubeDL(options) as ydl:
         browser = browser_of(request)
         failed = browser_cookies(yt_dlp, ydl, browser, logger)
@@ -515,7 +539,7 @@ def extract(
             kind, message = classify(error)
             return {"error": {"kind": kind, "message": message}}
         sanitized = yt_dlp.YoutubeDL.sanitize_info(info)
-        result = trimmed(sanitized, ydl.cookiejar, logger.warnings)
+        result = trimmed(sanitized, ydl.cookiejar, logger.warnings, seen)
         site = text(request.get("site")) or ""
         result["site_cookies"] = site_cookies(cast("Iterable[Cookie]", ydl.cookiejar), site)
         return {"ok": result}

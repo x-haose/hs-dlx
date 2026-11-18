@@ -84,8 +84,8 @@ impl AudioCodec {
 pub enum Route {
     /// 自己的引擎：http(s) 文件走分段下载，HLS 走 HLS 引擎
     Own,
-    /// 交回 yt-dlp 自己下：要模拟浏览器 TLS 指纹的、可能有 DRM 的（yt-dlp 会试）、DASH 分片与其余 yt-dlp 能下而我们
-    /// 没有引擎的协议
+    /// 交回 yt-dlp 自己下：要模拟浏览器 TLS 指纹的、可能有 DRM 的（yt-dlp 会试）、HLS 要另给密钥或参数的（见
+    /// [`Format::hls_extras`]）、DASH 分片与其余 yt-dlp 能下而我们没有引擎的协议
     YtDlp,
     /// 这一版下不了：原因
     Unsupported(&'static str),
@@ -100,7 +100,8 @@ pub fn route(format: &Format) -> Route {
         Protocol::Other(protocol) if protocol.starts_with("rtmp") => {
             Route::Unsupported("RTMP 这一版还不支持")
         }
-        Protocol::Http | Protocol::Hls if !format.impersonate => Route::Own,
+        Protocol::Http if !format.impersonate => Route::Own,
+        Protocol::Hls if !format.impersonate && !format.hls_extras => Route::Own,
         _ => Route::YtDlp,
     }
 }
@@ -389,6 +390,7 @@ mod tests {
             available_at: None,
             drm_maybe: false,
             impersonate: false,
+            hls_extras: false,
         }
     }
 
@@ -510,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn routes_follow_protocol_possible_drm_and_impersonation() {
+    fn routes_follow_protocol_possible_drm_impersonation_and_hls_extras() {
         let mut own = format("a", Some("avc1"), Some("none"), Some(720), 1.0);
         assert_eq!(route(&own), Route::Own);
         own.protocol = Protocol::Hls;
@@ -518,6 +520,9 @@ mod tests {
         own.impersonate = true;
         assert_eq!(route(&own), Route::YtDlp);
         own.impersonate = false;
+        own.hls_extras = true;
+        assert_eq!(route(&own), Route::YtDlp);
+        own.hls_extras = false;
         own.protocol = Protocol::Dash;
         assert_eq!(route(&own), Route::YtDlp);
         own.protocol = Protocol::Other("rtmp".to_owned());

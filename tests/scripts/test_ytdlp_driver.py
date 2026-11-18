@@ -348,12 +348,46 @@ def test_the_cookies_handed_back_have_whole_second_expiries() -> None:
     assert isinstance(handed["expires"], int)
 
 
+@pytest.mark.parametrize("on_the_video", [False, True])
+def test_hls_that_needs_more_than_the_playlist_is_marked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, on_the_video: bool
+) -> None:
+    # 解析器给出的结果照 yt-dlp 自己的流程处理（过滤、选格式、整理），其余同真的解析
+    yt_dlp = importlib.import_module("yt_dlp")
+    hls = {"url": "https://e.test/v.m3u8", "protocol": "m3u8_native", "ext": "mp4"}
+    extracted: dict[str, object] = {
+        "id": "x",
+        "title": "t",
+        "formats": [
+            {**hls, "format_id": "plain", "tbr": 1},
+            {**hls, "format_id": "keyed", "tbr": 2, "hls_aes": {"key": "0x" + "00" * 16}},
+            # 最后选中的格式：yt-dlp 把它的字段并进视频
+            {**hls, "format_id": "listed", "tbr": 3, "hls_media_playlist_data": "#EXTM3U\n"},
+        ],
+    }
+    if on_the_video:
+        extracted["extra_param_to_segment_url"] = "token=1"
+
+    def extract_info(self: object, url: str, *, download: bool) -> object:
+        assert url == YOUTUBE
+        return yt_dlp.YoutubeDL.process_ie_result(self, dict(extracted), download=download)
+
+    monkeypatch.setattr(yt_dlp.YoutubeDL, "extract_info", extract_info)
+    [reply] = serve([{"id": 1, "url": YOUTUBE, "proxy": "", "cookies": None, "generic": True}], tmp_path)
+    info = driver.mapping(reply["ok"]) or {}
+    formats = [driver.mapping(item) or {} for item in driver.items(info["formats"])]
+    marks = {fmt["format_id"]: fmt["hls_extras"] for fmt in formats}
+    assert marks == {"plain": on_the_video, "keyed": True, "listed": True}
+
+
 def test_lone_surrogates_and_nan_still_make_valid_json() -> None:
     class Jar:
         def get_cookie_header(self, url: str) -> str | None:
             return url if not url else None
 
-    info = driver.trimmed({"title": "半个表情\ud83d", "duration": float("nan"), "id": "x"}, Jar(), [])
+    info = driver.trimmed(
+        {"title": "半个表情\ud83d", "duration": float("nan"), "id": "x"}, Jar(), [], driver.HlsExtrasSeen()
+    )
     line = json.dumps(info, ensure_ascii=True, allow_nan=False)
     assert json.loads(line)["title"] == "半个表情�"
     assert json.loads(line)["duration"] is None
