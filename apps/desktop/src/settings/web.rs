@@ -19,6 +19,8 @@ pub(super) struct WebSettings {
     pub browser: Option<Browser>,
     /// 这台机器上有的浏览器（打开设置页时找）
     pub browsers: Vec<Browser>,
+    /// 选的浏览器的数据本进程没有权限读时怎么办（打开设置页与选浏览器时查）
+    pub denied: Option<String>,
     /// 查到的：有新版时为它，已是最新为 None；没查过时整个为 None，没查成为原因
     pub latest: Option<Result<Option<String>, String>>,
     /// 在查新版：释放即取消
@@ -265,6 +267,7 @@ impl SettingsView {
         match self.tasks.read(cx).service().set_web_browser(browser) {
             Ok(()) => {
                 self.web.browser = browser;
+                self.web.denied = denial(browser);
                 self.web.error = None;
             }
             Err(error) => self.web.error = Some(error.to_string()),
@@ -310,6 +313,7 @@ impl SettingsView {
                 .flex_col()
                 .gap(px(12.))
                 .child(div().flex().flex_wrap().gap(px(8.)).children(chips))
+                .children(self.web.denied.clone().map(|hint| ui::note(hint, true)))
                 .child(ui::caption(platform)),
         )
     }
@@ -344,4 +348,10 @@ impl SettingsView {
                 )),
         )
     }
+}
+
+/// `browser` 的数据本进程没有权限读时怎么办（见 [`Browser::access`]）；不读或读得了时为 None。
+pub(super) fn denial(browser: Option<Browser>) -> Option<String> {
+    let browser = browser?;
+    browser.access().err().map(|_| browser.denied_hint())
 }

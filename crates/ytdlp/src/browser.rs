@@ -1,11 +1,13 @@
 //! 解析时从哪个浏览器读登录后的 Cookie（yt-dlp 的 `cookiesfrombrowser`）。每次解析现读：浏览器里登录着、Cookie 轮换
 //! 了也是新的。
 //!
-//! 能不能读因平台而异：macOS 上 Chromium 系读时系统弹钥匙串的授权（一个解析进程里给过一次即留着），Safari 要给应用
-//! 完全磁盘访问权限；Linux 上 Chromium 系的钥匙在系统的密钥环里；Windows 上 Chrome、Edge、Brave 把 Cookie 加密成只有
+//! 能不能读因平台而异：macOS 上 Chromium 系读时系统弹钥匙串的授权（一个解析进程里给过一次即留着），Safari 与受系统
+//! 保护的浏览器数据目录要给应用完全磁盘访问权限（见 [`Browser::access`]）；Linux 上 Chromium 系的钥匙在系统的密钥环里；Windows 上 Chrome、Edge、Brave 把 Cookie 加密成只有
 //! 它们自己解得开的（app-bound encryption），yt-dlp 读不了，不列出；Firefox 各平台都能读。读不了时解析报
 //! [`crate::ExtractError::Cookies`]。
 
+use std::fmt;
+use std::io;
 use std::path::PathBuf;
 
 /// yt-dlp 能从中读 Cookie 的浏览器。
@@ -88,6 +90,32 @@ impl Browser {
         !(cfg!(windows) && matches!(self, Browser::Chrome | Browser::Edge | Browser::Brave))
     }
 
+    /// 本进程现在列不列得出它的各个数据目录（见 [`Browser::data_dirs`]）：在却没有权限列时为 [`Denied`]。macOS 上
+    /// 浏览器的数据目录受系统保护，没给本应用完全磁盘访问权限时系统不弹窗、直接拒绝；yt-dlp 搜 Cookie 文件时把列不出
+    /// 的目录当成空的，报的是没找到。不在的目录与别的错误不算：那时以 yt-dlp 读的结果为准。
+    pub fn access(self) -> Result<(), Denied> {
+        for dir in self.data_dirs() {
+            if let Err(error) = std::fs::read_dir(&dir)
+                && error.kind() == io::ErrorKind::PermissionDenied
+            {
+                return Err(Denied { dir, error });
+            }
+        }
+        Ok(())
+    }
+
+    /// 没有权限读它的数据时怎么办。
+    pub fn denied_hint(self) -> String {
+        let name = self.label();
+        if cfg!(target_os = "macos") {
+            format!(
+                "macOS 不让 hs-dlx 读 {name} 的数据：到「系统设置 → 隐私与安全性 → 完全磁盘访问权限」里打开 hs-dlx，重开 hs-dlx 后再试"
+            )
+        } else {
+            format!("没有权限读 {name} 的数据目录")
+        }
+    }
+
     fn present(self) -> bool {
         if self == Browser::Safari {
             return cfg!(target_os = "macos");
@@ -161,5 +189,18 @@ impl Browser {
             }
         };
         dirs.into_iter().flatten().collect()
+    }
+}
+
+/// 浏览器的一个数据目录在，本进程没有权限列出它（见 [`Browser::access`]）。
+#[derive(Debug)]
+pub struct Denied {
+    pub dir: PathBuf,
+    pub error: io::Error,
+}
+
+impl fmt::Display for Denied {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "列不出 {}：{}", self.dir.display(), self.error)
     }
 }

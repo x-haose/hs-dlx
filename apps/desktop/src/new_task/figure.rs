@@ -487,16 +487,16 @@ fn torrent_dial(choice: &TorrentChoice) -> Div {
     )
 }
 
-/// 探测失败的表盘：整圈暗的警告色，圆盘里写状态码或种类与这类失败多半是怎么回事（见 [`format::failure`]）。
+/// 探测失败的表盘：整圈暗的警告色，圆盘里写状态码或种类（见 [`format::failure`]）；怎么办写在检查面板里。
 fn failed_dial(failure: &Failure) -> Div {
-    let (mark, hint) = format::failure(failure.kind);
+    let (mark, _) = format::failure(failure.kind);
     let ticks = Ticks::full(ring::COMET_TICKS, theme::alpha(theme::warn(), 0.45), false);
     dial::dial(
         theme::warn(),
         dial::figure(move |bounds, window, _| {
             ring::paint_ticks(bounds, ring::RADIUS, &ticks, window)
         }),
-        dial::readout("探测失败", theme::warn(), dial::Big::Figure(mark), hint),
+        dial::readout("探测失败", theme::warn(), dial::Big::Figure(mark), ""),
     )
 }
 

@@ -626,7 +626,15 @@ impl Failure {
         let message = self.message;
         match self.kind.as_str() {
             "cookies" => {
-                ExtractError::Cookies(cookie_trouble(browser, self.reason.as_deref(), &message))
+                // yt-dlp 把没有权限列的数据目录当成空的，报没找到：这时报没有权限
+                let denied = match (self.reason.as_deref(), browser) {
+                    (Some("missing"), Some(browser)) => browser.access().err(),
+                    _ => None,
+                };
+                ExtractError::Cookies(match denied {
+                    Some(denied) => cookie_trouble(browser, Some("denied"), &denied.to_string()),
+                    None => cookie_trouble(browser, self.reason.as_deref(), &message),
+                })
             }
             "unsupported" => ExtractError::Unsupported(message),
             "geo" => ExtractError::Geo(message),
@@ -648,10 +656,10 @@ fn cookie_trouble(browser: Option<Browser>, reason: Option<&str>, detail: &str) 
     let name = browser.map_or("浏览器", Browser::label);
     let what = match reason {
         Some("missing") => format!("没找到 {name} 的 Cookie：这台电脑上没装它，或没用它打开过网页"),
-        Some("denied") if browser == Some(Browser::Safari) => {
-            "读不了 Safari 的 Cookie：到「系统设置 → 隐私与安全性 → 完全磁盘访问权限」里打开 hs-dlx 后再试".to_owned()
-        }
-        Some("denied") => format!("系统不让读 {name} 的 Cookie"),
+        Some("denied") => browser.map_or_else(
+            || "系统不让读浏览器的 Cookie".to_owned(),
+            Browser::denied_hint,
+        ),
         Some("encrypted") => format!(
             "{name} 把 Cookie 加密成了只有它自己解得开的（Windows 上 Chrome 127 起），读不了：改用 Firefox 登录，在设置里选 Firefox"
         ),

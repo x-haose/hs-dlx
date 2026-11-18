@@ -102,11 +102,11 @@ impl NewTask {
         Some(shown)
     }
 
-    /// 探测失败：错误（与看过不是网页的说明）、请求经哪里走、缺请求头时的编辑框；底栏是重新探测与另找。被拒或取到错误
-    /// 页的多半缺请求头，改了再探测；再试也一样的不给重新探测。网页视频要登录时主按钮是到网页里登录（嗅探页里登录、回到
-    /// 视频页后点「解析网页视频」，带着登录后的 Cookie 解析；从嗅探页来的回嗅探页），另给重新探测（在常用的浏览器里登录
-    /// 了、或在设置里选了从浏览器读之后，再解析时现读）；被拦截时另给到网页里登录。不是从嗅探页来的还可以在网页里打开它
-    /// 找视频流。
+    /// 探测失败：错误、这类失败怎么办（见 [`format::failure`]；要登录时换成怎么登录）、看过不是网页的说明、请求经哪里
+    /// 走、缺请求头时的编辑框；底栏是重新探测与另找。被拒或取到错误页的多半缺请求头，改了再探测；再试也一样的不给重新
+    /// 探测。网页视频要登录时主按钮是到网页里登录（嗅探页里登录、回到视频页后点「解析网页视频」，带着登录后的 Cookie
+    /// 解析；从嗅探页来的回嗅探页），另给重新探测（在常用的浏览器里登录了、或在设置里选了从浏览器读之后，再解析时现
+    /// 读）；被拦截时另给到网页里登录。不是从嗅探页来的还可以在网页里打开它找视频流。
     fn failed_inspector(
         &self,
         title: String,
@@ -119,6 +119,9 @@ impl NewTask {
         let login = needs_login && !self.from_sniff;
         let again = headers || failure.kind.retry_helps();
         let mut body = vec![ui::note(failure.message.clone(), true).into_any_element()];
+        if !needs_login {
+            body.push(ui::note(format::failure(failure.kind).1, false).into_any_element());
+        }
         if let PageCheck::NotPage(note) = &self.page_check {
             body.push(ui::note(note.clone(), false).into_any_element());
         }
@@ -359,7 +362,7 @@ impl NewTask {
         offer
     }
 
-    /// 取不到种子信息、读不出种子文件：错误，能再试的给再试。
+    /// 取不到种子信息、读不出种子文件：错误与这类失败怎么办（见 [`format::failure`]），能再试的给再试。
     fn torrent_failed_inspector(
         &self,
         title: String,
@@ -367,7 +370,10 @@ impl NewTask {
         failure: &Failure,
         cx: &mut Context<Self>,
     ) -> Div {
-        let body = [ui::note(failure.message.clone(), true).into_any_element()];
+        let body = [
+            ui::note(failure.message.clone(), true).into_any_element(),
+            ui::note(format::failure(failure.kind).1, false).into_any_element(),
+        ];
         let mut foot = self.cloud_offer(cx);
         if failure.kind.retry_helps() {
             foot.push(
