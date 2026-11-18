@@ -7,7 +7,9 @@ import importlib
 import importlib.metadata
 import io
 import json
+import socket
 import ssl
+import struct
 import sys
 import threading
 from functools import partial
@@ -54,6 +56,10 @@ def site(tmp_path: Path) -> Iterator[str]:
     yield f"http://127.0.0.1:{server.server_address[1]}"
     server.shutdown()
     server.server_close()
+
+
+# 测试用的 Cookie 过期时刻（Unix 秒，2100 年）
+EXPIRES = 4102444800
 
 
 def serve_lines(requests: list[Mapping[str, object]], tmp_path: Path) -> list[dict[str, object]]:
@@ -243,28 +249,87 @@ def test_warnings_that_leave_the_other_cookies_readable_do_not_fail(monkeypatch:
         assert driver.browser_cookies(yt_dlp, ydl, ("firefox", None), logger) is None
 
 
-def test_only_the_cookies_for_the_page_go_back_to_the_app() -> None:
-    # 浏览器里别的网站的 Cookie 不交出去；带子域的以点开头
+def test_only_the_cookies_of_the_site_go_back_to_the_app() -> None:
+    # 这个网站各个子域、各个路径下的都交回（解析时请求的接口常在别的子域）；别的网站的不交出去，名字像的也不算
     cookies = importlib.import_module("yt_dlp.cookies")
     jar = cookies.YoutubeDLCookieJar()
     jar.load(
         io.StringIO(
             "# Netscape HTTP Cookie File\n"
-            ".youtube.com\tTRUE\t/\tTRUE\t4102444800\tSID\tabc\n"
-            "bank.example\tFALSE\t/\tTRUE\t4102444800\tsession\tsecret\n"
+            f".bilibili.com\tTRUE\t/\tTRUE\t{EXPIRES}\tSESSDATA\tabc\n"
+            "api.bilibili.com\tFALSE\t/x/\tFALSE\t0\tbuvid\tdef\n"
+            "notbilibili.com\tFALSE\t/\tFALSE\t0\tlookalike\tno\n"
+            f"bank.example\tFALSE\t/\tTRUE\t{EXPIRES}\tsession\tsecret\n"
         )
     )
-    assert driver.site_cookies(jar, YOUTUBE) == [
-        {
-            "domain": ".youtube.com",
-            "include_subdomains": True,
-            "path": "/",
-            "secure": True,
-            "expires": 4102444800,
-            "name": "SID",
-            "value": "abc",
-        }
-    ]
+    handed = {cookie["name"]: cookie for cookie in driver.site_cookies(jar, "bilibili.com")}
+    assert sorted(handed) == ["SESSDATA", "buvid"]
+    assert handed["SESSDATA"] == {
+        "domain": ".bilibili.com",
+        "include_subdomains": True,
+        "path": "/",
+        "secure": True,
+        "expires": EXPIRES,
+        "name": "SESSDATA",
+        "value": "abc",
+    }
+    assert (handed["buvid"]["domain"], handed["buvid"]["path"]) == ("api.bilibili.com", "/x/")
+    assert driver.site_cookies(jar, "") == []
+
+
+def answer_once(how: str) -> int:
+    """起一个只接一个连接的本地服务器，返回端口。
+
+    读到客户端发来的第一段后：`reset` 以 RST 断开，`close` 正常断开，`plain` 回一段不是 TLS 的明文再断开。
+    """
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+
+    def serve() -> None:
+        with listener:
+            connection, _ = listener.accept()
+            connection.recv(4096)
+            if how == "reset":
+                connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            elif how == "plain":
+                connection.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+            connection.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return int(listener.getsockname()[1])
+
+
+@pytest.mark.parametrize(
+    ("scheme", "how", "kind"),
+    [("http", "reset", "reset"), ("https", "close", "reset"), ("https", "plain", "network")],
+)
+def test_a_connection_cut_off_after_it_was_made_is_told_apart(scheme: str, how: str, kind: str) -> None:
+    # 真的经 yt-dlp 的请求处理器（与应用装的一样是 requests）：读请求后连接被重置、TLS 握手时对方断开归 reset；
+    # 对方回的不是 TLS（老站、协议不合一类）不算
+    yt_dlp = importlib.import_module("yt_dlp")
+    utils = importlib.import_module("yt_dlp.utils")
+    port = answer_once(how)
+    with yt_dlp.YoutubeDL({"quiet": True, "retries": 0}) as ydl:
+        try:
+            ydl.urlopen(f"{scheme}://127.0.0.1:{port}/")
+        except utils.YoutubeDLError as error:
+            refused = error
+        else:
+            pytest.fail("连接被掐断却拿到了回应")
+    assert driver.classify(report_error(utils.ExtractorError("x", cause=refused)))[0] == kind
+
+
+def test_the_cookies_handed_back_have_whole_second_expiries() -> None:
+    # Firefox 142 起 yt-dlp 读出的过期时间是浮点数，应用按整数秒收
+    cookies = importlib.import_module("yt_dlp.cookies")
+    jar = cookies.YoutubeDLCookieJar()
+    jar.load(io.StringIO("# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tabc\n"))
+    [cookie] = list(jar)
+    cookie.expires = EXPIRES + 0.5
+    [handed] = driver.site_cookies(jar, "youtube.com")
+    assert handed["expires"] == EXPIRES
+    assert isinstance(handed["expires"], int)
 
 
 def test_lone_surrogates_and_nan_still_make_valid_json() -> None:
@@ -379,13 +444,8 @@ def test_failures_are_classified_by_what_the_site_said_and_where_they_happened()
         downloading = "rate_limited" if status == driver.TOO_MANY_REQUESTS else "network"
         assert driver.classify(report_error(cause), downloading=True)[0] == downloading, status
     assert driver.classify(report_error(utils.ContentTooShortError(1, 2)))[0] == "network"
-    # 连上后被掐断（TLS 读到一半没了、连接被重置）单列；证书不受信任不算
-    exceptions = networking.exceptions
-    eof = exceptions.SSLError(cause=ssl.SSLEOFError(8, "EOF occurred in violation of protocol"))
-    assert driver.classify(report_error(utils.ExtractorError("x", cause=eof)))[0] == "reset"
-    reset = exceptions.TransportError(cause=ConnectionResetError(54, "Connection reset by peer"))
-    assert driver.classify(report_error(utils.ExtractorError("x", cause=reset)))[0] == "reset"
-    untrusted = exceptions.CertificateVerifyError(cause=ssl.SSLCertVerificationError("bad"))
+    # 证书不受信任不算被掐断
+    untrusted = networking.exceptions.CertificateVerifyError(cause=ssl.SSLCertVerificationError("bad"))
     assert driver.classify(report_error(utils.ExtractorError("x", cause=untrusted)))[0] == "network"
     full = OSError(28, "No space left on device")
     assert driver.classify(report_error(full))[0] == "disk"

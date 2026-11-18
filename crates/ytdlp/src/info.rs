@@ -25,7 +25,8 @@ pub struct Info {
     pub entries: Option<Vec<Entry>>,
     /// yt-dlp 的警告，如缺 JavaScript 运行时、部分格式取不到
     pub warnings: Vec<String>,
-    /// 从浏览器读了 Cookie 时，其中发往这个网页的（见 [`crate::Request::for_download`]）；没读浏览器时为空
+    /// 从浏览器读了 Cookie 时，罐里属于这个网站（网页的可注册域名及其子域）的，含请求里给的（见
+    /// [`crate::Request::for_download`]）；没读浏览器时为空
     pub site_cookies: Vec<crate::Cookie>,
 }
 

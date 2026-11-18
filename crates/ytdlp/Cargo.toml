@@ -15,6 +15,8 @@ hs-m3u8-core.workspace = true
 dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# 交回 yt-dlp 下载时带的 Cookie 按网页的可注册域名取（见 Request::for_download）
+psl.workspace = true
 # 解开随应用带的 Python（tar 经 zstd 压缩）：纯 Rust 的解码器，不用编译 C 的 zstd
 ruzstd = "0.9.1"
 # 核对下载的 wheel

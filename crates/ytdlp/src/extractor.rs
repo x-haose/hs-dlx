@@ -64,17 +64,15 @@ pub struct Request {
 }
 
 impl Request {
-    /// 交回 yt-dlp 下载时用的请求：解析时从浏览器读过的，不再读浏览器，改带那次读到的、发往这个网页的 Cookie（`info`
-    /// 的 [`Info::site_cookies`]）；没读浏览器的原样。
+    /// 交回 yt-dlp 下载时用的请求：解析时从浏览器读过的，不再读浏览器，改带那次罐里属于这个网站的 Cookie（`info` 的
+    /// [`Info::site_cookies`]，已含请求里给的）；没读浏览器的原样。
     pub fn for_download(&self, info: &Info) -> Request {
         if self.browser.is_none() {
             return self.clone();
         }
-        let mut cookies = self.cookies.clone();
-        cookies.extend(info.site_cookies.iter().cloned());
         Request {
             url: self.url.clone(),
-            cookies,
+            cookies: info.site_cookies.clone(),
             generic: self.generic,
             browser: None,
         }
@@ -326,6 +324,7 @@ impl Extractor {
             "generic": request.generic,
             "browser": request.browser.as_ref().map(|source| source.browser.code()),
             "profile": profile_wire(request.browser.as_ref()),
+            "site": site_of(&request.url),
         });
         let id = worker.next_id;
         worker.next_id += 1;
@@ -719,10 +718,10 @@ impl Failure {
             "network" => ExtractError::Network(message),
             // 连上后被掐断：直连时多为网站在本地网络被拦，走代理时多为这个出口被网站拦了
             "reset" if direct => ExtractError::Network(format!(
-                "直连时连接被掐断，多为这个网站在本地网络被拦：改走代理再试（{message}）"
+                "直连时连接被掐断，多为在本地网络被拦：改走代理再试（{message}）"
             )),
             "reset" => ExtractError::Network(format!(
-                "经代理时连接被掐断：代理的出口可能被这个网站拦了，换个节点或改直连再试（{message}）"
+                "经代理时连接被掐断：代理的出口可能被拦了，换个节点或改直连再试（{message}）"
             )),
             "unavailable" => ExtractError::Unavailable(message),
             "changed" => ExtractError::Changed(message),
@@ -730,6 +729,12 @@ impl Failure {
             _ => ExtractError::Other(message),
         }
     }
+}
+
+/// 网址所在的可注册域名（`www.bilibili.com` 的为 `bilibili.com`）；认不出公共后缀时为主机本身，没有主机时为 None。
+fn site_of(url: &Url) -> Option<String> {
+    let host = url.host_str()?;
+    Some(psl::domain_str(host).unwrap_or(host).to_owned())
 }
 
 /// 交给驱动脚本的用户资料目录；不指定时为 null。
@@ -745,6 +750,8 @@ fn cookie_trouble(source: Option<&CookieSource>, reason: Option<&str>, detail: &
     let browser = source.map(|source| source.browser);
     let name = browser.map_or("浏览器", Browser::label);
     let profile = source.and_then(|source| source.profile.as_ref());
+    let chromium =
+        browser.is_some_and(|browser| !matches!(browser, Browser::Firefox | Browser::Safari));
     let what = match (reason, profile) {
         (Some("missing"), Some(dir)) => format!(
             "没找到 {name} 的用户资料 {} 的 Cookie：它可能被删了，要重选用户资料",
@@ -764,13 +771,14 @@ fn cookie_trouble(source: Option<&CookieSource>, reason: Option<&str>, detail: &
         (Some("keychain"), _) => format!(
             "没拿到解开 {name} 的 Cookie 的钥匙：macOS 弹出钥匙串的授权时点「允许」后再试；不想每次弹，改用 Firefox"
         ),
-        (Some("stalled"), _) if cfg!(target_os = "macos") => format!(
+        // 只有 Chromium 系的 Cookie 要钥匙串或密钥环里的钥匙解开
+        (Some("stalled"), _) if chromium && cfg!(target_os = "macos") => format!(
             "一直没读出 {name} 的 Cookie：多为 macOS 弹出的钥匙串授权还没点，点「允许」后再试"
         ),
-        (Some("stalled"), _) if cfg!(target_os = "linux") => format!(
+        (Some("stalled"), _) if chromium && cfg!(target_os = "linux") => format!(
             "一直没读出 {name} 的 Cookie：多为系统的密钥环（GNOME 密钥环或 KWallet）在等解锁，解锁后再试"
         ),
-        (Some("stalled"), _) => format!("一直没读出 {name} 的 Cookie：关掉 {name} 再试"),
+        (Some("stalled"), _) => format!("一直没读完 {name} 的 Cookie：关掉 {name} 再试"),
         (Some("keyring"), _) => format!(
             "没从系统的密钥环拿到解开 {name} 的 Cookie 的钥匙：解开密钥环（GNOME 密钥环或 KWallet）后再试，或改用 Firefox"
         ),
@@ -803,7 +811,7 @@ fn key_wire(key: &FormatKey) -> serde_json::Value {
 mod tests {
     use super::*;
 
-    /// 解析时读过浏览器的，交回 yt-dlp 下载时改带读到的发往网页的 Cookie、不再读浏览器；没读的原样。
+    /// 解析时读过浏览器的，交回 yt-dlp 下载时改带罐里属于这个网站的 Cookie、不再读浏览器；没读的原样。
     #[test]
     fn downloads_carry_the_cookies_read_instead_of_reading_the_browser_again() {
         let cookie = |name: &str| Cookie {
@@ -841,7 +849,7 @@ mod tests {
         };
         let download = request.for_download(&info);
         assert_eq!(download.browser, None);
-        assert_eq!(download.cookies, [cookie("given"), cookie("SID")]);
+        assert_eq!(download.cookies, [cookie("SID")]);
         let plain = Request {
             browser: None,
             ..request

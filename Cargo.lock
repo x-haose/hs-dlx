@@ -3675,6 +3675,7 @@ dependencies = [
  "axum",
  "dirs 7.0.0",
  "hs-m3u8-core",
+ "psl",
  "ruzstd",
  "serde",
  "serde_json",

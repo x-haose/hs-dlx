@@ -12,7 +12,8 @@
 - `serve <site> <quickjs> <cache>`：常驻解析。标准输入每行一个请求，标准输出每行一个回应，一次只处理一个：
   - 请求 `{"id": 整数, "url": 网址, "proxy": 代理地址（空串为直连）, "cookies": Netscape 格式的 Cookie 或 null,
     "generic": 只有通用解析器认得时也解析, "browser": 另从这个浏览器读 Cookie（yt-dlp 的浏览器名）或 null,
-    "profile": 读它的这个用户资料（目录的绝对路径）或 null（浏览器没有用户资料之分时）}`；
+    "profile": 读它的这个用户资料（目录的绝对路径）或 null（浏览器没有用户资料之分时）, "site": 网页的可注册域名
+    （交回哪些 Cookie，见 `site_cookies`）}`；
     `generic` 为假时只认得通用解析器的网址不发请求，直接回 `unsupported`；视频没有格式时照网站说的原因（要登录、人机
     验证、限流、地区限制、不可用）回错误
   - 回应 `{"id": 同请求, "ok": 结果}` 或 `{"id": 同请求, "error": {"kind": 种类, "message": 说明}}`，种类见
@@ -36,6 +37,7 @@ import io
 import json
 import math
 import os
+import ssl
 import sys
 import threading
 import time
@@ -43,7 +45,7 @@ import traceback
 from typing import TYPE_CHECKING, Any, Protocol, TextIO, cast
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sized
+    from collections.abc import Callable, Iterable, Mapping, Sized
     from http.cookiejar import Cookie
     from types import ModuleType
 
@@ -82,14 +84,6 @@ class CookieJar(Protocol):
 
     def get_cookie_header(self, url: str) -> str | None:
         """发往 `url` 的请求该带的 Cookie 请求头；没有时为 None。"""
-        ...
-
-
-class SiteJar(Protocol):
-    """yt-dlp 的 Cookie 罐里取发往某个网址的 Cookie 的部分。"""
-
-    def get_cookies_for_url(self, url: str) -> list[Cookie]:
-        """发往 `url` 的请求该带的各个 Cookie。"""
         ...
 
 
@@ -328,20 +322,27 @@ def status_kind(status: object, *, downloading: bool) -> str:
 
 
 def cut_off(root: BaseException) -> bool:
-    """`root` 是不是连上之后被对方掐断。
+    """`root` 是不是连上之后被对方掐断：连接被重置，或 TLS 读到一半对方断开（握手时被掐也是这样）。
 
-    yt-dlp 的 SSLError（证书校验失败的 CertificateVerifyError 除外），或沿 `cause`、`__cause__` 找得到
-    ConnectionResetError。
+    沿 `cause`（yt-dlp）、`__cause__`、`__context__`、`reason`（urllib3 的 MaxRetryError）与 `args` 里的异常找：
+    requests 包 urllib3 的错误时不用 `from`，原来的只在 `__context__` 与 `args` 里。证书不受信任、协议版本不合等别的
+    TLS 错误不算。
     """
-    if "SSLError" in lineage(root) and "CertificateVerifyError" not in lineage(root):
-        return True
+    pending: list[object] = [root]
     seen: set[int] = set()
-    error: object = root
-    while isinstance(error, BaseException) and id(error) not in seen:
-        if isinstance(error, ConnectionResetError):
-            return True
+    while pending:
+        error = pending.pop()
+        if not isinstance(error, BaseException) or id(error) in seen:
+            continue
         seen.add(id(error))
-        error = getattr(error, "cause", None) or error.__cause__
+        if isinstance(error, (ConnectionResetError, ssl.SSLEOFError, ssl.SSLZeroReturnError)):
+            return True
+        if any(mark in str(error).lower() for mark in CUT_OFF):
+            return True
+        pending.extend(
+            (getattr(error, "cause", None), error.__cause__, error.__context__, getattr(error, "reason", None))
+        )
+        pending.extend(error.args)
     return False
 
 
@@ -395,6 +396,8 @@ def browser_of(request: Mapping[str, object]) -> tuple[str, str | None] | None:
     return (browser, text(request.get("profile")))
 
 
+# 被掐断的连接在错误说明里的字样：curl_cffi（模拟浏览器指纹的请求）只给 curl 的说明，不带 Python 的异常
+CUT_OFF = ("connection reset by peer", "unexpected_eof_while_reading", "eof occurred in violation of protocol")
 # 读浏览器 Cookie 时 yt-dlp 的警告里，说明整罐加密的 Cookie 都解不开的（没拿到钥匙）；别的警告（某一条解不开、
 # 数据库版本较新）不影响其余的，缺的若正是要用的，网站照样回要登录
 KEYLESS = ("no key found",)
@@ -514,15 +517,17 @@ def extract(
             return {"error": {"kind": kind, "message": message}}
         sanitized = yt_dlp.YoutubeDL.sanitize_info(info)
         result = trimmed(sanitized, ydl.cookiejar, logger.warnings)
-        result["site_cookies"] = site_cookies(ydl.cookiejar, url) if browser else []
+        site = text(request.get("site")) or ""
+        result["site_cookies"] = site_cookies(cast("Iterable[Cookie]", ydl.cookiejar), site) if browser else []
         return {"ok": result}
 
 
-def site_cookies(jar: SiteJar, url: str) -> list[Info]:
-    """罐里发往 `url` 的 Cookie，各项同应用的 Cookie（Netscape cookies.txt 的各列）。
+def site_cookies(jar: Iterable[Cookie], site: str) -> list[Info]:
+    """罐里属于网站 `site`（可注册域名，含各个子域）的 Cookie，各项同应用的 Cookie（Netscape cookies.txt 的各列）。
 
-    从浏览器读过 Cookie 时交给应用：交回 yt-dlp 下载时带上它们，不再读浏览器（读 Chromium 系的要钥匙串授权，每个下载
-    进程都会再弹一次）。
+    从浏览器读过 Cookie 时交给应用：交回 yt-dlp 下载时它要重新解析网页，带上它们就不再读浏览器（读 Chromium 系的要
+    钥匙串授权，每个下载进程都会再弹一次）。不按路径与 secure 筛：解析时请求的接口常在别的子域与路径下（B 站的
+    api.bilibili.com）。别的网站的不交出去。
     """
     return [
         {
@@ -530,11 +535,13 @@ def site_cookies(jar: SiteJar, url: str) -> list[Info]:
             "include_subdomains": cookie.domain.startswith("."),
             "path": cookie.path,
             "secure": bool(cookie.secure),
-            "expires": cookie.expires,
+            # Firefox 142 起存毫秒，yt-dlp 除以 1000 后是浮点数
+            "expires": None if cookie.expires is None else int(cookie.expires),
             "name": cookie.name,
             "value": cookie.value or "",
         }
-        for cookie in jar.get_cookies_for_url(url)
+        for cookie in jar
+        if site and (cookie.domain.lstrip(".") == site or cookie.domain.endswith(f".{site}"))
     ]
 
 

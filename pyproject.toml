@@ -14,8 +14,9 @@ dev = [
     "pip==26.3",
     "pytest==9.1.1",
     "ruff==0.17.0",
-    # crates/ytdlp 的驱动脚本的测试对着本地网页跑真的 yt-dlp（通用解析器，不连外网）；应用运行时另从 PyPI 装
-    "yt-dlp==2026.10.26",
+    # crates/ytdlp 的驱动脚本的测试对着本地网页跑真的 yt-dlp（通用解析器，不连外网）；应用运行时另从 PyPI 装。带它
+    # 锁定的默认依赖（pin），与应用装的一样，请求走 requests 处理器
+    "yt-dlp[pin]==2026.10.26",
     # scripts/runtime.py 把随应用带的 Python 打成 tar 经 zstd 压缩（应用用纯 Rust 的 ruzstd 解）
     "zstandard==0.25.0",
 ]
