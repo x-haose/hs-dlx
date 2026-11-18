@@ -9,8 +9,8 @@ use crate::ui::{self, Tone};
 const FULL_DISK_ACCESS: &str =
     "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles";
 
-/// 只受完全磁盘访问权限保护的目录（相对用户目录）：系统各项隐私授权的记录
-const PROTECTED: &str = "Library/Application Support/com.apple.TCC";
+/// 只受完全磁盘访问权限保护的目录（相对用户目录）：Safari 的数据。不在时系统不列，说明里有点「+」加的办法
+const PROTECTED: &str = "Library/Safari";
 
 /// `browser` 的数据读不了时的警告：怎么办，macOS 上另有打开那一页设置的按钮。
 pub fn card(browser: Browser) -> Div {
