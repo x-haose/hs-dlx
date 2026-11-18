@@ -88,8 +88,8 @@ pub struct Tasks {
     /// 保存目录所在盘的可用空间（字节）：还没读到时为 None，读不出、目录不在或读超时时为原因
     free_space: Option<Result<u64, String>>,
     pikpak: PikPak,
-    /// 设置里选的、本进程没有权限读它的数据的浏览器（见 [`Browser::access`]）；没选或读得了时为 None。打开应用、窗口
-    /// 回到前台与改了选的浏览器时重查（见 [`Tasks::check_cookie_access`]）
+    /// 设置里选的、本进程没有权限读它的数据的浏览器（见 [`Browser::access`]）；没选或读得了时为 None。打开应用与改了
+    /// 选的浏览器时查（见 [`Tasks::check_cookie_access`]）：macOS 上给了权限的进程要重开才拿得到，开着时不会变
     cookies_denied: Option<Browser>,
     /// 收得了后打开的实例转交来的（再次打开应用会回到窗口）；macOS 上总能点程序坞回到窗口，用不到
     #[cfg(not(target_os = "macos"))]

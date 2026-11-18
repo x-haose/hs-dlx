@@ -130,9 +130,6 @@ impl Shell {
         let activated = cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
                 this.refresh_clipboard(cx);
-                // 可能刚在系统设置里给了读浏览器数据的权限
-                this.tasks
-                    .update(cx, |tasks, cx| tasks.check_cookie_access(cx));
             }
         });
         // 选中的一行被移除（放弃、从列表移除）时改选当时最新的一行
