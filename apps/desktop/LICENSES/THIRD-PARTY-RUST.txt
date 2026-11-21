@@ -215,7 +215,7 @@ hashbrown 0.14.5  MIT OR Apache-2.0  https://github.com/rust-lang/hashbrown
 hashbrown 0.16.1  MIT OR Apache-2.0  https://github.com/rust-lang/hashbrown
 hashbrown 0.17.1  MIT OR Apache-2.0  https://github.com/rust-lang/hashbrown
 hashlink 0.12.2  MIT OR Apache-2.0  https://github.com/djc/hashlink
-heapless 0.9.3  MIT OR Apache-2.0  https://github.com/rust-embedded/heapless
+heapless 0.9.4  MIT OR Apache-2.0  https://github.com/rust-embedded/heapless
 hex 0.4.3  MIT OR Apache-2.0  https://github.com/KokaKiwi/rust-hex
 hkdf 0.12.4  MIT OR Apache-2.0  https://github.com/RustCrypto/KDFs/
 hmac 0.12.1  MIT OR Apache-2.0  https://github.com/RustCrypto/MACs
@@ -571,18 +571,27 @@ windows-collections 0.3.2  MIT OR Apache-2.0  https://github.com/microsoft/windo
 windows-core 0.58.0  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-core 0.62.2  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-future 0.3.2  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
+windows-link 0.1.3  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-link 0.2.1  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-numerics 0.3.1  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
+windows-registry 0.4.0  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-registry 0.6.1  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-result 0.2.0  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
+windows-result 0.3.4  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-result 0.4.1  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-strings 0.1.0  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
+windows-strings 0.3.1  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-strings 0.5.1  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
+windows-sys 0.48.0  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-sys 0.61.2  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
+windows-targets 0.48.5  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-targets 0.52.6  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
+windows-targets 0.53.5  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-threading 0.2.1  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-version 0.1.7  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
+windows_x86_64_msvc 0.48.5  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows_x86_64_msvc 0.52.6  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
+windows_x86_64_msvc 0.53.1  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 winnow 1.0.4  MIT  https://github.com/winnow-rs/winnow
 writeable 0.6.4  Unicode-3.0  https://github.com/unicode-org/icu4x
 wry 0.57.2  Apache-2.0 OR MIT  https://github.com/tauri-apps/wry
@@ -1032,7 +1041,7 @@ hash32 0.3.1：LICENSE-APACHE
 hashbrown 0.14.5：LICENSE-APACHE
 hashbrown 0.16.1：LICENSE-APACHE
 hashbrown 0.17.1：LICENSE-APACHE
-heapless 0.9.3：LICENSE-APACHE
+heapless 0.9.4：LICENSE-APACHE
 html5ever 0.27.0：LICENSE-APACHE
 httparse 1.10.1：LICENSE-APACHE
 hyper-rustls 0.27.10：LICENSE-APACHE
@@ -11064,7 +11073,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 --------------------------------------------------------------------------------
-heapless 0.9.3：LICENSE-MIT
+heapless 0.9.4：LICENSE-MIT
 --------------------------------------------------------------------------------
 
 Copyright (c) 2017 Jorge Aparicio
@@ -21300,18 +21309,27 @@ windows-collections 0.3.2：license-apache-2.0
 windows-core 0.58.0：license-apache-2.0
 windows-core 0.62.2：license-apache-2.0
 windows-future 0.3.2：license-apache-2.0
+windows-link 0.1.3：license-apache-2.0
 windows-link 0.2.1：license-apache-2.0
 windows-numerics 0.3.1：license-apache-2.0
+windows-registry 0.4.0：license-apache-2.0
 windows-registry 0.6.1：license-apache-2.0
 windows-result 0.2.0：license-apache-2.0
+windows-result 0.3.4：license-apache-2.0
 windows-result 0.4.1：license-apache-2.0
 windows-strings 0.1.0：license-apache-2.0
+windows-strings 0.3.1：license-apache-2.0
 windows-strings 0.5.1：license-apache-2.0
+windows-sys 0.48.0：license-apache-2.0
 windows-sys 0.61.2：license-apache-2.0
+windows-targets 0.48.5：license-apache-2.0
 windows-targets 0.52.6：license-apache-2.0
+windows-targets 0.53.5：license-apache-2.0
 windows-threading 0.2.1：license-apache-2.0
 windows-version 0.1.7：license-apache-2.0
+windows_x86_64_msvc 0.48.5：license-apache-2.0
 windows_x86_64_msvc 0.52.6：license-apache-2.0
+windows_x86_64_msvc 0.53.1：license-apache-2.0
 --------------------------------------------------------------------------------
 
                                  Apache License
@@ -21523,18 +21541,27 @@ windows-collections 0.3.2：license-mit
 windows-core 0.58.0：license-mit
 windows-core 0.62.2：license-mit
 windows-future 0.3.2：license-mit
+windows-link 0.1.3：license-mit
 windows-link 0.2.1：license-mit
 windows-numerics 0.3.1：license-mit
+windows-registry 0.4.0：license-mit
 windows-registry 0.6.1：license-mit
 windows-result 0.2.0：license-mit
+windows-result 0.3.4：license-mit
 windows-result 0.4.1：license-mit
 windows-strings 0.1.0：license-mit
+windows-strings 0.3.1：license-mit
 windows-strings 0.5.1：license-mit
+windows-sys 0.48.0：license-mit
 windows-sys 0.61.2：license-mit
+windows-targets 0.48.5：license-mit
 windows-targets 0.52.6：license-mit
+windows-targets 0.53.5：license-mit
 windows-threading 0.2.1：license-mit
 windows-version 0.1.7：license-mit
+windows_x86_64_msvc 0.48.5：license-mit
 windows_x86_64_msvc 0.52.6：license-mit
+windows_x86_64_msvc 0.53.1：license-mit
 --------------------------------------------------------------------------------
 
     MIT License

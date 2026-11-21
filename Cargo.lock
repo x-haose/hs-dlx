@@ -669,7 +669,7 @@ dependencies = [
  "bitflags 2.13.2",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.11.0",
  "proc-macro2",
  "quote",
  "regex",
@@ -2042,7 +2042,7 @@ dependencies = [
 [[package]]
 name = "ffmpeg-sys-next"
 version = "9.0.0"
-source = "git+https://github.com/x-haose/hs-m3u8?rev=3844c2a4ececcf022021dbaecc550d7d062f3a26#3844c2a4ececcf022021dbaecc550d7d062f3a26"
+source = "git+https://github.com/x-haose/hs-m3u8?rev=ed67cba85e670288ea0d4d406b1f1eac8f30b329#ed67cba85e670288ea0d4d406b1f1eac8f30b329"
 dependencies = [
  "bindgen",
  "cc",
@@ -3481,9 +3481,9 @@ dependencies = [
 
 [[package]]
 name = "heapless"
-version = "0.9.3"
+version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25ba4bd83f9415b58b4ed8dc5714c76e626a105be4646c02630ad730ad3b5aa4"
+checksum = "411fdef4df93751117bd9ef8caa0e7f99c65dafec5bd84313eb8e2fdd75e32f2"
 dependencies = [
  "hash32",
  "stable_deref_trait",
@@ -3689,7 +3689,7 @@ dependencies = [
 [[package]]
 name = "hs-m3u8-core"
 version = "1.0.0"
-source = "git+https://github.com/x-haose/hs-m3u8?rev=3844c2a4ececcf022021dbaecc550d7d062f3a26#3844c2a4ececcf022021dbaecc550d7d062f3a26"
+source = "git+https://github.com/x-haose/hs-m3u8?rev=ed67cba85e670288ea0d4d406b1f1eac8f30b329#ed67cba85e670288ea0d4d406b1f1eac8f30b329"
 dependencies = [
  "aes 0.9.3",
  "cbc 0.2.1",
@@ -3704,6 +3704,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "sys-locale",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
@@ -3713,7 +3714,7 @@ dependencies = [
 [[package]]
 name = "hs-m3u8-hls"
 version = "1.0.0"
-source = "git+https://github.com/x-haose/hs-m3u8?rev=3844c2a4ececcf022021dbaecc550d7d062f3a26#3844c2a4ececcf022021dbaecc550d7d062f3a26"
+source = "git+https://github.com/x-haose/hs-m3u8?rev=ed67cba85e670288ea0d4d406b1f1eac8f30b329#ed67cba85e670288ea0d4d406b1f1eac8f30b329"
 dependencies = [
  "thiserror 2.0.21",
  "url",
@@ -3722,7 +3723,7 @@ dependencies = [
 [[package]]
 name = "hs-m3u8-remux"
 version = "1.0.0"
-source = "git+https://github.com/x-haose/hs-m3u8?rev=3844c2a4ececcf022021dbaecc550d7d062f3a26#3844c2a4ececcf022021dbaecc550d7d062f3a26"
+source = "git+https://github.com/x-haose/hs-m3u8?rev=ed67cba85e670288ea0d4d406b1f1eac8f30b329#ed67cba85e670288ea0d4d406b1f1eac8f30b329"
 dependencies = [
  "ffmpeg-next",
  "libc",
@@ -3733,7 +3734,7 @@ dependencies = [
 [[package]]
 name = "hs-m3u8-sysproxy"
 version = "1.0.0"
-source = "git+https://github.com/x-haose/hs-m3u8?rev=3844c2a4ececcf022021dbaecc550d7d062f3a26#3844c2a4ececcf022021dbaecc550d7d062f3a26"
+source = "git+https://github.com/x-haose/hs-m3u8?rev=ed67cba85e670288ea0d4d406b1f1eac8f30b329#ed67cba85e670288ea0d4d406b1f1eac8f30b329"
 dependencies = [
  "system-configuration 0.7.0",
  "windows-registry 0.6.1",
@@ -3879,7 +3880,7 @@ dependencies = [
  "tokio",
  "tower-service",
  "tracing",
- "windows-registry 0.6.1",
+ "windows-registry 0.4.0",
 ]
 
 [[package]]
@@ -7272,7 +7273,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8050abb251097357e24aff63ba2c52a6309ecb7d23a5474023df960a02694d8"
 dependencies = [
  "annotate-snippets",
- "base64 0.23.1",
+ "base64 0.22.1",
  "encoding_rs_io",
  "granit-parser",
  "nohash-hasher",
@@ -8013,7 +8014,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -9298,7 +9299,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
