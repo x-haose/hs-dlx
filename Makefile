@@ -1,4 +1,4 @@
-.PHONY: check ffmpeg ffmpeg_present libtorrent libtorrent_present icons licenses package \
+.PHONY: acceptance check ffmpeg ffmpeg_present libtorrent libtorrent_present icons licenses package \
 	rs_check rs_fmt rs_lint rs_clippy rs_doc rs_test rs_cov py_env py_check py_test
 
 FFMPEG_DIST := third_party/ffmpeg/dist
@@ -66,6 +66,12 @@ rs_doc: ffmpeg_present libtorrent_present runtime_present
 
 rs_test: ffmpeg_present libtorrent_present runtime_present
 	cargo test --workspace
+
+# 发版前的验收（crates/app/tests/acceptance.rs）：对真实网站、PyPI、BT 网络与 PikPak 跑，要联网；只填端口的代理一项要
+# 环境变量 HS_DLX_ACCEPT_PROXY_PORT（本机代理的端口），PikPak 一项要在浏览器里确认登录。逐个串行跑、打出过程；
+# ONLY 为测试名里的一段时只跑匹配的（如 make acceptance ONLY=youtube）
+acceptance: ffmpeg_present libtorrent_present runtime_present
+	cargo test -p hs-dlx-app --test acceptance -- --ignored --test-threads=1 --nocapture $(ONLY)
 
 # 任务存储与生命周期（app）、网盘的登录与接口（cloud）、yt-dlp 组件的核对安装与解析（ytdlp）的行覆盖各不低于 80%
 rs_cov: ffmpeg_present libtorrent_present runtime_present
