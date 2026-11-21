@@ -32,7 +32,10 @@ const BILIBILI: &str = "https://www.bilibili.com/video/BV1GJ411x7h7";
 const BLOCKED: &str = "https://www.xvideos.com/video.otdpbiv8d1c/_";
 /// Mux 的公开 HLS 测试流（Big Buck Bunny，多档清晰度）。
 const HLS: &str = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8";
-/// WebTorrent 的 Sintel 示例种子（Blender 基金会，CC BY 3.0），带 HTTP 网络种子：没有别的节点时也下得完。
+/// Debian 13.7.0 的网络安装镜像（约 790 MB）：普通 BT 网络里常年有大量做种，带 Debian 的 tracker。换了版本后旧的
+/// 做种会变少，取不到种子信息时换成 cdimage.debian.org 上当前的。
+const DEBIAN: &str = "magnet:?xt=urn:btih:7acf8fb590b2060dd9c3146ef770169d593433b0&dn=debian-13.7.0-amd64-netinst.iso&tr=http%3A%2F%2Fbttracker.debian.org%3A6969%2Fannounce";
+/// WebTorrent 的 Sintel 示例种子（Blender 基金会，CC BY 3.0）：网盘多已存有，离线即完成。
 const SINTEL: &str = "magnet:?xt=urn:btih:08ada5a7a6183aae1e09d831df6748d566095a10&dn=Sintel&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337&tr=wss%3A%2F%2Ftracker.openwebtorrent.com&ws=https%3A%2F%2Fwebtorrent.io%2Ftorrents%2F&xs=https%3A%2F%2Fwebtorrent.io%2Ftorrents%2Fsintel.torrent";
 /// WebTorrent 的 Big Buck Bunny 示例种子。
 const BIG_BUCK_BUNNY: &str = "magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c&dn=Big+Buck+Bunny&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337&tr=wss%3A%2F%2Ftracker.openwebtorrent.com&ws=https%3A%2F%2Fwebtorrent.io%2Ftorrents%2F&xs=https%3A%2F%2Fwebtorrent.io%2Ftorrents%2Fbig-buck-bunny.torrent";
@@ -82,40 +85,45 @@ impl Rig {
         }
     }
 
+    /// 在运行时里等 `future`，超过 `limit` 时以 `what` 失败。
+    fn within<F: Future>(&self, limit: Duration, what: &str, future: F) -> F::Output {
+        self.runtime.block_on(async {
+            tokio::time::timeout(limit, future)
+                .await
+                .unwrap_or_else(|_| panic!("{what}超时"))
+        })
+    }
+
     fn out(&self) -> PathBuf {
         self.dir.join("out")
     }
 
     /// 装网页视频的组件，返回装上的 yt-dlp 版本。
     fn install(&self) -> String {
-        self.service.install_web().unwrap();
-        self.web_settled()
+        self.web_changed(|service| service.install_web().unwrap())
     }
 
-    /// 等组件装好、换好（[`WebState::Ready`]），返回版本；装不成或换不成时失败。
-    fn web_settled(&self) -> String {
+    /// 做 `change`（装、更新、换回组件）后等它有了结果：组件装好、换好（[`WebState::Ready`]）时返回版本，装不成或换
+    /// 不成时失败。
+    fn web_changed(&self, change: impl FnOnce(&Service)) -> String {
         let mut state = self.service.web_state();
-        self.runtime.block_on(async {
-            tokio::time::timeout(INSTALL, async {
-                loop {
-                    match state.borrow_and_update().clone() {
-                        WebState::Ready(version) => return version,
-                        WebState::Installing(_) => {}
-                        other => panic!("组件没装好：{other:?}"),
-                    }
-                    state.changed().await.unwrap();
+        state.borrow_and_update();
+        change(&self.service);
+        self.within(INSTALL, "装组件", async {
+            loop {
+                state.changed().await.unwrap();
+                match state.borrow_and_update().clone() {
+                    WebState::Ready(version) => return version,
+                    WebState::Installing(_) => {}
+                    other => panic!("组件没装好：{other:?}"),
                 }
-            })
-            .await
-            .expect("装组件超时")
+            }
         })
     }
 
     fn resolve(&self, url: &str) -> Resolved {
         let handle = self.service.resolve(Url::parse(url).unwrap(), &[]).unwrap();
-        self.runtime
-            .block_on(tokio::time::timeout(RESOLVE, handle))
-            .expect("解析超时")
+        self.within(RESOLVE, "解析", handle)
             .unwrap()
             .unwrap_or_else(|error| panic!("解析 {url} 失败：{error}"))
     }
@@ -272,16 +280,16 @@ fn components_install_update_roll_back_and_reinstall() {
         .unwrap()
         .expect("每日构建与稳定版不同");
     println!("每日构建 {nightly}");
-    rig.service.update_web(nightly.clone()).unwrap();
-    assert_eq!(rig.web_settled(), nightly);
+    let updated = rig.web_changed(|service| service.update_web(nightly.clone()).unwrap());
+    assert_eq!(updated, nightly);
     assert_eq!(rig.service.web_previous(), Some(stable.clone()));
 
-    rig.service.rollback_web().unwrap();
-    assert_eq!(rig.web_settled(), stable);
+    let rolled_back = rig.web_changed(|service| service.rollback_web().unwrap());
+    assert_eq!(rolled_back, stable);
 
     rig.service.set_web_channel(Channel::Stable).unwrap();
-    rig.service.install_web().unwrap();
-    assert_eq!(rig.web_settled(), stable);
+    let reinstalled = rig.web_changed(|service| service.install_web().unwrap());
+    assert_eq!(reinstalled, stable);
     // 重装后照样解析得了
     let resolved = rig.resolve(YOUTUBE);
     assert!(!resolved.choices.is_empty());
@@ -352,9 +360,7 @@ fn a_blocked_site_over_a_direct_connection_says_use_a_proxy() {
         .resolve(Url::parse(BLOCKED).unwrap(), &[])
         .unwrap();
     let error = rig
-        .runtime
-        .block_on(tokio::time::timeout(RESOLVE, handle))
-        .expect("解析超时")
+        .within(RESOLVE, "解析", handle)
         .unwrap()
         .expect_err("直连应被拦");
     println!("{error}");
@@ -424,22 +430,28 @@ fn an_hls_stream_downloads_and_plays() {
     assert!(duration > 590.0 && kinds.iter().any(|k| k == "video"));
 }
 
-/// 磁力链接：取到种子信息，下完全部文件，大小对得上。
+/// 磁力链接：取到种子信息，下完全部文件，大小对得上。设了 `HS_DLX_ACCEPT_PROXY_PORT` 时 BT 经本机的 SOCKS5 代理（中国
+/// 大陆直连多半找不到节点）；取不到种子信息时打出连着的节点数与 tracker 的错误。
 #[test]
 #[ignore = "要联网，由 make acceptance 跑"]
 fn a_magnet_link_downloads() {
     let mut rig = Rig::new("magnet");
-    let fetch = rig.service.fetch_metadata(SINTEL.to_owned()).unwrap();
-    let resume = rig
-        .runtime
-        .block_on(tokio::time::timeout(RESOLVE, fetch.resume))
-        .expect("取种子信息超时")
-        .unwrap()
-        .unwrap();
+    if let Ok(port) = std::env::var("HS_DLX_ACCEPT_PROXY_PORT") {
+        let proxy = Url::parse(&format!("socks5h://127.0.0.1:{port}")).unwrap();
+        rig.service.set_torrent_proxy(Some(proxy)).unwrap();
+    }
+    let fetch = rig.service.fetch_metadata(DEBIAN.to_owned()).unwrap();
+    let progress = fetch.progress.clone();
+    let resume = rig.runtime.block_on(async {
+        tokio::time::timeout(RESOLVE, fetch.resume)
+            .await
+            .unwrap_or_else(|_| panic!("取种子信息超时：{:?}", *progress.borrow()))
+    });
+    let resume = resume.unwrap().unwrap();
     let info = TorrentInfo::of(&resume).unwrap();
     println!("{}：{} 个文件", info.name, info.files.len());
     let id = rig.create(Draft {
-        url: Url::parse(SINTEL).unwrap(),
+        url: Url::parse(DEBIAN).unwrap(),
         headers: Vec::new(),
         folder: rig.out(),
         kind: DraftKind::Torrent {
@@ -468,11 +480,7 @@ fn pikpak_offline_fetches_and_discards() {
         "在浏览器里打开 {} 确认登录，登录码 {}",
         login.url, login.user_code
     );
-    rig.runtime
-        .block_on(tokio::time::timeout(LOGIN, login.done))
-        .expect("等登录超时")
-        .unwrap()
-        .unwrap();
+    rig.within(LOGIN, "等登录", login.done).unwrap().unwrap();
     let cloud = |magnet: &str, folder: PathBuf| Draft {
         url: Url::parse(magnet).unwrap(),
         headers: Vec::new(),
