@@ -694,8 +694,8 @@ struct Failure {
 }
 
 impl Failure {
-    /// `source` 为请求里读 Cookie 的浏览器与用户资料（`cookies` 的说明里写它们），`direct` 为没走代理（`reset` 的
-    /// 说明按它写怎么办）。
+    /// `source` 为请求里读 Cookie 的浏览器与用户资料（`cookies` 的说明里写它们），`direct` 为没走代理（`reset`、
+    /// `unreachable` 的说明按它写怎么办）。
     fn into_error(self, source: Option<&CookieSource>, direct: bool) -> ExtractError {
         let browser = source.map(|source| source.browser);
         let message = self.message;
@@ -723,6 +723,13 @@ impl Failure {
             )),
             "reset" => ExtractError::Network(format!(
                 "经代理时连接被掐断：代理的出口可能被拦了，换个节点或改直连再试（{message}）"
+            )),
+            // 连接没建成（超时）：直连时多为网站在本地网络被拦（DNS 被污染到连不通的地址），走代理时多为节点连不上网站
+            "unreachable" if direct => ExtractError::Network(format!(
+                "直连连不上（{message}），多为在本地网络被拦：改走代理再试"
+            )),
+            "unreachable" => ExtractError::Network(format!(
+                "经代理连不上（{message}）：代理的节点可能连不上这个网站，换个节点或改直连再试"
             )),
             "unavailable" => ExtractError::Unavailable(message),
             "changed" => ExtractError::Changed(message),
@@ -858,18 +865,20 @@ mod tests {
         assert_eq!(plain.for_download(&info), plain);
     }
 
-    /// 连上后被掐断：直连时说改走代理，走代理时说换节点。
+    /// 连上后被掐断、连接没建成：直连时说改走代理，走代理时说换节点。
     #[test]
-    fn a_cut_off_connection_says_what_to_change_by_the_route() {
-        let reset = || Failure {
-            kind: "reset".to_owned(),
-            message: "SSLError".to_owned(),
-            reason: None,
-        };
-        let direct = reset().into_error(None, true).to_string();
-        assert!(direct.contains("改走代理"), "{direct}");
-        let proxied = reset().into_error(None, false).to_string();
-        assert!(proxied.contains("换个节点"), "{proxied}");
+    fn a_cut_off_or_unreachable_connection_says_what_to_change_by_the_route() {
+        for kind in ["reset", "unreachable"] {
+            let failure = || Failure {
+                kind: kind.to_owned(),
+                message: "建立连接超时".to_owned(),
+                reason: None,
+            };
+            let direct = failure().into_error(None, true).to_string();
+            assert!(direct.contains("改走代理"), "{direct}");
+            let proxied = failure().into_error(None, false).to_string();
+            assert!(proxied.contains("换个节点"), "{proxied}");
+        }
     }
 
     #[test]

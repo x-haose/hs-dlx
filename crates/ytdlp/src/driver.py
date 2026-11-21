@@ -300,7 +300,8 @@ def classify(error: BaseException, *, downloading: bool = False) -> tuple[str, s
 
     种类：`unsupported`（没有专门的解析器认得这个网址）、`geo`（地区限制）、`login`（要登录或 Cookie）、
     `rate_limited`（429）、`blocked`（网站拦下了这个出口）、`reset`（连上后被掐断：TLS 握手或读到一半连接没了、被
-    重置，证书不受信任不算；直连时多为网站在本地网络被拦）、`network`（其余连不上、超时、TLS；下载时服务器回的错误
+    重置，证书不受信任不算；直连时多为网站在本地网络被拦）、`unreachable`（建立连接超时：直连时多为网站在本地网络被拦，
+    说明为固定的一句，不带异常原文）、`network`（其余连不上、超时、TLS；下载时服务器回的错误
     状态与没下完整）、`disk`（下载时写不了文件）、`unavailable`（网站说视频不可用：私密、删了、未开播等）、`other`（其余，
     多为网站改了、yt-dlp 要更新）。
     网站回的错误状态：429 为限流；解析时请求网页与接口回的 401 为要登录，403、412 为拦截（`blocked`：多为出口 IP 被
@@ -321,6 +322,8 @@ def classify(error: BaseException, *, downloading: bool = False) -> tuple[str, s
         kind = status_kind(status, downloading=downloading)
     elif cut_off(root):
         kind = "reset"
+    elif connect_timed_out(root):
+        kind, message = "unreachable", "建立连接超时"
     elif "TransportError" in causes or "ContentTooShortError" in names:
         kind = "network"
     elif isinstance(original, OSError):
@@ -348,9 +351,38 @@ def status_kind(status: object, *, downloading: bool) -> str:
 def cut_off(root: BaseException) -> bool:
     """`root` 是不是连上之后被对方掐断：连接被重置，或 TLS 读到一半对方断开（握手时被掐也是这样）。
 
+    证书不受信任、协议版本不合等别的 TLS 错误不算。沿哪些找见 `in_chain`。
+    """
+
+    def is_cut_off(error: BaseException) -> bool:
+        if isinstance(error, (ConnectionResetError, ssl.SSLEOFError, ssl.SSLZeroReturnError)):
+            return True
+        return any(mark in str(error).lower() for mark in CUT_OFF)
+
+    return in_chain(root, is_cut_off)
+
+
+def connect_timed_out(root: BaseException) -> bool:
+    """`root` 是不是建立连接超时（连接没建成）：requests 与 urllib3 的连接超时，或 curl 在连接阶段超时。
+
+    连上之后读超时不算。沿哪些找见 `in_chain`。
+    """
+
+    def is_connect_timeout(error: BaseException) -> bool:
+        if {"ConnectTimeout", "ConnectTimeoutError"} & set(lineage(error)):
+            return True
+        lowered = str(error).lower()
+        return any(all(mark in lowered for mark in marks) for marks in CONNECT_TIMEOUT)
+
+    return in_chain(root, is_connect_timeout)
+
+
+def in_chain(root: BaseException, test: Callable[[BaseException], bool]) -> bool:
+    """`root` 或引起它的错误里有满足 `test` 的。
+
     沿 `cause`（yt-dlp）与 `__cause__` 找；yt-dlp 之外的异常另沿 `reason`（urllib3 的 MaxRetryError）与 `args` 找：
-    requests 包 urllib3 的错误时不用 `from`，原来的只在 `args` 里。不沿 `__context__` 找：解析器在处理一次被掐断时
-    另抛的（要登录、取不到字段的 KeyError 等）不算被掐断。证书不受信任、协议版本不合等别的 TLS 错误不算。
+    requests 包 urllib3 的错误时不用 `from`，原来的只在 `args` 里。不沿 `__context__` 找：解析器在处理一次网络错误时
+    另抛的（要登录、取不到字段的 KeyError 等）不算由它引起。
     """
     pending: list[object] = [root]
     seen: set[int] = set()
@@ -359,9 +391,7 @@ def cut_off(root: BaseException) -> bool:
         if not isinstance(error, BaseException) or id(error) in seen:
             continue
         seen.add(id(error))
-        if isinstance(error, (ConnectionResetError, ssl.SSLEOFError, ssl.SSLZeroReturnError)):
-            return True
-        if any(mark in str(error).lower() for mark in CUT_OFF):
+        if test(error):
             return True
         pending.extend((getattr(error, "cause", None), error.__cause__))
         if "YoutubeDLError" not in lineage(error):
@@ -421,6 +451,9 @@ def browser_of(request: Mapping[str, object]) -> tuple[str, str | None] | None:
 
 # 被掐断的连接在错误说明里的字样：curl_cffi（模拟浏览器指纹的请求）只给 curl 的说明，不带 Python 的异常
 CUT_OFF = ("connection reset by peer", "unexpected_eof_while_reading", "eof occurred in violation of protocol")
+# curl 在连接阶段超时的说明（每组的字样都在才算）：旧版写 Connection timed out after，新版写 Failed to connect ...
+# Timeout was reached；传输阶段超时写 Operation timed out，不算
+CONNECT_TIMEOUT = (("connection timed out after",), ("failed to connect", "timeout was reached"))
 # 读浏览器 Cookie 时 yt-dlp 的警告里，说明整罐加密的 Cookie 都解不开的（没拿到钥匙）；别的警告（某一条解不开、
 # 数据库版本较新）不影响其余的，缺的若正是要用的，网站照样回要登录
 KEYLESS = ("no key found",)

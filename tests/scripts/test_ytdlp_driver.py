@@ -336,6 +336,35 @@ def test_a_connection_cut_off_after_it_was_made_is_told_apart(scheme: str, how: 
     assert driver.classify(report_error(utils.ExtractorError("x", cause=refused)))[0] == kind
 
 
+def test_a_connection_that_times_out_before_it_is_made_is_told_apart() -> None:
+    # yt-dlp 的 requests 处理器把连接超时包成 TransportError(cause=requests 的 ConnectTimeout)，里面是 urllib3 的
+    # MaxRetryError(reason=ConnectTimeoutError)，说明是 urllib3 的元组原文；归 unreachable，说明换成固定的一句。读
+    # 超时（连上之后）照旧是 network
+    networking = importlib.import_module("yt_dlp.networking")
+    utils = importlib.import_module("yt_dlp.utils")
+    requests = importlib.import_module("requests")
+    urllib3 = importlib.import_module("urllib3")
+    url = "https://blocked.example/"
+    connect = urllib3.exceptions.ConnectTimeoutError(
+        None, "Connection to blocked.example timed out. (connect timeout=20)"
+    )
+    timed_out = requests.exceptions.ConnectTimeout(urllib3.exceptions.MaxRetryError(None, url, reason=connect))
+    error = utils.ExtractorError("x", cause=networking.exceptions.TransportError(cause=timed_out))
+    assert driver.classify(report_error(error)) == ("unreachable", "建立连接超时")
+    curl = utils.ExtractorError(
+        "x",
+        cause=networking.exceptions.TransportError(
+            cause=RuntimeError("Failed to connect to blocked.example port 443 after 20002 ms: Timeout was reached")
+        ),
+    )
+    assert driver.classify(report_error(curl))[0] == "unreachable"
+    read = urllib3.exceptions.ReadTimeoutError(None, url, "Read timed out. (read timeout=20)")
+    reading = utils.ExtractorError(
+        "x", cause=networking.exceptions.TransportError(cause=requests.exceptions.ReadTimeout(read))
+    )
+    assert driver.classify(report_error(reading))[0] == "network"
+
+
 def test_the_cookies_handed_back_have_whole_second_expiries() -> None:
     # Firefox 142 起 yt-dlp 读出的过期时间是浮点数，应用按整数秒收
     cookies = importlib.import_module("yt_dlp.cookies")
