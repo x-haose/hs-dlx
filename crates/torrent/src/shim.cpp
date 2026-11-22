@@ -9,6 +9,7 @@
 #include <libtorrent/add_torrent_params.hpp>
 #include <libtorrent/alert_types.hpp>
 #include <libtorrent/create_torrent.hpp>
+#include <libtorrent/error_code.hpp>
 #include <libtorrent/fingerprint.hpp>
 #include <libtorrent/hex.hpp>
 #include <libtorrent/load_torrent.hpp>
@@ -376,9 +377,12 @@ rust::Vec<TrackerState> Session::trackers(rust::Str id) const {
 		state.updating = false;
 		state.seeds = -1;
 		state.leechers = -1;
-		// 各监听地址（IPv4、IPv6）各通告一次，每次 v1 与 v2 各一：有一次成功就算正常；每个地址都失败过才算连不上（只有
-		// IPv4 的机器上 IPv6 的那次立即失败，IPv4 的还在等）；人数取最多的，说明取第一条
+		// 各监听地址（IPv4、IPv6、回环）各通告一次，每次 v1 与 v2 各一：有一次成功就算正常；每个地址都失败过才算连不上
+		// （路由不到 tracker 的地址立即以跳过失败，别的还在等）；人数取最多的。说明取第一条，跳过的说明只在没有别的时取：
+		// 回环地址对任何外面的 tracker 都跳过，它的说明盖住真正的原因
 		bool every_endpoint_failed = !entry.endpoints.empty();
+		std::string message;
+		std::string skipped;
 		for (lt::announce_endpoint const& endpoint : entry.endpoints) {
 			bool endpoint_failed = false;
 			for (lt::announce_infohash const& ih : endpoint.info_hashes) {
@@ -387,14 +391,14 @@ rust::Vec<TrackerState> Session::trackers(rust::Str id) const {
 				if (ih.updating) state.updating = true;
 				state.seeds = std::max(state.seeds, ih.scrape_complete);
 				state.leechers = std::max(state.leechers, ih.scrape_incomplete);
-				if (state.message.empty()) {
-					std::string const message = !ih.message.empty() ? ih.message
-						: ih.last_error ? ih.last_error.message() : std::string();
-					state.message = text_of(message);
-				}
+				std::string const said = !ih.message.empty() ? ih.message
+					: ih.last_error ? ih.last_error.message() : std::string();
+				std::string& into = ih.last_error == lt::errors::announce_skipped ? skipped : message;
+				if (into.empty()) into = said;
 			}
 			if (!endpoint_failed) every_endpoint_failed = false;
 		}
+		state.message = text_of(message.empty() ? skipped : message);
 		state.failed = !state.working && every_endpoint_failed;
 		out.push_back(std::move(state));
 	}
@@ -529,6 +533,9 @@ rust::Vec<Alert> Session::pop_alerts(std::uint32_t wait_ms) const {
 			out.push_back(alert_of(AlertKind::DeleteFailed, *a, id));
 			removed(id, true);
 		} else if (auto* t = lt::alert_cast<lt::tracker_error_alert>(a)) {
+			// 跳过（announce_skipped）不是 tracker 出错：这个监听地址路由不到 tracker，如回环地址、只有 IPv4 的机器上
+			// 的 IPv6 地址，别的监听地址照常通告；每个地址都被跳过的由 trackers 报
+			if (t->error == lt::errors::announce_skipped) continue;
 			std::string const id = id_of(t->handle);
 			bool const added = added_tracker(id, t->tracker_url());
 			out.push_back(alert_of(added ? AlertKind::AddedTrackerError : AlertKind::TrackerError, *a, id));

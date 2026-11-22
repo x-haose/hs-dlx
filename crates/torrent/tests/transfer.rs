@@ -560,3 +560,58 @@ fn added_trackers_stay_out_of_resume_data() {
     let again = session.add_magnet(&uri, path_str(&dir)).unwrap();
     assert_eq!(session.add_trackers(&again, &urls).unwrap(), 1);
 }
+
+/// 没有哪个监听地址路由得到的 tracker（只在 IPv4 回环上监听时的 IPv6 地址）被跳过：不报 tracker 出错，查 tracker 时算
+/// 连不上、说明是跳过的；连得到地址、被拒的照常报错。
+#[test]
+fn a_tracker_no_listen_address_can_route_to_is_skipped_without_an_error() {
+    let dir = scratch("skipped-tracker");
+    let session = local_session();
+    let skipped = "http://[2001:db8::1]/announce";
+    // 本机这个端口没人监听：通告随即被拒
+    let refused = "http://127.0.0.1:9/announce";
+    let hash = "1123456789abcdef0123456789abcdef01234567";
+    let uri = format!(
+        "magnet:?xt=urn:btih:{hash}&tr=http%3A%2F%2F%5B2001%3Adb8%3A%3A1%5D%2Fannounce&tr={refused}"
+    );
+    let id = session.add_magnet(&uri, path_str(&dir)).unwrap();
+    let mut errors = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        // 状态先于事件更新：都算连不上之后再取一次，跳过的事件若有必已在队列里
+        let failed = session.trackers(&id).unwrap().iter().all(|t| t.failed);
+        errors.extend(
+            session
+                .pop_alerts(100)
+                .unwrap()
+                .into_iter()
+                .filter(|alert| alert.kind == AlertKind::TrackerError)
+                .map(|alert| alert.message),
+        );
+        if failed {
+            break;
+        }
+        assert!(Instant::now() < deadline, "没等到两个 tracker 都算连不上");
+    }
+    assert!(
+        errors.iter().all(|message| !message.contains("2001:db8")),
+        "{errors:?}"
+    );
+    assert!(
+        errors.iter().any(|message| message.contains(refused)),
+        "{errors:?}"
+    );
+    let trackers = session.trackers(&id).unwrap();
+    let message = |url: &str| {
+        trackers
+            .iter()
+            .find(|t| t.url == url)
+            .map(|t| t.message.clone())
+            .unwrap()
+    };
+    assert!(message(skipped).contains("skipping"), "{trackers:?}");
+    assert!(!message(refused).contains("skipping"), "{trackers:?}");
+
+    drop(session);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
