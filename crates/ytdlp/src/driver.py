@@ -366,8 +366,23 @@ def from_proxy(error: BaseException) -> bool:
     return (
         "NewConnectionError" in names
         and type(getattr(error, "conn", None)).__name__.startswith("Socks")
-        and not isinstance(error.__cause__, socket.gaierror)
+        and not resolving_target(error.__cause__)
     )
+
+
+def resolving_target(error: BaseException | None) -> bool:
+    """`error` 是不是 yt-dlp 的 SOCKS 连接在本机解析目标网站时解析不出（socks4、socks5 由本机解析目标）。
+
+    连上代理之前解析代理自己的主机名失败也是 gaierror，按抛出它的位置（yt-dlp socks.py 的 `_resolve_address`）分开。
+    """
+    if not isinstance(error, socket.gaierror):
+        return False
+    frame = error.__traceback__
+    while frame is not None:
+        if frame.tb_frame.f_code.co_name == "_resolve_address":
+            return True
+        frame = frame.tb_next
+    return False
 
 
 def cut_off(root: BaseException) -> bool:

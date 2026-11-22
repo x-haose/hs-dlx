@@ -160,8 +160,8 @@ pub fn torrent_from_file(torrent: &[u8]) -> Result<Vec<u8>, Error> {
 pub struct MetadataProgress {
     /// 连着的节点数
     pub peers: u32,
-    /// 最近一次 tracker 报的错（libtorrent 的说明，英文，含 tracker 的地址）；没报过，或另有 tracker 正常回应（连不上
-    /// 的那个不妨碍找节点）时为 None
+    /// 最近一次 tracker 报的错（libtorrent 的说明，英文，含 tracker 的地址）；没报过，或另有 tracker 回应了这个种子
+    /// 有人在做种或在下（连不上的那个不妨碍找节点）时为 None
     pub tracker_error: Option<String>,
     /// 磁力链接没带 tracker、要补公共 tracker，而列表这次没取到时为原因（隔一阵再取）；别的时候为 None
     pub public_trackers_error: Option<String>,
@@ -1016,7 +1016,7 @@ pub(crate) async fn fetch_metadata(
             .trackers(&id)
             .map_err(owner.libtorrent("查 tracker"))?
             .iter()
-            .any(|tracker| tracker.working);
+            .any(|tracker| tracker.working && (tracker.seeds > 0 || tracker.leechers > 0));
         progress.send_replace(MetadataProgress {
             peers: u32::try_from(status.peers).expect("libtorrent 的计数不为负"),
             tracker_error: tracker_error.clone().filter(|_| !answered),

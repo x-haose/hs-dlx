@@ -695,7 +695,7 @@ struct Failure {
 
 impl Failure {
     /// `source` 为请求里读 Cookie 的浏览器与用户资料（`cookies` 的说明里写它们），`direct` 为没走代理（`reset`、
-    /// `unreachable` 的说明按它写怎么办；`proxy` 只在走代理时有）。
+    /// `unreachable` 的说明按它写怎么办；直连时的 `proxy` 只能是网站或中间设备回的 407，照原文报）。
     fn into_error(self, source: Option<&CookieSource>, direct: bool) -> ExtractError {
         let browser = source.map(|source| source.browser);
         let message = self.message;
@@ -732,6 +732,7 @@ impl Failure {
             "unreachable" => ExtractError::Network(format!(
                 "经代理连不上（{message}）：代理的节点可能连不上这个网站，换个节点或改直连再试；代理不在本机时也可能是代理本身连不上"
             )),
+            "proxy" if direct => ExtractError::Network(message),
             "proxy" => ExtractError::Network(format!(
                 "代理出错（{message}）：先确认代理开着、端口对，要登录的代理在设置里填好用户名与密码；代理没问题时多为它的节点连不上这个网站，换个节点或改直连再试"
             )),

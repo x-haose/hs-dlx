@@ -53,7 +53,8 @@
 
 - BT 任务不再误报「tracker 报错：… skipping tracker announce (unreachable)」：那是本机的某个地址（如 127.0.0.1）
   连不到这个 tracker、不经它通告，别的地址照常通告。本机所有地址都连不到时（如 tracker 只有 IPv6 地址、本机只连着
-  IPv4 网络）照样报，写明原因；网络检测里 tracker 连不上时显示真正的原因
+  IPv4 网络）照样报，写明原因；网络检测里 tracker 连不上时显示真正的原因。取种子信息时另有 tracker 回应了有人在
+  做种或在下，就不显示连不上的那个 tracker 的报错
 
 ### 已知限制
 
