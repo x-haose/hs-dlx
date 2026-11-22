@@ -1700,6 +1700,7 @@ pub(crate) async fn diagnose(
         working: tracker.working,
         failed: tracker.failed,
         message: tracker.message.clone(),
+        unroutable: tracker.unroutable,
     };
     let public = match &*engine.public.borrow() {
         PublicTrackers::Off => Public::Off,

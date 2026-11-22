@@ -314,7 +314,10 @@ impl NewTask {
             body.push(
                 ui::note("没有节点有这个种子时会一直找，可随时取消", false).into_any_element(),
             );
-            if let Some(error) = &progress.tracker_error {
+            // 连上了节点时 tracker 报错不妨碍取种子信息（多为种子带的几个 tracker 里有连不上的），不显示
+            if let Some(error) = &progress.tracker_error
+                && progress.peers == 0
+            {
                 body.push(ui::note(format!("tracker 报错：{error}"), true).into_any_element());
             }
             if let Some(error) = &progress.public_trackers_error {

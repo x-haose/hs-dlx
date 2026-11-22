@@ -586,17 +586,48 @@ fn a_tracker_no_listen_address_can_route_to_is_reported_as_unroutable() {
     assert!(
         about(unroutable)
             .iter()
-            .all(|m| m.contains("本机没有能连到")),
+            .all(|m| m.contains("本机的网络地址都连不到它")),
         "{errors:?}"
     );
     assert!(
         about(refused)
             .iter()
-            .all(|m| !m.contains("本机没有能连到") && !m.contains("skipping")),
+            .all(|m| !m.contains("本机的网络地址都连不到它") && !m.contains("skipping")),
         "{errors:?}"
     );
     let message = tracker_message(&session, &id, unroutable);
-    assert!(message.contains("本机没有能连到"), "{message}");
+    assert!(message.contains("本机的网络地址都连不到它"), "{message}");
+
+    drop(session);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 跳过的事件还在队列里时种子移除完了：照样取得出事件，不因查不到这个种子的 tracker 出错。
+#[test]
+fn a_skipped_announce_of_a_removed_torrent_still_pops() {
+    let dir = scratch("skipped-then-removed");
+    let session = local_session();
+    let hash = "3123456789abcdef0123456789abcdef01234567";
+    let uri =
+        format!("magnet:?xt=urn:btih:{hash}&tr=http%3A%2F%2F%5B2001%3Adb8%3A%3A1%5D%2Fannounce");
+    let id = session.add_magnet(&uri, path_str(&dir)).unwrap();
+    // 先不取事件：跳过的事件留在队列里
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !session.trackers(&id).unwrap().iter().all(|t| t.failed) {
+        assert!(Instant::now() < deadline, "没等到 tracker 算连不上");
+    }
+    session.remove(&id, Removal::Keep).unwrap();
+    // 移除完之后种子的句柄失效，查它即出错
+    while session.trackers(&id).is_ok() {
+        assert!(Instant::now() < deadline, "没等到种子移除完");
+    }
+    let kinds: Vec<AlertKind> = session
+        .pop_alerts(100)
+        .unwrap()
+        .into_iter()
+        .map(|a| a.kind)
+        .collect();
+    assert!(kinds.contains(&AlertKind::Removed), "{kinds:?}");
 
     drop(session);
     std::fs::remove_dir_all(&dir).unwrap();
@@ -617,7 +648,7 @@ fn a_tracker_skipped_on_some_listen_addresses_reports_the_real_failure() {
     assert!(
         errors
             .iter()
-            .all(|m| !m.contains("skipping") && !m.contains("本机没有能连到")),
+            .all(|m| !m.contains("skipping") && !m.contains("本机的网络地址都连不到它")),
         "{errors:?}"
     );
     let message = tracker_message(&session, &id, refused);

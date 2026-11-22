@@ -733,7 +733,7 @@ impl Failure {
                 "经代理连不上（{message}）：代理的节点可能连不上这个网站，换个节点或改直连再试；代理不在本机时也可能是代理本身连不上"
             )),
             "proxy" => ExtractError::Network(format!(
-                "代理出错（{message}）：先确认代理开着、端口对；代理没问题时多为它的节点连不上这个网站，换个节点或改直连再试"
+                "代理出错（{message}）：先确认代理开着、端口对，要登录的代理在设置里填好用户名与密码；代理没问题时多为它的节点连不上这个网站，换个节点或改直连再试"
             )),
             "unavailable" => ExtractError::Unavailable(message),
             "changed" => ExtractError::Changed(message),

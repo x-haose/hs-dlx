@@ -37,7 +37,7 @@ std::string canonical(lt::info_hash_t const& hashes) {
 }
 
 // 本机每个监听地址都路由不到 tracker 时的说明
-char const* const UNROUTABLE = "本机没有能连到这个 tracker 的网络地址（多为它只有 IPv6 地址，而本机只连着 IPv4 网络）";
+char const* const UNROUTABLE = "本机的网络地址都连不到它：本机没联网，或它只有另一种 IP 版本的地址（如只有 IPv6，而本机只连着 IPv4）";
 
 bool skipped(lt::announce_infohash const& ih) { return ih.last_error == lt::errors::announce_skipped; }
 
@@ -49,6 +49,16 @@ bool skipped_everywhere(lt::announce_entry const& entry) {
 					   [](lt::announce_infohash const& ih) { return ih.start_sent && ih.fails == 0; })
 				&& std::any_of(endpoint.info_hashes.begin(), endpoint.info_hashes.end(), skipped);
 		});
+}
+
+// `handle` 的 tracker；种子已移除完（它的事件还在队列里）时为空
+std::vector<lt::announce_entry> trackers_of(lt::torrent_handle const& handle) {
+	try {
+		return handle.trackers();
+	} catch (lt::system_error const& error) {
+		if (error.code() == lt::errors::invalid_torrent_handle) return {};
+		throw;
+	}
 }
 
 // `id` 是 `hashes` 里 v1 或（截短的）v2 信息哈希的十六进制串
@@ -411,7 +421,8 @@ rust::Vec<TrackerState> Session::trackers(rust::Str id) const {
 			}
 			if (!endpoint_failed) every_endpoint_failed = false;
 		}
-		state.message = text_of(message.empty() && skipped_everywhere(entry) ? std::string(UNROUTABLE) : message);
+		state.unroutable = message.empty() && skipped_everywhere(entry);
+		state.message = text_of(state.unroutable ? std::string(UNROUTABLE) : message);
 		state.failed = !state.working && every_endpoint_failed;
 		out.push_back(std::move(state));
 	}
@@ -547,12 +558,12 @@ rust::Vec<Alert> Session::pop_alerts(std::uint32_t wait_ms) const {
 			removed(id, true);
 		} else if (auto* t = lt::alert_cast<lt::tracker_error_alert>(a)) {
 			// 跳过（announce_skipped）：这个监听地址路由不到 tracker（回环地址、只有 IPv4 的网络上的 IPv6 地址；HTTP 的
-			// 在取网卡、UDP 的在解析时），别的地址照常通告，不算出错；每个地址都被跳过才报，说明为 UNROUTABLE。暂停、停止时
+			// 在取网卡、UDP 的在解析时），别的地址照常通告，不算出错；每个地址都被跳过才报，说明为 UNROUTABLE。会话暂停、关闭时
 			// 撤下的通告（bittorrent）也以跳过结束，不报
 			bool const skip = t->error == lt::errors::announce_skipped;
 			if (skip) {
 				bool const unroutable = t->op == lt::operation_t::get_interface || t->op == lt::operation_t::hostname_lookup;
-				std::vector<lt::announce_entry> const trackers = unroutable ? t->handle.trackers() : std::vector<lt::announce_entry>();
+				std::vector<lt::announce_entry> const trackers = unroutable ? trackers_of(t->handle) : std::vector<lt::announce_entry>();
 				std::string const url = t->tracker_url();
 				bool const everywhere = std::any_of(trackers.begin(), trackers.end(),
 					[&](lt::announce_entry const& entry) { return entry.url == url && skipped_everywhere(entry); });

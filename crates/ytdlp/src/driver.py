@@ -300,9 +300,9 @@ def classify(error: BaseException, *, downloading: bool = False) -> tuple[str, s
 
     种类：`unsupported`（没有专门的解析器认得这个网址）、`geo`（地区限制）、`login`（要登录或 Cookie）、
     `rate_limited`（429）、`blocked`（网站拦下了这个出口）、`reset`（连上后被掐断：TLS 握手或读到一半连接没了、被
-    重置，证书不受信任不算；直连时多为网站在本地网络被拦）、`proxy`（代理报的错：连不上代理，或代理说它连不上网站，如
-    SOCKS 回 Host unreachable、HTTP 代理建隧道回 502）、`unreachable`（建立连接超时：直连时多为网站在本地网络被拦，
-    说明为固定的一句，不带异常原文；拒绝连接、域名解析失败不算）、`network`（其余连不上、超时、TLS；下载时服务器回的错误
+    重置，证书不受信任不算；直连时多为网站在本地网络被拦）、`proxy`（代理报的错：连不上代理、代理要认证，或代理说它
+    连不上网站，如 SOCKS 回 Host unreachable、HTTP 代理建隧道回 502）、`unreachable`（建立连接超时：直连时多为网站在
+    本地网络被拦，说明为固定的一句，不带异常原文；拒绝连接、域名解析失败不算）、`network`（其余连不上、超时、TLS；下载时服务器回的错误
     状态与没下完整）、`disk`（下载时写不了文件）、`unavailable`（网站说视频不可用：私密、删了、未开播等）、`other`（其余，
     多为网站改了、yt-dlp 要更新）。
     网站回的错误状态：429 为限流；解析时请求网页与接口回的 401 为要登录，403、412 为拦截（`blocked`：多为出口 IP 被
@@ -321,7 +321,7 @@ def classify(error: BaseException, *, downloading: bool = False) -> tuple[str, s
         kind = "geo"
     elif status is not None:
         kind = status_kind(status, downloading=downloading)
-    elif in_chain(root, lambda error: "ProxyError" in lineage(error)):
+    elif in_chain(root, from_proxy):
         kind = "proxy"
     elif cut_off(root):
         kind = "reset"
@@ -349,6 +349,17 @@ def status_kind(status: object, *, downloading: bool) -> str:
     if status in GONE:
         return "unavailable"
     return "network"
+
+
+def from_proxy(error: BaseException) -> bool:
+    """`error` 是不是代理报的：各家的 ProxyError，或 yt-dlp 的 SOCKS 连接连不上代理。
+
+    yt-dlp 把连 SOCKS 代理时的 OSError 包成 urllib3 的 NewConnectionError，连接对象是 Socks*Connection。
+    """
+    names = lineage(error)
+    if "ProxyError" in names:
+        return True
+    return "NewConnectionError" in names and type(getattr(error, "conn", None)).__name__.startswith("Socks")
 
 
 def cut_off(root: BaseException) -> bool:
