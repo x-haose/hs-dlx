@@ -695,7 +695,7 @@ struct Failure {
 
 impl Failure {
     /// `source` 为请求里读 Cookie 的浏览器与用户资料（`cookies` 的说明里写它们），`direct` 为没走代理（`reset`、
-    /// `unreachable` 的说明按它写怎么办）。
+    /// `unreachable` 的说明按它写怎么办；`proxy` 只在走代理时有）。
     fn into_error(self, source: Option<&CookieSource>, direct: bool) -> ExtractError {
         let browser = source.map(|source| source.browser);
         let message = self.message;
@@ -728,8 +728,12 @@ impl Failure {
             "unreachable" if direct => ExtractError::Network(format!(
                 "直连连不上（{message}），多为在本地网络被拦：改走代理再试"
             )),
+            // 经 SOCKS 代理时，代理本身连不上与节点连不上网站都是建立连接超时，分不出
             "unreachable" => ExtractError::Network(format!(
-                "经代理连不上（{message}）：代理的节点可能连不上这个网站，换个节点或改直连再试"
+                "经代理连不上（{message}）：代理的节点可能连不上这个网站，换个节点或改直连再试；代理不在本机时也可能是代理本身连不上"
+            )),
+            "proxy" => ExtractError::Network(format!(
+                "代理出错（{message}）：先确认代理开着、端口对；代理没问题时多为它的节点连不上这个网站，换个节点或改直连再试"
             )),
             "unavailable" => ExtractError::Unavailable(message),
             "changed" => ExtractError::Changed(message),

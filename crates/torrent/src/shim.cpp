@@ -36,6 +36,21 @@ std::string canonical(lt::info_hash_t const& hashes) {
 	return lt::aux::to_hex(hashes.has_v1() ? hashes.v1 : hashes.get(lt::protocol_version::V2));
 }
 
+// 本机每个监听地址都路由不到 tracker 时的说明
+char const* const UNROUTABLE = "本机没有能连到这个 tracker 的网络地址（多为它只有 IPv6 地址，而本机只连着 IPv4 网络）";
+
+bool skipped(lt::announce_infohash const& ih) { return ih.last_error == lt::errors::announce_skipped; }
+
+// `entry` 在每个监听地址上都被跳过（路由不到），没有一次成功
+bool skipped_everywhere(lt::announce_entry const& entry) {
+	return !entry.endpoints.empty()
+		&& std::all_of(entry.endpoints.begin(), entry.endpoints.end(), [](lt::announce_endpoint const& endpoint) {
+			return std::none_of(endpoint.info_hashes.begin(), endpoint.info_hashes.end(),
+					   [](lt::announce_infohash const& ih) { return ih.start_sent && ih.fails == 0; })
+				&& std::any_of(endpoint.info_hashes.begin(), endpoint.info_hashes.end(), skipped);
+		});
+}
+
 // `id` 是 `hashes` 里 v1 或（截短的）v2 信息哈希的十六进制串
 bool names(lt::info_hash_t const& hashes, std::string const& id) {
 	return (hashes.has_v1() && lt::aux::to_hex(hashes.v1) == id)
@@ -378,11 +393,10 @@ rust::Vec<TrackerState> Session::trackers(rust::Str id) const {
 		state.seeds = -1;
 		state.leechers = -1;
 		// 各监听地址（IPv4、IPv6、回环）各通告一次，每次 v1 与 v2 各一：有一次成功就算正常；每个地址都失败过才算连不上
-		// （路由不到 tracker 的地址立即以跳过失败，别的还在等）；人数取最多的。说明取第一条，跳过的说明只在没有别的时取：
-		// 回环地址对任何外面的 tracker 都跳过，它的说明盖住真正的原因
+		// （路由不到 tracker 的地址立即以跳过失败，别的还在等）；人数取最多的。说明取第一条不是跳过的（回环地址对任何
+		// 外面的 tracker 都跳过，它的说明会盖住真正的原因），每个地址都被跳过时为 UNROUTABLE
 		bool every_endpoint_failed = !entry.endpoints.empty();
 		std::string message;
-		std::string skipped;
 		for (lt::announce_endpoint const& endpoint : entry.endpoints) {
 			bool endpoint_failed = false;
 			for (lt::announce_infohash const& ih : endpoint.info_hashes) {
@@ -393,12 +407,11 @@ rust::Vec<TrackerState> Session::trackers(rust::Str id) const {
 				state.leechers = std::max(state.leechers, ih.scrape_incomplete);
 				std::string const said = !ih.message.empty() ? ih.message
 					: ih.last_error ? ih.last_error.message() : std::string();
-				std::string& into = ih.last_error == lt::errors::announce_skipped ? skipped : message;
-				if (into.empty()) into = said;
+				if (message.empty() && !skipped(ih)) message = said;
 			}
 			if (!endpoint_failed) every_endpoint_failed = false;
 		}
-		state.message = text_of(message.empty() ? skipped : message);
+		state.message = text_of(message.empty() && skipped_everywhere(entry) ? std::string(UNROUTABLE) : message);
 		state.failed = !state.working && every_endpoint_failed;
 		out.push_back(std::move(state));
 	}
@@ -533,12 +546,23 @@ rust::Vec<Alert> Session::pop_alerts(std::uint32_t wait_ms) const {
 			out.push_back(alert_of(AlertKind::DeleteFailed, *a, id));
 			removed(id, true);
 		} else if (auto* t = lt::alert_cast<lt::tracker_error_alert>(a)) {
-			// 跳过（announce_skipped）不是 tracker 出错：这个监听地址路由不到 tracker，如回环地址、只有 IPv4 的机器上
-			// 的 IPv6 地址，别的监听地址照常通告；每个地址都被跳过的由 trackers 报
-			if (t->error == lt::errors::announce_skipped) continue;
+			// 跳过（announce_skipped）：这个监听地址路由不到 tracker（回环地址、只有 IPv4 的网络上的 IPv6 地址；HTTP 的
+			// 在取网卡、UDP 的在解析时），别的地址照常通告，不算出错；每个地址都被跳过才报，说明为 UNROUTABLE。暂停、停止时
+			// 撤下的通告（bittorrent）也以跳过结束，不报
+			bool const skip = t->error == lt::errors::announce_skipped;
+			if (skip) {
+				bool const unroutable = t->op == lt::operation_t::get_interface || t->op == lt::operation_t::hostname_lookup;
+				std::vector<lt::announce_entry> const trackers = unroutable ? t->handle.trackers() : std::vector<lt::announce_entry>();
+				std::string const url = t->tracker_url();
+				bool const everywhere = std::any_of(trackers.begin(), trackers.end(),
+					[&](lt::announce_entry const& entry) { return entry.url == url && skipped_everywhere(entry); });
+				if (!everywhere) continue;
+			}
 			std::string const id = id_of(t->handle);
 			bool const added = added_tracker(id, t->tracker_url());
-			out.push_back(alert_of(added ? AlertKind::AddedTrackerError : AlertKind::TrackerError, *a, id));
+			Alert alert = alert_of(added ? AlertKind::AddedTrackerError : AlertKind::TrackerError, *a, id);
+			if (skip) alert.message = text_of(std::string(t->tracker_url()) + "：" + UNROUTABLE);
+			out.push_back(std::move(alert));
 		} else if (lt::alert_cast<lt::alerts_dropped_alert>(a)) {
 			mark_lost();
 			out.push_back(alert_of(AlertKind::AlertsDropped, *a, std::string()));

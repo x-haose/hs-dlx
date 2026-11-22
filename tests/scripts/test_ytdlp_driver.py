@@ -365,6 +365,30 @@ def test_a_connection_that_times_out_before_it_is_made_is_told_apart() -> None:
     assert driver.classify(report_error(reading))[0] == "network"
 
 
+def free_port() -> int:
+    """本机一个此刻没人监听的端口：连它随即被拒。"""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
+@pytest.mark.parametrize(("proxy", "kind"), [("", "network"), ("http://127.0.0.1:{port}", "proxy")])
+def test_a_refused_connection_is_not_a_connect_timeout(proxy: str, kind: str) -> None:
+    # 真的经 yt-dlp 的 requests 处理器：urllib3 的 NewConnectionError 是 ConnectTimeoutError 的子类，被拒不能归成
+    # 连接超时；经 HTTP 代理时连不上代理，urllib3 包成 ProxyError
+    yt_dlp = importlib.import_module("yt_dlp")
+    utils = importlib.import_module("yt_dlp.utils")
+    port = free_port()
+    with yt_dlp.YoutubeDL({"quiet": True, "retries": 0, "proxy": proxy.format(port=port)}) as ydl:
+        try:
+            ydl.urlopen(f"http://127.0.0.1:{port}/")
+        except utils.YoutubeDLError as error:
+            refused = error
+        else:
+            pytest.fail("连接被拒却拿到了回应")
+    assert driver.classify(report_error(utils.ExtractorError("x", cause=refused)))[0] == kind
+
+
 def test_the_cookies_handed_back_have_whole_second_expiries() -> None:
     # Firefox 142 起 yt-dlp 读出的过期时间是浮点数，应用按整数秒收
     cookies = importlib.import_module("yt_dlp.cookies")
