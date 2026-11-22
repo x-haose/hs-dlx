@@ -4,7 +4,7 @@ hs-dlx 桌面应用静态链接或随带了以下软件：
 
 1. FFmpeg 9.0.2（https://ffmpeg.org），按 GNU Lesser General Public License（LGPL）2.1 或更高版本授权，全文见
    FFmpeg-LGPL-2.1.txt。FFmpeg 的源码未作修改，只编译了转封装用到的组件，configure 参数见 hs-m3u8 的构建脚本：
-   https://github.com/x-haose/hs-m3u8/blob/ed67cba85e670288ea0d4d406b1f1eac8f30b329/third_party/ffmpeg/build.sh
+   https://github.com/x-haose/hs-m3u8/blob/08046bb758128e20426db14ef8a884a2f9864697/third_party/ffmpeg/build.sh
    对应的源码包 ffmpeg-9.0.2.tar.xz 可从
    https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz 取得，SHA-256 为
    8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e。

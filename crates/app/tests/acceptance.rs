@@ -21,7 +21,7 @@ use hs_dlx_app::{
     WebProgress, WebState,
 };
 use hs_m3u8_core::hls::{AudioChoice, Preference as TrackPreference};
-use hs_m3u8_core::{Proxy, Source, Url};
+use hs_m3u8_core::{Proxy, Resource, Source, Url};
 use tokio::runtime::Runtime;
 
 /// Blender 基金会的 Big Buck Bunny（CC BY 3.0），约 10 分钟。
@@ -121,8 +121,15 @@ impl Rig {
         })
     }
 
+    /// 照桌面端新建任务的走法解析网页 `url`：先认出它是网页（[`Service::identify`]），再交给 yt-dlp。
     fn resolve(&self, url: &str) -> Resolved {
-        let handle = self.service.resolve(Url::parse(url).unwrap(), &[]).unwrap();
+        let parsed = Url::parse(url).unwrap();
+        let identified = self.service.identify(Source::new(parsed.clone())).unwrap();
+        match self.within(RESOLVE, "认出地址", identified).unwrap() {
+            Ok(Resource::Page { .. }) => {}
+            other => panic!("{url} 应认出为网页：{other:?}"),
+        }
+        let handle = self.service.resolve(parsed, &[]).unwrap();
         self.within(RESOLVE, "解析", handle)
             .unwrap()
             .unwrap_or_else(|error| panic!("解析 {url} 失败：{error}"))

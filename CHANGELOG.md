@@ -55,6 +55,8 @@
   连不到这个 tracker、不经它通告，别的地址照常通告。本机所有地址都连不到时（如 tracker 只有 IPv6 地址、本机只连着
   IPv4 网络）照样报，写明原因；网络检测里 tracker 连不上时显示真正的原因。取种子信息时另有 tracker 回应了有人在
   做种或在下，就不显示连不上的那个 tracker 的报错
+- 响应头很大的网站（如 YouTube）不再探测失败、报「http2 error：stream error detected」：HTTP/2 响应头的上限从
+  16 KiB 提到与 Chrome 相同的 256 KiB
 
 ### 已知限制
 
