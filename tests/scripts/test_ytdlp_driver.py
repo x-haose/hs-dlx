@@ -358,6 +358,16 @@ def test_a_connection_that_times_out_before_it_is_made_is_told_apart() -> None:
         ),
     )
     assert driver.classify(report_error(curl))[0] == "unreachable"
+    # curl 连不上代理：yt-dlp 的 curl_cffi 处理器不报 ProxyError
+    over_proxy = utils.ExtractorError(
+        "x",
+        cause=networking.exceptions.TransportError(
+            cause=RuntimeError(
+                "Failed to connect to www.example.com port 443 over proxy 127.0.0.1 after 0 ms: Could not connect"
+            )
+        ),
+    )
+    assert driver.classify(report_error(over_proxy))[0] == "proxy"
     read = urllib3.exceptions.ReadTimeoutError(None, url, "Read timed out. (read timeout=20)")
     reading = utils.ExtractorError(
         "x", cause=networking.exceptions.TransportError(cause=requests.exceptions.ReadTimeout(read))
@@ -569,13 +579,14 @@ def test_failures_are_classified_by_what_the_site_said_and_where_they_happened()
         (404, "unavailable"),
         (429, "rate_limited"),
         (401, "login"),
+        (407, "proxy"),
     ):
         response = networking.Response(io.BytesIO(b""), "http://x/", {}, status=status)
         cause = networking.exceptions.HTTPError(response)
         refused = utils.ExtractorError(f"HTTP Error {status}", cause=cause, expected=True)
         assert driver.classify(report_error(refused))[0] == kind, status
-        # 下载时直链回的：除了限流都算网络（再试即换新的直链）
-        downloading = "rate_limited" if status == driver.TOO_MANY_REQUESTS else "network"
+        # 下载时直链回的：除了限流、代理要认证都算网络（再试即换新的直链）
+        downloading = kind if status in {429, 407} else "network"
         assert driver.classify(report_error(cause), downloading=True)[0] == downloading, status
     assert driver.classify(report_error(utils.ContentTooShortError(1, 2)))[0] == "network"
     # 解析器在处理一次被掐断时另报要登录：照它说的归类

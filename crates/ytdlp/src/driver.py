@@ -37,6 +37,7 @@ import io
 import json
 import math
 import os
+import socket
 import ssl
 import sys
 import threading
@@ -54,8 +55,9 @@ Info = dict[str, Any]
 
 # 网络请求的等待上限（秒）：一次解析要发多个请求，整次的时限由应用掐
 SOCKET_TIMEOUT = 20
-# 请求太频繁的 HTTP 状态
-TOO_MANY_REQUESTS = 429
+# 解析与下载时都照它归类的 HTTP 状态：429 请求太频繁；407 代理要认证（经代理请求 http:// 网址时代理直接回，
+# https:// 的在建隧道时回、yt-dlp 报 ProxyError）
+ANY_STATUS: dict[object, str] = {429: "rate_limited", 407: "proxy"}
 # 播放列表最多列多少条：大的频道一页页翻完要很久
 PLAYLIST_LIMIT = 200
 # 意外异常的调用栈留多少字符
@@ -305,9 +307,9 @@ def classify(error: BaseException, *, downloading: bool = False) -> tuple[str, s
     本地网络被拦，说明为固定的一句，不带异常原文；拒绝连接、域名解析失败不算）、`network`（其余连不上、超时、TLS；下载时服务器回的错误
     状态与没下完整）、`disk`（下载时写不了文件）、`unavailable`（网站说视频不可用：私密、删了、未开播等）、`other`（其余，
     多为网站改了、yt-dlp 要更新）。
-    网站回的错误状态：429 为限流；解析时请求网页与接口回的 401 为要登录，403、412 为拦截（`blocked`：多为出口 IP 被
-    风控，如 B 站对境外代理回 412；换直连或别的出口、登录后再试），404、410 为不可用；其余（5xx 等，与 `downloading` 时
-    直链回的一切状态）算网络：多为一时的或直链过期，再试即重新解析、换新的直链。
+    网站回的错误状态：429 为限流，407（代理要认证）归 `proxy`；解析时请求网页与接口回的 401 为要登录，403、412 为拦截
+    （`blocked`：多为出口 IP 被风控，如 B 站对境外代理回 412；换直连或别的出口、登录后再试），404、410 为不可用；其余
+    （5xx 等，与 `downloading` 时直链回的一切状态）算网络：多为一时的或直链过期，再试即重新解析、换新的直链。
     """
     original = unwrapped(error)
     message = clean(str(getattr(original, "orig_msg", None) or original))
@@ -338,8 +340,8 @@ def classify(error: BaseException, *, downloading: bool = False) -> tuple[str, s
 
 def status_kind(status: object, *, downloading: bool) -> str:
     """网站回的错误状态 `status` 的种类（见 `classify`）。"""
-    if status == TOO_MANY_REQUESTS:
-        return "rate_limited"
+    if status in ANY_STATUS:
+        return ANY_STATUS[status]
     if downloading:
         return "network"
     if status == UNAUTHORIZED:
@@ -352,14 +354,20 @@ def status_kind(status: object, *, downloading: bool) -> str:
 
 
 def from_proxy(error: BaseException) -> bool:
-    """`error` 是不是代理报的：各家的 ProxyError，或 yt-dlp 的 SOCKS 连接连不上代理。
+    """`error` 是不是代理报的：各家的 ProxyError，curl 连不上代理，或 yt-dlp 的 SOCKS 连接连不上代理。
 
-    yt-dlp 把连 SOCKS 代理时的 OSError 包成 urllib3 的 NewConnectionError，连接对象是 Socks*Connection。
+    yt-dlp 把连 SOCKS 代理时的 OSError 包成 urllib3 的 NewConnectionError，连接对象是 Socks*Connection；其中本机解析
+    不出主机名的（socks4、socks5 由本机解析目标网站）是域名解析失败，不算。curl 连不上代理（code 7）时 yt-dlp 的
+    curl_cffi 处理器不报 ProxyError，说明是 `Failed to connect to <网站> over proxy <代理> …`。
     """
     names = lineage(error)
-    if "ProxyError" in names:
+    if "ProxyError" in names or CURL_OVER_PROXY in str(error).lower():
         return True
-    return "NewConnectionError" in names and type(getattr(error, "conn", None)).__name__.startswith("Socks")
+    return (
+        "NewConnectionError" in names
+        and type(getattr(error, "conn", None)).__name__.startswith("Socks")
+        and not isinstance(error.__cause__, socket.gaierror)
+    )
 
 
 def cut_off(root: BaseException) -> bool:
@@ -470,6 +478,8 @@ CUT_OFF = ("connection reset by peer", "unexpected_eof_while_reading", "eof occu
 # curl 在连接阶段超时的说明（每组的字样都在才算）：旧版写 Connection timed out after，新版写 Failed to connect ...
 # Timeout was reached；传输阶段超时写 Operation timed out，不算
 CONNECT_TIMEOUT = (("connection timed out after",), ("failed to connect", "timeout was reached"))
+# curl 经代理连不上时说明里的字样（小写）
+CURL_OVER_PROXY = " over proxy "
 # 读浏览器 Cookie 时 yt-dlp 的警告里，说明整罐加密的 Cookie 都解不开的（没拿到钥匙）；别的警告（某一条解不开、
 # 数据库版本较新）不影响其余的，缺的若正是要用的，网站照样回要登录
 KEYLESS = ("no key found",)
