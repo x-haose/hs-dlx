@@ -322,6 +322,8 @@ struct SeedControl {
     cancel: CancellationToken,
     /// 用户停止了做种（[`Service::stop_seeding`]）：停下后不再做种，即使停的期间应用正在退出
     by_user: Arc<AtomicBool>,
+    /// 停下了（进度与「不再做种」已写进存储、已撤登记）时为 true
+    ended: watch::Receiver<bool>,
 }
 
 /// 任务服务。不能在 tokio 运行时里释放：释放时要在自己的运行时上等任务停下（见 [`Service::close`]）。
@@ -621,22 +623,7 @@ impl Service {
     /// 停止做种：随即记为不再做种（之后应用退出或崩溃也不再接着做），再存下进度、从 BT 会话里移除；停下后发
     /// [`Event::SeedingEnded`]。没在做种时什么也不做；记不进存储时报错，做种照旧。
     pub fn stop_seeding(&self, id: TaskId) -> Result<(), Error> {
-        let shared = &self.shared;
-        let mut store = lock(&shared.store);
-        let tx = store.transaction()?;
-        let applied = shared.apply_unsaved(&tx)?;
-        let Some((cancel, by_user)) = lock(&shared.seeders)
-            .get(&id)
-            .map(|seeder| (seeder.cancel.clone(), seeder.by_user.clone()))
-        else {
-            return Ok(());
-        };
-        store::set_seeding_task(&tx, id, false)?;
-        shared.commit(tx, applied)?;
-        // 提交了才停（提交失败时做种照旧，与报的错一致），仍在 `store` 锁内：与关闭的先后分明
-        by_user.store(true, Ordering::Relaxed);
-        cancel.cancel();
-        Ok(())
+        self.shared.stop_seeding(id).map(drop)
     }
 
     /// 记下 BT 经的 SOCKS5 代理（None 为直连），BT 会话已建时随即照它连。不是 `socks5://` 或 `socks5h://` 开头、没写
@@ -1070,63 +1057,21 @@ impl Service {
     }
 
     /// 从存储里删掉任务，输出不动：用于已完成的（任务目录已在完成时删掉，输出归用户；BT 另删保存目录里它的 `.parts`
-    /// 文件）与没有自己的任务目录的 HLS、文件任务。别的报 [`Error::NotFinished`]：它们的任务目录（BT 为下了的文件）要用
-    /// [`Service::discard`] 一起删。在做种的报 [`Error::Seeding`]；`.parts` 删不掉时报 [`Error::Io`]，记录留着。
-    pub fn forget(&self, id: TaskId) -> Result<(), Error> {
-        let part = self.shared.write(|tx| {
-            if lock(&self.shared.discarding).contains(&id) {
-                return Err(Error::Discarding(id));
-            }
-            if lock(&self.shared.seeders).contains_key(&id) {
-                return Err(Error::Seeding(id));
-            }
-            let task = store::get(tx, id)?.ok_or(Error::NotFound(id))?;
-            let unfinished = task.work_dir.is_some() || task.spec.torrent().is_some();
-            if task.status != Status::Done && unfinished {
-                return Err(Error::NotFinished(id));
-            }
-            // BT：没选的文件与选了的共用的块里没选的部分存在保存目录里的 .parts（做种时要读），不归用户；记录删了之后在
-            // 后台删
-            let part = match task.spec.torrent() {
-                Some(spec) => Some((torrent_folder(spec), store::torrent_resume(tx, id)?.data)),
-                None => None,
-            };
-            store::delete(tx, id)?;
-            Ok(part)
-        })?;
-        if let Some((folder, resume)) = part {
-            self.forget_part_file(folder, resume);
-        }
-        Ok(())
-    }
-
-    /// 在运行时的阻塞线程上删掉移除了的 BT 任务在保存目录 `folder` 里的 `.parts`（名字由续传数据 `resume` 得出）；删不掉
-    /// 或读不出名字时发 [`Event::Orphaned`]。
-    fn forget_part_file(&self, folder: PathBuf, resume: Vec<u8>) {
-        let events = self.shared.events.clone();
+    /// 文件，删不掉时发 [`Event::Orphaned`]）与没有自己的任务目录的 HLS、文件任务。别的报 [`Error::NotFinished`]：它们
+    /// 的任务目录（BT 为下了的文件）要用 [`Service::discard`] 一起删。在做种的先停止做种（同 [`Service::stop_seeding`]，
+    /// 记不进存储时报那个错，做种照旧），停下后再删；等的期间又开始做种时报 [`Error::Seeding`]。返回的句柄在任何执行器
+    /// 上都可等待。
+    pub fn forget(&self, id: TaskId) -> JoinHandle<Result<(), Error>> {
+        let shared = self.shared.clone();
+        let stopping = shared.stop_seeding(id);
         let _entered = self.runtime().enter();
         self.shared.tracker.spawn(async move {
-            let removed = tokio::task::spawn_blocking(move || {
-                let name = TorrentInfo::of(&resume)
-                    .map_err(|error| (folder.clone(), format!("读不出 .parts 的名字：{error}")))?
-                    .part_file;
-                let part = folder.join(name);
-                match std::fs::remove_file(&part) {
-                    Ok(()) => Ok(()),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Err(error) => Err((part, format!("删不掉：{error}"))),
-                }
-            })
-            .await
-            .expect("删文件不会 panic，运行时关闭时本任务也一起丢弃");
-            if let Err((path, reason)) = removed {
-                // 接收端随界面关闭而丢弃时没有谁能处理
-                let _closed = events.send(Event::Orphaned {
-                    paths: vec![path],
-                    reason,
-                });
+            if let Some(mut ended) = stopping? {
+                // 发送端随做种的任务结束而释放：那时已停下
+                let _ended = ended.wait_for(|ended| *ended).await;
             }
-        });
+            shared.forget(id)
+        })
     }
 
     /// 换掉暂停或失败的任务的请求头，之后继续时照它请求。名与值不合要求（见 [`check_option_header`]）、或任务是 BT
@@ -1631,6 +1576,7 @@ impl Shared {
     ) {
         let cancel = CancellationToken::new();
         let by_user = Arc::new(AtomicBool::new(false));
+        let (ended_tx, ended) = watch::channel(false);
         {
             let _store = lock(&self.store);
             lock(&self.seeders).insert(
@@ -1638,6 +1584,7 @@ impl Shared {
                 SeedControl {
                     cancel: cancel.clone(),
                     by_user: by_user.clone(),
+                    ended,
                 },
             );
             // 关闭之后才登记的（下完时正赶上退出）随即停下
@@ -1696,12 +1643,92 @@ impl Shared {
                 store::set_seeding_task(tx, id, keep)
             });
             lock(&shared.seeders).remove(&id);
+            ended_tx.send_replace(true);
             // 同上
             let _closed = shared.events.send(Event::SeedingEnded {
                 id,
                 end: seeded.end,
                 unsaved: saved.err(),
             });
+        });
+    }
+
+    /// 见 [`Service::stop_seeding`]；在做种时返回它停下的信号。
+    fn stop_seeding(&self, id: TaskId) -> Result<Option<watch::Receiver<bool>>, Error> {
+        let mut store = lock(&self.store);
+        let tx = store.transaction()?;
+        let applied = self.apply_unsaved(&tx)?;
+        let Some((cancel, by_user, ended)) = lock(&self.seeders).get(&id).map(|seeder| {
+            (
+                seeder.cancel.clone(),
+                seeder.by_user.clone(),
+                seeder.ended.clone(),
+            )
+        }) else {
+            return Ok(None);
+        };
+        store::set_seeding_task(&tx, id, false)?;
+        self.commit(tx, applied)?;
+        // 提交了才停（提交失败时做种照旧，与报的错一致），仍在 `store` 锁内：与关闭的先后分明
+        by_user.store(true, Ordering::Relaxed);
+        cancel.cancel();
+        Ok(Some(ended))
+    }
+
+    /// 见 [`Service::forget`]：不在做种的任务。在做种的报 [`Error::Seeding`]。
+    fn forget(&self, id: TaskId) -> Result<(), Error> {
+        let part = self.write(|tx| {
+            if lock(&self.discarding).contains(&id) {
+                return Err(Error::Discarding(id));
+            }
+            if lock(&self.seeders).contains_key(&id) {
+                return Err(Error::Seeding(id));
+            }
+            let task = store::get(tx, id)?.ok_or(Error::NotFound(id))?;
+            let unfinished = task.work_dir.is_some() || task.spec.torrent().is_some();
+            if task.status != Status::Done && unfinished {
+                return Err(Error::NotFinished(id));
+            }
+            // BT：没选的文件与选了的共用的块里没选的部分存在保存目录里的 .parts（做种时要读），不归用户；记录删了之后在
+            // 后台删
+            let part = match task.spec.torrent() {
+                Some(spec) => Some((torrent_folder(spec), store::torrent_resume(tx, id)?.data)),
+                None => None,
+            };
+            store::delete(tx, id)?;
+            Ok(part)
+        })?;
+        if let Some((folder, resume)) = part {
+            self.forget_part_file(folder, resume);
+        }
+        Ok(())
+    }
+
+    /// 在运行时的阻塞线程上删掉移除了的 BT 任务在保存目录 `folder` 里的 `.parts`（名字由续传数据 `resume` 得出）；删不掉
+    /// 或读不出名字时发 [`Event::Orphaned`]。调用方须在运行时里。
+    fn forget_part_file(&self, folder: PathBuf, resume: Vec<u8>) {
+        let events = self.events.clone();
+        self.tracker.spawn(async move {
+            let removed = tokio::task::spawn_blocking(move || {
+                let name = TorrentInfo::of(&resume)
+                    .map_err(|error| (folder.clone(), format!("读不出 .parts 的名字：{error}")))?
+                    .part_file;
+                let part = folder.join(name);
+                match std::fs::remove_file(&part) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err((part, format!("删不掉：{error}"))),
+                }
+            })
+            .await
+            .expect("删文件不会 panic，运行时关闭时本任务也一起丢弃");
+            if let Err((path, reason)) = removed {
+                // 接收端随界面关闭而丢弃时没有谁能处理
+                let _closed = events.send(Event::Orphaned {
+                    paths: vec![path],
+                    reason,
+                });
+            }
         });
     }
 

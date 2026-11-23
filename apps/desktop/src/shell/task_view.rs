@@ -531,10 +531,10 @@ impl Shell {
                         .flex_1(),
                     );
                 }
-                // BT：做种时只能停止做种（停了才能从列表移除），没在做种时可以再做
+                // BT：做种时可停止做种，没在做种时可以再做；做种时从列表移除先停止做种
                 if row.task.spec.torrent().is_some() {
-                    if row.task.seeding {
-                        rest.push(ui::button(
+                    rest.push(if row.task.seeding {
+                        ui::button(
                             "stop-seeding",
                             "停止做种",
                             Tone::Ghost,
@@ -543,17 +543,17 @@ impl Shell {
                                     .update(cx, |tasks, cx| tasks.stop_seeding(id, cx));
                                 cx.notify();
                             }),
-                        ));
-                        return Foot { primary, rest };
-                    }
-                    rest.push(ui::button(
-                        "seed",
-                        "做种",
-                        Tone::Ghost,
-                        cx.listener(move |this, _, _, cx| {
-                            this.tasks.update(cx, |tasks, cx| tasks.seed(id, cx))
-                        }),
-                    ));
+                        )
+                    } else {
+                        ui::button(
+                            "seed",
+                            "做种",
+                            Tone::Ghost,
+                            cx.listener(move |this, _, _, cx| {
+                                this.tasks.update(cx, |tasks, cx| tasks.seed(id, cx))
+                            }),
+                        )
+                    });
                 }
                 rest.push(forget(Tone::Ghost, cx));
                 Foot { primary, rest }

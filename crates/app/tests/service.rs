@@ -262,7 +262,7 @@ fn a_task_downloads_and_is_recorded_as_done() {
         service.set_headers(task.id, Vec::new()),
         Err(Error::AlreadyDone(_))
     ));
-    service.forget(task.id).unwrap();
+    rt.block_on(service.forget(task.id)).unwrap().unwrap();
     assert!(service.tasks().unwrap().is_empty());
     assert!(folder.join("index.mp4").is_file());
 }
@@ -301,7 +301,10 @@ fn a_paused_task_resumes_after_reopening() {
     let task = service.tasks().unwrap().remove(0);
     assert_eq!((task.status, task.total), (Status::Paused, Some(2)));
     // 没完成的任务不能只从列表移除，任务目录要一起放弃
-    assert!(matches!(service.forget(id), Err(Error::NotFinished(_))));
+    assert!(matches!(
+        rt.block_on(service.forget(id)).unwrap(),
+        Err(Error::NotFinished(_))
+    ));
     let Saved::Hls(saved) = rt.block_on(service.inspect(id)).unwrap().unwrap().unwrap() else {
         panic!("HLS 任务的任务目录");
     };
@@ -372,7 +375,7 @@ fn discarding_a_running_task_removes_it() {
         )
     };
     assert!(refused(service.resume(id).map(|_| ())));
-    assert!(refused(service.forget(id)));
+    assert!(refused(rt.block_on(service.forget(id)).unwrap()));
     assert!(matches!(
         rt.block_on(service.discard(id)).unwrap(),
         Err(Error::Discarding(_) | Error::NotFound(_))

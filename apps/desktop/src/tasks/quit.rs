@@ -54,7 +54,7 @@ impl Tasks {
         self.stays
     }
 
-    /// 有任务在运行、继续、放弃或新建：退出要等它们。
+    /// 有任务在运行、继续、放弃、从列表移除或新建：退出要等它们。
     pub fn busy(&self) -> usize {
         self.creating
             + self

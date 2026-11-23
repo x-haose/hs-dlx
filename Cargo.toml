@@ -57,7 +57,7 @@ thiserror = "2.0.21"
 tokio = "1.54.1"
 tokio-rustls = "0.26.6"
 tokio-util = "0.7.20"
-url = "2.5.8"
+url = "2.5.9"
 # 嗅探页嵌网页；与嵌入层（源自 gpui-webview）一起精确锁定，升级时一起改
 wry = "=0.57.2"
 

@@ -160,8 +160,8 @@ pub fn torrent_from_file(torrent: &[u8]) -> Result<Vec<u8>, Error> {
 pub struct MetadataProgress {
     /// 连着的节点数
     pub peers: u32,
-    /// 最近一次 tracker 报的错（libtorrent 的说明，英文，含 tracker 的地址）；没报过，或另有 tracker 回应了这个种子
-    /// 有人在做种或在下（连不上的那个不妨碍找节点）时为 None
+    /// 最近一次 tracker 报的错，「tracker 的地址：原因」（见 [`hs_dlx_torrent::AlertKind::TrackerError`]）；没报过，或另有
+    /// tracker 回应了这个种子有人在做种或在下（连不上的那个不妨碍找节点）时为 None
     pub tracker_error: Option<String>,
     /// 磁力链接没带 tracker、要补公共 tracker，而列表这次没取到时为原因（隔一阵再取）；别的时候为 None
     pub public_trackers_error: Option<String>,
@@ -206,8 +206,8 @@ pub struct TorrentProgress {
     pub reachable: u32,
     /// 资源不足：下载中连着节点，凑不齐全部内容已持续 3 秒以上
     pub scarce: bool,
-    /// 这次运行里最近一次 tracker 报的错（libtorrent 的说明，英文，含 tracker 的地址）；没报过时为 None。私有种子只经
-    /// tracker 找节点，它报错时多半一直连不上节点
+    /// 这次运行里最近一次 tracker 报的错，取法同 [`MetadataProgress::tracker_error`]。私有种子只经 tracker 找节点，它
+    /// 报错时多半一直连不上节点
     pub tracker_error: Option<String>,
     /// BT 代理的问题（同 [`MetadataProgress::proxy_problem`]）
     pub proxy_problem: Option<String>,
@@ -455,6 +455,23 @@ impl Owner {
     fn libtorrent(&self, what: &str) -> impl FnOnce(hs_dlx_torrent::Error) -> Error + use<> {
         let what = format!("{what}（种子 {}）", self.id);
         move |error| Error::Torrent(format!("{what}：{error}"))
+    }
+
+    /// 要显示的 tracker 报错：`latest` 为最近一次报的；另有 tracker 回应了这个种子有人在做种或在下时为 None（连不上的那个
+    /// 不妨碍找节点）。`latest` 为 None 时不查 tracker。
+    fn tracker_error(
+        &self,
+        latest: Option<&String>,
+    ) -> Result<Option<String>, hs_dlx_torrent::Error> {
+        let Some(latest) = latest else {
+            return Ok(None);
+        };
+        let answered = self
+            .session()
+            .trackers(&self.id)?
+            .iter()
+            .any(|tracker| tracker.working && (tracker.seeds > 0 || tracker.leechers > 0));
+        Ok((!answered).then(|| latest.clone()))
     }
 
     /// 下一条事件；事件丢了时为 [`Routed::Lost`]。接收不会结束：自己持有一个发送端（`route`）。
@@ -1011,15 +1028,11 @@ pub(crate) async fn fetch_metadata(
         if status.has_metadata {
             break;
         }
-        let answered = owner
-            .session()
-            .trackers(&id)
-            .map_err(owner.libtorrent("查 tracker"))?
-            .iter()
-            .any(|tracker| tracker.working && (tracker.seeds > 0 || tracker.leechers > 0));
         progress.send_replace(MetadataProgress {
             peers: u32::try_from(status.peers).expect("libtorrent 的计数不为负"),
-            tracker_error: tracker_error.clone().filter(|_| !answered),
+            tracker_error: owner
+                .tracker_error(tracker_error.as_ref())
+                .map_err(owner.libtorrent("查 tracker"))?,
             public_trackers_error: public.failure(),
             proxy_problem: owner.engine.proxy_problem(),
         });
@@ -1374,7 +1387,10 @@ pub(crate) async fn seed(
                     break SeedEnd::Failed(format!("种子出错：{}", status.error));
                 }
                 let mut progress = TorrentProgress::of(&status);
-                progress.tracker_error.clone_from(&tracker_error);
+                progress.tracker_error = match owner.tracker_error(tracker_error.as_ref()) {
+                    Ok(shown) => shown,
+                    Err(error) => break SeedEnd::Failed(owner.libtorrent("查 tracker")(error).to_string()),
+                };
                 progress.proxy_problem = owner.engine.proxy_problem();
                 if matches!(progress.phase, TorrentPhase::Checking { .. }) {
                     each(progress);
@@ -1461,7 +1477,15 @@ async fn drive(
                         && progress.reachable < progress.pieces;
                     short = if shortfall { short + 1 } else { 0 };
                     progress.scarce = short >= SCARCE_TICKS;
-                    progress.tracker_error.clone_from(&tracker_error);
+                    progress.tracker_error = match owner.tracker_error(tracker_error.as_ref()) {
+                        Ok(shown) => shown,
+                        Err(error) => {
+                            return Outcome::Failed(Failure {
+                                kind: FailureKind::Other,
+                                message: owner.libtorrent("查 tracker")(error).to_string(),
+                            });
+                        }
+                    };
                     progress.proxy_problem = owner.engine.proxy_problem();
                     each(progress);
                 }

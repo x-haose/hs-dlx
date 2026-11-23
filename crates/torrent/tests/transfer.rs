@@ -1,7 +1,10 @@
 //! 本机两个会话互传：一个做种，另一个用磁力链接（只有信息哈希）连上它取种子信息，或直接用种子文件，再照选择加入、
 //! 下完内容。不用 DHT、tracker 与端口映射，不出本机。
 
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use hs_dlx_torrent::{
@@ -617,10 +620,9 @@ fn a_skipped_announce_of_a_removed_torrent_still_pops() {
         assert!(Instant::now() < deadline, "没等到 tracker 算连不上");
     }
     session.remove(&id, Removal::Keep).unwrap();
-    // 移除完之后种子的句柄失效，查它即出错
-    while session.trackers(&id).is_ok() {
-        assert!(Instant::now() < deadline, "没等到种子移除完");
-    }
+    // 没有种子信息的种子没有存储：移除在会话的线程上做完时随即发出移除的事件。之后的同步调用（取监听端口）在会话的线程
+    // 上排在移除之后，返回时移除已做完、事件已在队列里
+    session.listen_port();
     let kinds: Vec<AlertKind> = session
         .pop_alerts(100)
         .unwrap()
@@ -659,6 +661,81 @@ fn a_tracker_skipped_on_some_listen_addresses_reports_the_real_failure() {
 
     drop(session);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// tracker 出错的说明为「tracker 的地址：原因」：回了 failure reason 的取它，连不上的取错误说明；不带种子、监听地址与
+/// 连续失败的次数。
+#[test]
+fn tracker_errors_read_as_the_url_and_the_reason() {
+    let dir = scratch("tracker-error-text");
+    let session = local_session();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let failing = format!("http://{address}/announce");
+    let refused = "http://127.0.0.1:9/announce";
+    let stop = AtomicBool::new(false);
+    let errors = std::thread::scope(|scope| {
+        scope.spawn(|| refuse_announces(&listener, &stop));
+        let hash = "4123456789abcdef0123456789abcdef01234567";
+        let uri = format!("magnet:?xt=urn:btih:{hash}&tr={failing}&tr={refused}");
+        let id = session.add_magnet(&uri, path_str(&dir)).unwrap();
+        let errors = tracker_errors_until_failed(&session, &id);
+        stop.store(true, Ordering::Relaxed);
+        TcpStream::connect(address).unwrap();
+        errors
+    });
+    assert!(
+        errors.contains(&format!("{failing}：not allowed")),
+        "{errors:?}"
+    );
+    let refusals: Vec<&str> = errors
+        .iter()
+        .filter_map(|m| m.strip_prefix(&format!("{refused}：")))
+        .collect();
+    assert!(!refusals.is_empty(), "{errors:?}");
+    assert!(
+        refusals
+            .iter()
+            .all(|reason| !reason.is_empty() && !reason.contains(['"', '['])),
+        "{errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .all(|m| m.starts_with(&format!("{failing}："))
+                || m.starts_with(&format!("{refused}："))),
+        "{errors:?}"
+    );
+
+    drop(session);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 在 `listener` 上当 HTTP tracker：每次通告都回 failure reason「not allowed」；`stop` 置位后收到下一个连接即返回。
+fn refuse_announces(listener: &TcpListener, stop: &AtomicBool) {
+    for stream in listener.incoming() {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut stream = stream.unwrap();
+        let mut head = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            let read = stream.read(&mut buf).unwrap();
+            if read == 0 {
+                break;
+            }
+            head.extend_from_slice(&buf[..read]);
+        }
+        let body = b"d14:failure reason11:not allowede";
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        stream.write_all(body).unwrap();
+    }
 }
 
 /// 等到 `id` 的每个 tracker 都算连不上，返回期间报的 tracker 出错的说明。状态先于事件更新：都算连不上之后再取一次，

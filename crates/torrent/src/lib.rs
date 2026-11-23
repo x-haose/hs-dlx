@@ -117,8 +117,9 @@ mod ffi {
         ListenFailed,
         PortMapped,
         PortMapFailed,
-        /// 种子自己的 tracker 回了错误或连不上：`message` 里有 tracker 的地址与原因（英文）。某个监听地址路由不到它（如
-        /// 回环地址）而跳过的不算；每个监听地址都路由不到时才报，原因为中文的说明
+        /// 种子自己的 tracker 回了错误或连不上：`message` 为「tracker 的地址：原因」，原因为 tracker 回的 failure reason，
+        /// 没回时为错误说明（英文）。某个监听地址路由不到它（如回环地址）而跳过的不算；每个监听地址都路由不到时才报，
+        /// 原因为中文的说明
         TrackerError,
         /// 补的 tracker（[`Session::add_trackers`]）回了错误或连不上，同上
         AddedTrackerError,

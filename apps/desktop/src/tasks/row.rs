@@ -71,6 +71,8 @@ pub struct Row {
     pub resuming: bool,
     /// 正在放弃：操作都不可用
     pub discarding: bool,
+    /// 正在从列表移除（做种的先停下）：操作都不可用
+    pub forgetting: bool,
     /// 直播录制这次打开应用以来的时间线（钟面用）
     pub timeline: Timeline,
     /// 开始只写出已录的那一刻的已录时长：那次运行在核心报出进度之前按它显示
@@ -114,6 +116,7 @@ impl Row {
             file_name,
             resuming: false,
             discarding: false,
+            forgetting: false,
             timeline: Timeline::default(),
             recorded_before_writing: Duration::ZERO,
         }
@@ -130,9 +133,9 @@ impl Row {
         signals::push(&mut self.signals, at, level, text);
     }
 
-    /// 能不能操作：正在继续或放弃时不能。
+    /// 能不能操作：正在继续、放弃或从列表移除时不能。
     pub fn idle(&self) -> bool {
-        !self.resuming && !self.discarding
+        !self.resuming && !self.discarding && !self.forgetting
     }
 
     /// 已录（直播）或已下（点播）的第 0 条轨时长：运行中按进度，停下的按任务目录里读到的；都没有时为 0。

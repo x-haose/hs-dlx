@@ -572,7 +572,9 @@ rust::Vec<Alert> Session::pop_alerts(std::uint32_t wait_ms) const {
 			std::string const id = id_of(t->handle);
 			bool const added = added_tracker(id, t->tracker_url());
 			Alert alert = alert_of(added ? AlertKind::AddedTrackerError : AlertKind::TrackerError, *a, id);
-			if (skip) alert.message = text_of(std::string(t->tracker_url()) + "：" + UNROUTABLE);
+			// tracker 自己给的说明优先（回了 failure reason 时），没有时为错误说明
+			std::string const said = *t->failure_reason() != '\0' ? std::string(t->failure_reason()) : t->error.message();
+			alert.message = text_of(std::string(t->tracker_url()) + "：" + (skip ? std::string(UNROUTABLE) : said));
 			out.push_back(std::move(alert));
 		} else if (lt::alert_cast<lt::alerts_dropped_alert>(a)) {
 			mark_lost();
