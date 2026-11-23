@@ -5,7 +5,6 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -622,90 +621,49 @@ fn the_part_file_stays_for_seeding_until_the_task_is_forgotten() {
     drop(seeder);
 }
 
-/// tracker 报错照常报出「地址：原因」；另有 tracker 回应了有人在做种时不报（连不上的那个不妨碍找节点）。
+/// 还没连上过节点时 tracker 报错照常报出，为「tracker 的地址：原因」：磁力链接只带一个连不上的 tracker、不给节点，取
+/// 种子信息时报它连不上。
 #[test]
-fn a_tracker_error_is_not_shown_while_another_tracker_reports_seeds() {
-    let dir = test_dir("tracker-error");
-    let (seeder, id) = seed(&dir.join("seed"), false, false);
-    let own = Tracker::start(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
-    own.point_to(&seeder);
+fn a_tracker_error_is_shown_while_no_peer_has_connected() {
     // 本机这个端口没人监听：通告随即被拒
     let refused = "http://127.0.0.1:9/announce";
     let rt = runtime();
-    let (service, mut events) = service(&dir.join("tasks.sqlite"));
+    let (service, _events) = service(&test_dir("tracker-error").join("tasks.sqlite"));
     // 系统代理可能不放过回环地址
     service.set_proxy(&Proxy::Direct).unwrap();
-    let uri = format!("magnet:?xt=urn:btih:{id}&tr={}&tr={refused}", own.announce);
-    let resume = fetch(&rt, &service, &uri);
-    let info = TorrentInfo::of(&resume).unwrap();
-    let all = info.files.iter().map(|file| file.index).collect();
-    let task = rt
-        .block_on(service.create(draft(&uri, &dir.join("downloads"), resume, all), 1))
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        rt.block_on(until(&mut events, task.id, |_| false)),
-        Some(Status::Done)
-    );
-    let seeding_error = |progress: &TorrentProgress| {
-        (progress.phase == TorrentPhase::Seeding).then(|| progress.tracker_error.clone())
-    };
-
-    // 回应里没人在做种：报连不上的那个
-    let shown = rt.block_on(event(&mut events, |event| match event {
-        Event::TorrentProgress { id: at, progress } if at == task.id => {
-            seeding_error(&progress).flatten()
-        }
-        _ => None,
-    }));
-    assert!(shown.starts_with(&format!("{refused}：")), "{shown}");
-    service.stop_seeding(task.id).unwrap();
-    assert_eq!(
-        rt.block_on(seeding_ended(&mut events, task.id)),
-        SeedEnd::Stopped
-    );
-
-    // 回应说有人在做种：不报。被拒的那个在回环地址上随即被拒，6 次进度（约 3 秒）之内必已报过
-    own.report_seeds(1);
-    service.seed(task.id).unwrap();
-    let mut seen = Vec::new();
-    while seen.len() < 6 {
-        let error = rt.block_on(event(&mut events, |event| match event {
-            Event::TorrentProgress { id: at, progress } if at == task.id => {
-                seeding_error(&progress)
+    let uri = format!("magnet:?xt=urn:btih:5123456789abcdef0123456789abcdef01234567&tr={refused}");
+    let mut fetch = service.fetch_metadata(uri).unwrap();
+    let shown = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Some(error) = fetch.progress.borrow_and_update().tracker_error.clone() {
+                    return error;
+                }
+                fetch.progress.changed().await.unwrap();
             }
-            _ => None,
-        }));
-        seen.push(error);
-    }
-    assert_eq!(seen.last(), Some(&None), "{seen:?}");
-    service.stop_seeding(task.id).unwrap();
-    rt.block_on(seeding_ended(&mut events, task.id));
-    drop(service);
-    drop(seeder);
+        })
+        .await
+        .expect("20 秒内没报 tracker 出错")
+    });
+    assert!(shown.starts_with(&format!("{refused}：")), "{shown}");
+    assert_eq!(fetch.progress.borrow().peers, 0);
 }
 
 /// 测试的 tracker：在回环地址上的 HTTP 服务，`/list` 为只有它自己的公共 tracker 列表，`/announce` 回一个节点（建时
-/// 给出，[`Tracker::point_to`] 可改）与做种的人数（起初为 0，[`Tracker::report_seeds`] 可改）；记下通告来的信息哈希
-/// （十六进制）。在自己的线程与运行时上跑，随测试进程结束。
+/// 给出，[`Tracker::point_to`] 可改）；记下通告来的信息哈希（十六进制）。在自己的线程与运行时上跑，随测试进程结束。
 struct Tracker {
     list: Url,
     announce: String,
     peer: Arc<Mutex<SocketAddrV4>>,
-    seeds: Arc<AtomicU32>,
     announced: Arc<Mutex<Vec<String>>>,
 }
 
 impl Tracker {
     fn start(peer: SocketAddrV4) -> Tracker {
         use axum::extract::{RawQuery, State as Shared};
-        type Answer = (
-            Arc<Mutex<SocketAddrV4>>,
-            Arc<AtomicU32>,
-            Arc<Mutex<Vec<String>>>,
-        );
+        type Answer = (Arc<Mutex<SocketAddrV4>>, Arc<Mutex<Vec<String>>>);
         async fn announce(
-            Shared((peer, seeds, announced)): Shared<Answer>,
+            Shared((peer, announced)): Shared<Answer>,
             RawQuery(query): RawQuery,
         ) -> Vec<u8> {
             let query = query.unwrap_or_default();
@@ -724,27 +682,20 @@ impl Tracker {
                 .find_map(|pair| pair.strip_prefix("port="))
                 .and_then(|port| port.parse::<u16>().ok());
             let peer = *peer.lock().unwrap();
-            let mut body = format!(
-                "d8:completei{}e8:intervali60e",
-                seeds.load(Ordering::Relaxed)
-            )
-            .into_bytes();
             // 同真实的 tracker：不把请求者自己回给它
             if port == Some(peer.port()) {
-                body.extend_from_slice(b"5:peers0:e");
-                return body;
+                return b"d8:intervali60e5:peers0:e".to_vec();
             }
-            body.extend_from_slice(b"5:peers6:");
+            let mut body = b"d8:intervali60e5:peers6:".to_vec();
             body.extend_from_slice(&peer.ip().octets());
             body.extend_from_slice(&peer.port().to_be_bytes());
             body.push(b'e');
             body
         }
         let peer = Arc::new(Mutex::new(peer));
-        let seeds = Arc::new(AtomicU32::new(0));
         let announced = Arc::new(Mutex::new(Vec::new()));
         let (sender, receiver) = std::sync::mpsc::channel();
-        let shared: Answer = (peer.clone(), seeds.clone(), announced.clone());
+        let shared: Answer = (peer.clone(), announced.clone());
         std::thread::spawn(move || {
             let rt = runtime();
             rt.block_on(async move {
@@ -764,14 +715,8 @@ impl Tracker {
             list: Url::parse(&format!("{base}/list")).unwrap(),
             announce: format!("{base}/announce"),
             peer,
-            seeds,
             announced,
         }
-    }
-
-    /// 之后的通告回答有 `seeds` 人在做种。
-    fn report_seeds(&self, seeds: u32) {
-        self.seeds.store(seeds, Ordering::Relaxed);
     }
 
     /// 之后的通告回 `seeder` 的地址。

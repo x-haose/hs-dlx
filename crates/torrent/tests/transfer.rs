@@ -2,8 +2,9 @@
 //! 下完内容。不用 DHT、tracker 与端口映射，不出本机。
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -669,23 +670,26 @@ fn a_tracker_skipped_on_some_listen_addresses_reports_the_real_failure() {
 fn tracker_errors_read_as_the_url_and_the_reason() {
     let dir = scratch("tracker-error-text");
     let session = local_session();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let failing = format!("http://{address}/announce");
+    let failing = LocalTracker::start(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 33\r\nConnection: close\r\n\r\nd14:failure reason11:not allowede",
+    );
+    let missing = LocalTracker::start(
+        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
     let refused = "http://127.0.0.1:9/announce";
-    let stop = AtomicBool::new(false);
-    let errors = std::thread::scope(|scope| {
-        scope.spawn(|| refuse_announces(&listener, &stop));
-        let hash = "4123456789abcdef0123456789abcdef01234567";
-        let uri = format!("magnet:?xt=urn:btih:{hash}&tr={failing}&tr={refused}");
-        let id = session.add_magnet(&uri, path_str(&dir)).unwrap();
-        let errors = tracker_errors_until_failed(&session, &id);
-        stop.store(true, Ordering::Relaxed);
-        TcpStream::connect(address).unwrap();
-        errors
-    });
+    let hash = "4123456789abcdef0123456789abcdef01234567";
+    let uri = format!(
+        "magnet:?xt=urn:btih:{hash}&tr={}&tr={}&tr={refused}",
+        failing.url, missing.url
+    );
+    let id = session.add_magnet(&uri, path_str(&dir)).unwrap();
+    let errors = tracker_errors_until_failed(&session, &id);
     assert!(
-        errors.contains(&format!("{failing}：not allowed")),
+        errors.contains(&format!("{}：not allowed", failing.url)),
+        "{errors:?}"
+    );
+    assert!(
+        errors.contains(&format!("{}：404 Not Found", missing.url)),
         "{errors:?}"
     );
     let refusals: Vec<&str> = errors
@@ -700,10 +704,9 @@ fn tracker_errors_read_as_the_url_and_the_reason() {
         "{errors:?}"
     );
     assert!(
-        errors
+        errors.iter().all(|m| [&failing.url, &missing.url, refused]
             .iter()
-            .all(|m| m.starts_with(&format!("{failing}："))
-                || m.starts_with(&format!("{refused}："))),
+            .any(|url| m.starts_with(&format!("{url}：")))),
         "{errors:?}"
     );
 
@@ -711,30 +714,58 @@ fn tracker_errors_read_as_the_url_and_the_reason() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// 在 `listener` 上当 HTTP tracker：每次通告都回 failure reason「not allowed」；`stop` 置位后收到下一个连接即返回。
-fn refuse_announces(listener: &TcpListener, stop: &AtomicBool) {
-    for stream in listener.incoming() {
-        if stop.load(Ordering::Relaxed) {
-            return;
-        }
-        let mut stream = stream.unwrap();
-        let mut head = Vec::new();
-        let mut buf = [0u8; 1024];
-        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-            let read = stream.read(&mut buf).unwrap();
-            if read == 0 {
-                break;
+/// 回环地址上的 HTTP tracker，在自己的线程上：每次通告都原样回 `reply`。释放时让线程停下并等它结束。
+struct LocalTracker {
+    /// 通告的地址
+    url: String,
+    address: SocketAddr,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LocalTracker {
+    fn start(reply: &'static [u8]) -> LocalTracker {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let thread = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stopping.load(Ordering::Relaxed) {
+                    return;
+                }
+                let mut stream = stream.unwrap();
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let read = stream.read(&mut buf).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    head.extend_from_slice(&buf[..read]);
+                }
+                stream.write_all(reply).unwrap();
             }
-            head.extend_from_slice(&buf[..read]);
+        });
+        LocalTracker {
+            url: format!("http://{address}/announce"),
+            address,
+            stop,
+            thread: Some(thread),
         }
-        let body = b"d14:failure reason11:not allowede";
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )
-        .unwrap();
-        stream.write_all(body).unwrap();
+    }
+}
+
+impl Drop for LocalTracker {
+    /// 置位后连一次，把线程从等连接里叫醒；测试已在 panic 时不再因线程出错 panic（同时两个 panic 会直接中止进程）。
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let woken = TcpStream::connect(self.address);
+        let joined = self.thread.take().expect("只在这里取走").join();
+        if !std::thread::panicking() {
+            woken.unwrap();
+            joined.unwrap();
+        }
     }
 }
 

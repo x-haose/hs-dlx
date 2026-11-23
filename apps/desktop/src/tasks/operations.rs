@@ -452,24 +452,37 @@ impl Tasks {
     }
 
     /// 从列表移除已完成的任务（输出归用户；在做种的先停止做种）与没有自己的任务目录的任务：只删记录；做完时移除这一行，
-    /// 移除不了的提示原因。
+    /// 移除不了的提示原因（正在退出时不再退出，让用户看到）。正在继续、放弃或移除的不做。
     pub fn forget(&mut self, id: TaskId, cx: &mut Context<Self>) {
         let title = self.title(id);
-        if let Some(row) = self.row_mut(id) {
-            row.forgetting = true;
+        let Some(row) = self.row_mut(id) else {
+            return;
+        };
+        if !row.idle() {
+            return;
         }
+        row.forgetting = true;
         let handle = self.service.forget(id);
         cx.spawn(async move |this, cx| {
             let result = handle.await;
             // 等待期间应用退出时不再需要结果；移除本身在服务里照常做完
             let _gone = this.update(cx, |this, cx| {
-                match result {
-                    Ok(Ok(())) => this.rows.retain(|row| row.task.id != id),
-                    Ok(Err(error)) => this.add_notice(format!("移除「{title}」失败：{error}")),
-                    Err(join) => this.add_notice(format!("移除「{title}」中途出错：{join}")),
-                }
+                let problem = match result {
+                    Ok(Ok(())) => {
+                        this.rows.retain(|row| row.task.id != id);
+                        None
+                    }
+                    Ok(Err(error)) => Some(format!("移除「{title}」失败：{error}")),
+                    Err(join) => Some(format!("移除「{title}」中途出错：{join}")),
+                };
                 if let Some(row) = this.row_mut(id) {
                     row.forgetting = false;
+                }
+                if let Some(text) = problem {
+                    if this.quitting() {
+                        this.cancel_quit("从列表移除没做成，没有退出".to_owned());
+                    }
+                    this.add_notice(text);
                 }
                 this.quit_if_idle(cx);
                 cx.notify();
