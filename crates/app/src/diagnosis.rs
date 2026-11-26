@@ -101,7 +101,8 @@ pub(crate) enum Public {
 enum Responses {
     /// 有这么多个回应了
     Working(usize),
-    /// 都连不上；为第一个说了原因的原因，带括号，没有时为空
+    /// 都连不上；为第一个说了原因的原因（本机路由不到的排在后面：它的说明盖住别的 tracker 的真正原因），带括号，没有时
+    /// 为空
     AllFailed(String),
     /// 这么多个连不上（原因同上），其余的还没回应
     SomeFailed(usize, String),
@@ -115,7 +116,8 @@ fn responses(trackers: &[Tracker]) -> Responses {
     let failed: Vec<&Tracker> = trackers.iter().filter(|t| t.failed).collect();
     let why = failed
         .iter()
-        .find(|t| !t.message.is_empty())
+        .filter(|t| !t.message.is_empty())
+        .min_by_key(|t| t.unroutable)
         .map_or_else(String::new, |t| format!("（{}）", t.message));
     match () {
         () if working > 0 => Responses::Working(working),
@@ -133,6 +135,8 @@ pub(crate) struct Tracker {
     pub failed: bool,
     /// tracker 回的错误或连不上的原因；没有时为空
     pub message: String,
+    /// 本机的网络地址都路由不到它
+    pub unroutable: bool,
 }
 
 /// 按查到的下结论，顺序同 [`CheckItem`]。
@@ -498,6 +502,7 @@ mod tests {
                 working: true,
                 failed: false,
                 message: String::new(),
+                unroutable: false,
             }],
             seeds: Some(12),
             leechers: Some(3),
@@ -505,6 +510,7 @@ mod tests {
                 working: true,
                 failed: false,
                 message: String::new(),
+                unroutable: false,
             }]),
             upload_limit: None,
         }
@@ -565,9 +571,18 @@ mod tests {
             } else {
                 String::new()
             },
+            unroutable: false,
         };
         facts.trackers = vec![tracker(true), tracker(true)];
         assert_eq!(level(&facts, CheckItem::Trackers), CheckLevel::Warn);
+        assert!(text(&facts, CheckItem::Trackers).contains("timed out"));
+        // 本机路由不到的排在后面，说的是别的 tracker 的真正原因
+        let unroutable = Tracker {
+            message: "本机的网络地址都连不到它".into(),
+            unroutable: true,
+            ..tracker(true)
+        };
+        facts.trackers = vec![unroutable, tracker(true)];
         assert!(text(&facts, CheckItem::Trackers).contains("timed out"));
         // 私有种子只有自己的 tracker 能用：都连不上即不通
         facts.private = true;

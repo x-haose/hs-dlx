@@ -12,19 +12,21 @@ use hs_m3u8_core::{Proxy, Url};
 
 use crate::preference::StoredPreference;
 use crate::torrent::{Resume, SessionState};
+use crate::web::Container;
 use crate::{
     CloudFile, CloudProvider, CloudSpec, Error, Expected, Failure, FailureKind, FileSpec, Finished,
     HlsSpec, Kind, OutputSpec, Seeding, Settings, Status, Task, TaskId, TaskSpec, Theme,
-    TorrentSpec, naming,
+    TorrentSpec, WebSpec, naming,
 };
 use hs_dlx_cloud::pikpak::Account;
+use hs_dlx_ytdlp::{FormatKey, Track};
 use std::num::NonZeroU32;
 
 /// 一次迁移：在给定的事务里把表结构升一个版本。
 type Migration = fn(&Transaction<'_>) -> Result<(), Error>;
 
 /// 各版本的迁移：第 i 项把版本 i 升到 i + 1。已发布的迁移不再改动，新的表结构只追加一项。
-const MIGRATIONS: [Migration; 11] = [
+const MIGRATIONS: [Migration; 12] = [
     create_task_table,
     rebuild_with_work_dir_and_result,
     create_settings_table,
@@ -36,6 +38,7 @@ const MIGRATIONS: [Migration; 11] = [
     add_check_updates,
     add_torrent_proxy,
     rebuild_with_cloud,
+    rebuild_with_web,
 ];
 
 fn create_task_table(tx: &Transaction<'_>) -> Result<(), Error> {
@@ -635,6 +638,130 @@ fn rebuild_with_cloud(tx: &Transaction<'_>) -> Result<(), Error> {
     keep_task_counter(tx, counter)
 }
 
+/// 第 12 版：网页视频任务（`kind` 为 `web`，yt-dlp 解析）。重建任务表（SQLite 改不了 CHECK）：
+/// - 网页视频的各列：解析器（`web_extractor`）、视频编号（`web_video_id`）、视频与另配的音频的格式（`web_video`、
+///   `web_audio`，至少一个；认出格式用的各项，写法见 `StoredFormat`）、合并后的容器（`web_container`：`mp4`、`matroska`，只有一路不合并时为 `original`）、输出
+///   （`web_path`）；有任务目录（各路各一个核心的任务目录在里面）。只属于网页视频的列在别的任务为 NULL。请求头只放
+///   Cookie（解析与下载时带上）。
+/// - 失败的种类加 `web-login`、`web-geo`、`web-extract`、`web-gone`、`web-changed`、`web-denied`、`web-blocked`、
+///   `web-cookies`、`web-components`。其余约束不变，已有的行原样搬过来。
+/// - 设置加网页视频的 yt-dlp 渠道（`web_channel`：`stable`、`nightly`）、画质取向（`web_preference`：`compatible`、
+///   `quality`）与读 Cookie 的浏览器（`web_browser`：yt-dlp 的浏览器名，NULL 为不读）及它的用户资料
+///   （`web_browser_profile`：目录的绝对路径，浏览器没有用户资料之分时为 NULL），没设过为稳定版、兼容优先、不读。
+fn rebuild_with_web(tx: &Transaction<'_>) -> Result<(), Error> {
+    let counter = task_counter(tx)?;
+    tx.execute_batch(
+        "CREATE TABLE task_v12 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL CHECK (kind IN ('hls', 'file', 'torrent', 'cloud', 'web')),
+            title TEXT NOT NULL,
+            url TEXT NOT NULL,
+            headers TEXT NOT NULL,
+            preference TEXT,
+            output_kind TEXT CHECK (output_kind IN ('mp4', 'hls', 'both')),
+            mp4_path TEXT,
+            hls_path TEXT,
+            live INTEGER CHECK (live IN (0, 1)),
+            file_path TEXT,
+            file_length INTEGER CHECK (file_length >= 0),
+            file_accepts_ranges INTEGER CHECK (file_accepts_ranges IN (0, 1)),
+            file_etag TEXT,
+            file_last_modified TEXT,
+            file_content_type TEXT,
+            chunk_size INTEGER CHECK (chunk_size > 0),
+            torrent_info_hash TEXT UNIQUE CHECK (length(torrent_info_hash) = 40
+                                                 AND torrent_info_hash NOT GLOB '*[^0-9a-f]*'),
+            torrent_root TEXT,
+            torrent_resume BLOB,
+            torrent_trusted INTEGER CHECK (torrent_trusted IN (0, 1)),
+            torrent_seeding INTEGER CHECK (torrent_seeding IN (0, 1)),
+            cloud_provider TEXT CHECK (cloud_provider IN ('pikpak')),
+            cloud_user TEXT CHECK (cloud_user != ''),
+            cloud_job TEXT CHECK (cloud_job != ''),
+            cloud_before TEXT CHECK (cloud_before IS NULL OR cloud_job IS NULL),
+            cloud_folder TEXT,
+            cloud_root TEXT,
+            web_extractor TEXT CHECK (web_extractor != ''),
+            web_video_id TEXT CHECK (web_video_id != ''),
+            web_video TEXT CHECK (web_video != ''),
+            web_audio TEXT CHECK (web_audio != ''),
+            web_container TEXT CHECK (web_container IN ('mp4', 'matroska', 'original')),
+            web_path TEXT,
+            work_dir TEXT,
+            status TEXT NOT NULL CHECK (status IN ('running', 'paused', 'failed', 'done', 'discard-unfinished')),
+            error TEXT,
+            failure TEXT CHECK (
+                (status = 'failed') = (failure IS NOT NULL)
+                AND (failure IS NULL
+                     OR failure IN ('network', 'certificate', 'disk', 'output-taken', 'source-changed', 'not-expected',
+                                    'malformed', 'stalled', 'nothing-to-write', 'mp4-unsupported', 'unsupported',
+                                    'unrecoverable', 'cloud-login', 'cloud-quota', 'cloud-failed', 'cloud-api',
+                                    'integrity', 'web-login', 'web-geo', 'web-extract', 'web-gone',
+                                    'web-changed', 'web-denied', 'web-blocked', 'web-cookies', 'web-components',
+                                    'other')
+                     OR failure GLOB 'status:[0-9][0-9][0-9]')
+            ),
+            created_at INTEGER NOT NULL,
+            total INTEGER CHECK (total >= 0),
+            duration_ms INTEGER CHECK (duration_ms >= 0),
+            bytes INTEGER CHECK (bytes >= 0),
+            width INTEGER CHECK (width > 0),
+            height INTEGER CHECK (height > 0),
+            write_only INTEGER NOT NULL DEFAULT 0 CHECK (write_only IN (0, 1)),
+            CHECK (kind != 'hls' OR (preference IS NOT NULL AND output_kind IS NOT NULL AND live IS NOT NULL)),
+            CHECK (kind = 'hls' OR (preference IS NULL AND output_kind IS NULL AND live IS NULL AND mp4_path IS NULL
+                                    AND hls_path IS NULL AND total IS NULL AND write_only = 0)),
+            CHECK ((kind = 'file') = (file_path IS NOT NULL AND file_accepts_ranges IS NOT NULL)),
+            CHECK (kind = 'file' OR (file_path IS NULL AND file_accepts_ranges IS NULL AND file_length IS NULL
+                                     AND file_etag IS NULL AND file_last_modified IS NULL AND file_content_type IS NULL
+                                     AND chunk_size IS NULL)),
+            CHECK ((kind = 'torrent') = (torrent_info_hash IS NOT NULL AND torrent_root IS NOT NULL
+                                         AND torrent_resume IS NOT NULL AND torrent_trusted IS NOT NULL
+                                         AND torrent_seeding IS NOT NULL)),
+            CHECK (kind = 'torrent' OR (torrent_info_hash IS NULL AND torrent_root IS NULL AND torrent_resume IS NULL
+                                        AND torrent_trusted IS NULL AND torrent_seeding IS NULL)),
+            CHECK (torrent_seeding IS NOT 1 OR status = 'done'),
+            CHECK (kind != 'torrent' OR (work_dir IS NULL AND headers = '[]')),
+            CHECK ((kind = 'cloud') = (cloud_provider IS NOT NULL AND cloud_user IS NOT NULL
+                                       AND cloud_folder IS NOT NULL)),
+            CHECK (kind = 'cloud' OR (cloud_provider IS NULL AND cloud_user IS NULL AND cloud_job IS NULL
+                                      AND cloud_before IS NULL AND cloud_folder IS NULL AND cloud_root IS NULL)),
+            CHECK (kind != 'cloud' OR (headers = '[]' AND (cloud_root IS NULL) = (work_dir IS NULL)
+                                       AND (cloud_root IS NULL OR cloud_job IS NOT NULL))),
+            CHECK ((kind = 'web') = (web_extractor IS NOT NULL AND web_video_id IS NOT NULL
+                                     AND web_container IS NOT NULL AND web_path IS NOT NULL)),
+            CHECK (kind = 'web' OR (web_extractor IS NULL AND web_video_id IS NULL AND web_video IS NULL
+                                    AND web_audio IS NULL AND web_container IS NULL AND web_path IS NULL)),
+            CHECK (kind != 'web' OR ((web_video IS NOT NULL OR web_audio IS NOT NULL) AND work_dir IS NOT NULL))
+        ) STRICT;
+        INSERT INTO task_v12 (id, kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live,
+                              file_path, file_length, file_accepts_ranges, file_etag, file_last_modified,
+                              file_content_type, chunk_size, torrent_info_hash, torrent_root, torrent_resume,
+                              torrent_trusted, torrent_seeding, cloud_provider, cloud_user, cloud_job, cloud_before,
+                              cloud_folder, cloud_root, work_dir, status, error, failure, created_at, total,
+                              duration_ms, bytes, width, height, write_only)
+            SELECT id, kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live,
+                              file_path, file_length, file_accepts_ranges, file_etag, file_last_modified,
+                              file_content_type, chunk_size, torrent_info_hash, torrent_root, torrent_resume,
+                              torrent_trusted, torrent_seeding, cloud_provider, cloud_user, cloud_job, cloud_before,
+                              cloud_folder, cloud_root, work_dir, status, error, failure, created_at, total,
+                              duration_ms, bytes, width, height, write_only
+            FROM task;
+        DROP TABLE task;
+        ALTER TABLE task_v12 RENAME TO task;
+        ALTER TABLE settings ADD COLUMN web_channel TEXT NOT NULL DEFAULT 'stable'
+            CHECK (web_channel IN ('stable', 'nightly'));
+        ALTER TABLE settings ADD COLUMN web_preference TEXT NOT NULL DEFAULT 'compatible'
+            CHECK (web_preference IN ('compatible', 'quality'));
+        ALTER TABLE settings ADD COLUMN web_browser TEXT
+            CHECK (web_browser IN ('chrome', 'edge', 'firefox', 'safari', 'brave', 'chromium', 'opera', 'vivaldi',
+                                   'whale'));
+        ALTER TABLE settings ADD COLUMN web_browser_profile TEXT
+            CHECK (web_browser_profile IS NULL OR (web_browser_profile != '' AND web_browser IS NOT NULL));",
+    )?;
+    keep_task_counter(tx, counter)
+}
+
 /// 第 2 版迁移比较路径用的键：转小写再做 NFC，与写这一版时的 [`naming::path_key`] 相同；那边之后改规则不影响这次
 /// 迁移的结果。
 fn v2_path_key(path: &str) -> String {
@@ -738,7 +865,20 @@ const COLUMNS: &str = "id, kind, title, url, headers, preference, output_kind, m
                        file_length, file_etag, file_last_modified, file_content_type, chunk_size, work_dir, status, \
                        error, failure, created_at, total, duration_ms, bytes, width, height, write_only, \
                        file_accepts_ranges, torrent_info_hash, torrent_root, torrent_seeding, cloud_provider, \
-                       cloud_job, cloud_folder, cloud_root, cloud_user, cloud_before";
+                       cloud_job, cloud_folder, cloud_root, cloud_user, cloud_before, web_extractor, web_video_id, \
+                       web_video, web_audio, web_container, web_path";
+
+/// 种子 `info_hash`（信息哈希的十六进制，小写）所在的 BT 任务；没有时为 None。
+pub fn task_with_torrent(tx: &Transaction<'_>, info_hash: &str) -> Result<Option<TaskId>, Error> {
+    Ok(tx
+        .query_row(
+            "SELECT id FROM task WHERE torrent_info_hash = ?1",
+            [info_hash],
+            |row| row.get(0),
+        )
+        .optional()?
+        .map(TaskId))
+}
 
 /// 新建任务，状态为运行中，任务目录为 `work_dir`（绝对路径；BT 任务没有，为 None），BT 任务的续传数据为 `resume`
 /// （别的任务为 None）；返回分配的编号。输出或任务目录与已有任务的输出或任务目录相同（按 [`naming::path_key`] 比较）
@@ -772,12 +912,14 @@ pub fn insert(
                 Some(spec.live),
             )
         }
-        Kind::File(_) | Kind::Torrent(_) | Kind::Cloud(_) => (None, None, None, None, None),
+        Kind::File(_) | Kind::Torrent(_) | Kind::Cloud(_) | Kind::Web(_) => {
+            (None, None, None, None, None)
+        }
     };
     let (file_path, length, accepts_ranges, etag, last_modified, content_type, chunk) = match &spec
         .kind
     {
-        Kind::Hls(_) | Kind::Torrent(_) | Kind::Cloud(_) => {
+        Kind::Hls(_) | Kind::Torrent(_) | Kind::Cloud(_) | Kind::Web(_) => {
             (None, None, None, None, None, None, None)
         }
         Kind::File(file) => (
@@ -800,17 +942,10 @@ pub fn insert(
         ),
     };
     let (info_hash, root, trusted, seeding) = match &spec.kind {
-        Kind::Hls(_) | Kind::File(_) | Kind::Cloud(_) => (None, None, None, None),
+        Kind::Hls(_) | Kind::File(_) | Kind::Cloud(_) | Kind::Web(_) => (None, None, None, None),
         Kind::Torrent(torrent) => {
-            if let Some(existing) = tx
-                .query_row(
-                    "SELECT id FROM task WHERE torrent_info_hash = ?1",
-                    [&torrent.info_hash],
-                    |row| row.get(0),
-                )
-                .optional()?
-            {
-                return Err(Error::TorrentTaken(TaskId(existing)));
+            if let Some(existing) = task_with_torrent(tx, &torrent.info_hash)? {
+                return Err(Error::TorrentTaken(existing));
             }
             // 新建时的续传数据还没有已有的块；还在下，不做种
             (
@@ -822,7 +957,9 @@ pub fn insert(
         }
     };
     let (provider, user, job, before, folder, cloud_root) = match &spec.kind {
-        Kind::Hls(_) | Kind::File(_) | Kind::Torrent(_) => (None, None, None, None, None, None),
+        Kind::Hls(_) | Kind::File(_) | Kind::Torrent(_) | Kind::Web(_) => {
+            (None, None, None, None, None, None)
+        }
         Kind::Cloud(cloud) => {
             if !cloud.folder.is_absolute() {
                 return Err(Error::InvalidInput(format!(
@@ -840,10 +977,43 @@ pub fn insert(
             )
         }
     };
+    let (extractor, video_id, video, audio, container, web_path) = match &spec.kind {
+        Kind::Hls(_) | Kind::File(_) | Kind::Torrent(_) | Kind::Cloud(_) => {
+            (None, None, None, None, None, None)
+        }
+        Kind::Web(web) => {
+            if web.video.is_none() && web.audio.is_none() {
+                return Err(Error::InvalidInput("网页视频没选视频也没选音频".to_owned()));
+            }
+            if work_dir.is_none() {
+                return Err(Error::InvalidInput("网页视频要有任务目录".to_owned()));
+            }
+            (
+                Some(web.extractor.as_str()),
+                Some(web.video_id.as_str()),
+                web.video
+                    .as_ref()
+                    .map(|key| to_json(&StoredFormat::from(key))),
+                web.audio
+                    .as_ref()
+                    .map(|key| to_json(&StoredFormat::from(key))),
+                Some(container_code(web.container)),
+                Some(named_utf8(&web.path)?),
+            )
+        }
+    };
     let taken = taken_paths(tx)?;
-    for path in [&mp4, &hls, &file_path, &root, &cloud_root, &work_dir_text]
-        .into_iter()
-        .flatten()
+    for path in [
+        &mp4,
+        &hls,
+        &file_path,
+        &root,
+        &cloud_root,
+        &web_path,
+        &work_dir_text,
+    ]
+    .into_iter()
+    .flatten()
     {
         if taken.contains(&naming::path_key(path)) {
             return Err(Error::PathTaken(path.into()));
@@ -854,9 +1024,10 @@ pub fn insert(
                            file_length, file_etag, file_last_modified, file_content_type, chunk_size, work_dir,
                            status, created_at, file_accepts_ranges, torrent_info_hash, torrent_root, torrent_resume,
                            torrent_trusted, torrent_seeding, cloud_provider, cloud_job, cloud_folder, cloud_root,
-                           cloud_user, cloud_before)
+                           cloud_user, cloud_before, web_extractor, web_video_id, web_video, web_audio,
+                           web_container, web_path)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'running', ?17, ?18, ?19, ?20,
-                 ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
+                 ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35)",
         params![
             kind_code(&spec.kind),
             spec.title,
@@ -887,6 +1058,12 @@ pub fn insert(
             cloud_root,
             user,
             before,
+            extractor,
+            video_id,
+            video,
+            audio,
+            container,
+            web_path,
         ],
     )?;
     Ok(TaskId(tx.last_insert_rowid()))
@@ -920,7 +1097,7 @@ pub fn taken_paths(tx: &Transaction<'_>) -> Result<HashSet<String>, Error> {
 /// 除任务 `except` 之外的任务占用的路径的比较键；`except` 为 None 时为全部任务的。
 fn taken_except(tx: &Transaction<'_>, except: Option<TaskId>) -> Result<HashSet<String>, Error> {
     let mut statement = tx.prepare(
-        "SELECT mp4_path, hls_path, file_path, torrent_root, cloud_root, work_dir FROM task
+        "SELECT mp4_path, hls_path, file_path, torrent_root, cloud_root, web_path, work_dir FROM task
          WHERE ?1 IS NULL OR id != ?1",
     )?;
     let rows = statement.query_map([except.map(|id| id.0)], |row| {
@@ -931,6 +1108,7 @@ fn taken_except(tx: &Transaction<'_>, except: Option<TaskId>) -> Result<HashSet<
             row.get::<_, Option<String>>(3)?,
             row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
         ])
     })?;
     let mut taken = HashSet::new();
@@ -957,6 +1135,28 @@ pub fn set_output(tx: &Transaction<'_>, id: TaskId, output: &OutputSpec) -> Resu
     if tx.execute(
         "UPDATE task SET output_kind = ?2, mp4_path = ?3, hls_path = ?4 WHERE id = ?1 AND kind = 'hls'",
         params![id.0, kind, mp4, hls],
+    )? == 0
+    {
+        return Err(Error::NotFound(id));
+    }
+    Ok(())
+}
+
+/// 换掉网页视频任务合并后的容器与输出；新的输出路径与别的任务的输出或任务目录相同时报 [`Error::PathTaken`]，没有这个
+/// 网页视频任务时报 [`Error::NotFound`]。任务目录不变。
+pub fn set_web_output(
+    tx: &Transaction<'_>,
+    id: TaskId,
+    container: Container,
+    path: &Path,
+) -> Result<(), Error> {
+    let path_text = named_utf8(path)?;
+    if taken_except(tx, Some(id))?.contains(&naming::path_key(&path_text)) {
+        return Err(Error::PathTaken(path.into()));
+    }
+    if tx.execute(
+        "UPDATE task SET web_container = ?2, web_path = ?3 WHERE id = ?1 AND kind = 'web'",
+        params![id.0, container_code(container), path_text],
     )? == 0
     {
         return Err(Error::NotFound(id));
@@ -1412,6 +1612,12 @@ struct Row {
     cloud_root: Option<String>,
     cloud_user: Option<String>,
     cloud_before: Option<String>,
+    web_extractor: Option<String>,
+    web_video_id: Option<String>,
+    web_video: Option<String>,
+    web_audio: Option<String>,
+    web_container: Option<String>,
+    web_path: Option<String>,
 }
 
 impl Row {
@@ -1454,6 +1660,12 @@ impl Row {
             cloud_root: row.get(34)?,
             cloud_user: row.get(35)?,
             cloud_before: row.get(36)?,
+            web_extractor: row.get(37)?,
+            web_video_id: row.get(38)?,
+            web_video: row.get(39)?,
+            web_audio: row.get(40)?,
+            web_container: row.get(41)?,
+            web_path: row.get(42)?,
         })
     }
 
@@ -1497,6 +1709,41 @@ impl Row {
             }
             _ => return Err(corrupt("云离线的各列")),
         };
+        let web = match (
+            self.web_extractor,
+            self.web_video_id,
+            self.web_container,
+            self.web_path,
+        ) {
+            (None, None, None, None) if self.web_video.is_none() && self.web_audio.is_none() => {
+                None
+            }
+            (Some(extractor), Some(video_id), Some(container), Some(path))
+                if self.web_video.is_some() || self.web_audio.is_some() =>
+            {
+                let path = PathBuf::from(path);
+                if !named_absolute(&path) {
+                    return Err(corrupt("网页视频的输出"));
+                }
+                let format = |text: Option<String>| {
+                    text.map(|text| {
+                        serde_json::from_str::<StoredFormat>(&text)
+                            .map(FormatKey::from)
+                            .map_err(|_| corrupt("网页视频的格式"))
+                    })
+                    .transpose()
+                };
+                Some(WebSpec {
+                    extractor,
+                    video_id,
+                    video: format(self.web_video)?,
+                    audio: format(self.web_audio)?,
+                    container: parse_container(&container).ok_or_else(|| corrupt("容器"))?,
+                    path,
+                })
+            }
+            _ => return Err(corrupt("网页视频的各列")),
+        };
         let kind = match (
             self.kind.as_str(),
             self.preference,
@@ -1508,7 +1755,7 @@ impl Row {
             self.torrent_root,
         ) {
             ("hls", Some(preference), Some(output_kind), Some(live), None, None, None, None)
-                if cloud.is_none() =>
+                if cloud.is_none() && web.is_none() =>
             {
                 let preference: StoredPreference =
                     serde_json::from_str(&preference).map_err(|_| corrupt("选轨偏好"))?;
@@ -1521,7 +1768,7 @@ impl Row {
                 })
             }
             ("file", None, None, None, Some(path), Some(accepts_ranges), None, None)
-                if cloud.is_none() =>
+                if cloud.is_none() && web.is_none() =>
             {
                 let path = PathBuf::from(path);
                 if !named_absolute(&path) {
@@ -1550,7 +1797,7 @@ impl Row {
                 })
             }
             ("torrent", None, None, None, None, None, Some(info_hash), Some(root))
-                if cloud.is_none() =>
+                if cloud.is_none() && web.is_none() =>
             {
                 let root = PathBuf::from(root);
                 if !named_absolute(&root) {
@@ -1558,8 +1805,11 @@ impl Row {
                 }
                 Kind::Torrent(TorrentSpec { info_hash, root })
             }
-            ("cloud", None, None, None, None, None, None, None) => {
+            ("cloud", None, None, None, None, None, None, None) if web.is_none() => {
                 Kind::Cloud(cloud.ok_or_else(|| corrupt("云离线的各列"))?)
+            }
+            ("web", None, None, None, None, None, None, None) if cloud.is_none() => {
+                Kind::Web(web.ok_or_else(|| corrupt("网页视频的各列"))?)
             }
             _ => return Err(corrupt("种类")),
         };
@@ -1645,6 +1895,26 @@ fn kind_code(kind: &Kind) -> &'static str {
         Kind::File(_) => "file",
         Kind::Torrent(_) => "torrent",
         Kind::Cloud(_) => "cloud",
+        Kind::Web(_) => "web",
+    }
+}
+
+/// 网页视频合并后的容器在表里的写法（表上有 CHECK）。
+fn container_code(container: Container) -> &'static str {
+    match container {
+        Container::Mp4 => "mp4",
+        Container::Matroska => "matroska",
+        Container::Original => "original",
+    }
+}
+
+/// [`container_code`] 的反过来；认不出时为 None。
+fn parse_container(code: &str) -> Option<Container> {
+    match code {
+        "mp4" => Some(Container::Mp4),
+        "matroska" => Some(Container::Matroska),
+        "original" => Some(Container::Original),
+        _ => None,
     }
 }
 
@@ -1702,11 +1972,28 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
         Option<u32>,
         bool,
         Option<String>,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
     );
-    let (folder, proxy, theme, seed, ratio, minutes, upload, check_updates, torrent_proxy): Columns =
-        tx.query_row(
+    let (
+        folder,
+        proxy,
+        theme,
+        seed,
+        ratio,
+        minutes,
+        upload,
+        check_updates,
+        torrent_proxy,
+        web_channel,
+        web_preference,
+        web_browser,
+        web_browser_profile,
+    ): Columns = tx.query_row(
             "SELECT folder, proxy, theme, seed, seed_ratio_percent, seed_minutes, upload_limit, check_updates,
-                    torrent_proxy
+                    torrent_proxy, web_channel, web_preference, web_browser, web_browser_profile
              FROM settings WHERE id = 1",
             [],
             |row| {
@@ -1720,6 +2007,10 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
                     row.get(6)?,
                     row.get(7)?,
                     row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
                 ))
             },
         )?;
@@ -1764,7 +2055,74 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
         upload_limit,
         check_updates,
         torrent_proxy,
+        web_channel: match web_channel.as_str() {
+            "stable" => hs_dlx_ytdlp::Channel::Stable,
+            "nightly" => hs_dlx_ytdlp::Channel::Nightly,
+            _ => return Err(Error::Corrupt("设置里的 yt-dlp 渠道".to_owned())),
+        },
+        web_preference: match web_preference.as_str() {
+            "compatible" => crate::web::Preference::Compatible,
+            "quality" => crate::web::Preference::Quality,
+            _ => return Err(Error::Corrupt("设置里的画质取向".to_owned())),
+        },
+        web_browser: web_browser
+            .map(|code| {
+                let browser = hs_dlx_ytdlp::Browser::from_code(&code)
+                    .ok_or_else(|| Error::Corrupt("设置里读 Cookie 的浏览器".to_owned()))?;
+                Ok::<_, Error>(hs_dlx_ytdlp::CookieSource {
+                    browser,
+                    profile: web_browser_profile.map(PathBuf::from),
+                })
+            })
+            .transpose()?,
     })
+}
+
+/// 记下解析网页视频时从哪个浏览器的哪个用户资料读 Cookie（None 为不读）。用户资料的目录不是 UTF-8 时报
+/// [`Error::InvalidInput`]。
+pub fn set_web_browser(
+    tx: &Transaction<'_>,
+    source: Option<&hs_dlx_ytdlp::CookieSource>,
+) -> Result<(), Error> {
+    let profile = source
+        .and_then(|source| source.profile.as_ref())
+        .map(|dir| {
+            dir.to_str().map(str::to_owned).ok_or_else(|| {
+                Error::InvalidInput(format!("用户资料的目录不是 UTF-8：{}", dir.display()))
+            })
+        })
+        .transpose()?;
+    tx.execute(
+        "UPDATE settings SET web_browser = ?1, web_browser_profile = ?2 WHERE id = 1",
+        rusqlite::params![source.map(|source| source.browser.code()), profile],
+    )?;
+    Ok(())
+}
+
+/// 记下网页视频的 yt-dlp 渠道。
+pub fn set_web_channel(tx: &Transaction<'_>, channel: hs_dlx_ytdlp::Channel) -> Result<(), Error> {
+    let code = match channel {
+        hs_dlx_ytdlp::Channel::Stable => "stable",
+        hs_dlx_ytdlp::Channel::Nightly => "nightly",
+    };
+    tx.execute("UPDATE settings SET web_channel = ?1 WHERE id = 1", [code])?;
+    Ok(())
+}
+
+/// 记下网页视频的画质取向。
+pub fn set_web_preference(
+    tx: &Transaction<'_>,
+    preference: crate::web::Preference,
+) -> Result<(), Error> {
+    let code = match preference {
+        crate::web::Preference::Compatible => "compatible",
+        crate::web::Preference::Quality => "quality",
+    };
+    tx.execute(
+        "UPDATE settings SET web_preference = ?1 WHERE id = 1",
+        [code],
+    )?;
+    Ok(())
 }
 
 /// 记下 BT 经的 SOCKS5 代理（None 为直连）；调用方已校验（见 [`crate::socks::check`]）。
@@ -1913,6 +2271,65 @@ fn output_columns(
 /// 表结构版本在 `user_version` 里的写法。
 fn schema_version(version: usize) -> i64 {
     i64::try_from(version).expect("迁移的项数远小于 i64 的上限")
+}
+
+/// 网页视频一路的格式在 `web_video`、`web_audio` 列里的写法（JSON）：认出它用的各项（见 [`FormatKey`]）。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredFormat {
+    id: String,
+    ext: Option<String>,
+    video: StoredTrack,
+    audio: StoredTrack,
+    height: Option<u32>,
+    language: Option<String>,
+    /// 确切的字节数
+    size: Option<u64>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StoredTrack {
+    Absent,
+    Unknown,
+    Codec(String),
+}
+
+impl From<&FormatKey> for StoredFormat {
+    fn from(key: &FormatKey) -> StoredFormat {
+        let track = |track: &Track| match track {
+            Track::Absent => StoredTrack::Absent,
+            Track::Unknown => StoredTrack::Unknown,
+            Track::Codec(codec) => StoredTrack::Codec(codec.clone()),
+        };
+        StoredFormat {
+            id: key.id.clone(),
+            ext: key.ext.clone(),
+            video: track(&key.video),
+            audio: track(&key.audio),
+            height: key.height,
+            language: key.language.clone(),
+            size: key.size,
+        }
+    }
+}
+
+impl From<StoredFormat> for FormatKey {
+    fn from(stored: StoredFormat) -> FormatKey {
+        let track = |track: StoredTrack| match track {
+            StoredTrack::Absent => Track::Absent,
+            StoredTrack::Unknown => Track::Unknown,
+            StoredTrack::Codec(codec) => Track::Codec(codec),
+        };
+        FormatKey {
+            id: stored.id,
+            ext: stored.ext,
+            video: track(stored.video),
+            audio: track(stored.audio),
+            height: stored.height,
+            language: stored.language,
+            size: stored.size,
+        }
+    }
 }
 
 fn to_json(value: &impl serde::Serialize) -> String {
@@ -2676,6 +3093,140 @@ mod tests {
         assert!(headers.is_err());
     }
 
+    fn web_spec(video: Option<&str>, audio: Option<&str>) -> TaskSpec {
+        TaskSpec {
+            title: "节目.mp4".into(),
+            url: "https://www.youtube.com/watch?v=x".parse().unwrap(),
+            headers: vec![("Cookie".into(), "SID=a".into())],
+            kind: Kind::Web(WebSpec {
+                extractor: "Youtube".into(),
+                video_id: "x".into(),
+                video: video.map(|id| FormatKey {
+                    id: id.to_owned(),
+                    ext: Some("mp4".into()),
+                    video: Track::Codec("avc1.640028".into()),
+                    audio: Track::Absent,
+                    height: Some(1080),
+                    language: None,
+                    size: Some(123),
+                }),
+                audio: audio.map(|id| FormatKey {
+                    id: id.to_owned(),
+                    ext: Some("m4a".into()),
+                    video: Track::Absent,
+                    audio: Track::Codec("mp4a.40.2".into()),
+                    height: None,
+                    language: Some("ja".into()),
+                    size: None,
+                }),
+                container: Container::Mp4,
+                path: m("节目.mp4"),
+            }),
+        }
+    }
+
+    /// 网页视频任务写进去读得回；视频与音频都没选、没有任务目录的写不进；输出占着路径。
+    #[test]
+    fn web_tasks_round_trip() {
+        let mut store = Store::in_memory().unwrap();
+        let tx = store.transaction().unwrap();
+        let id = insert(
+            &tx,
+            &web_spec(Some("137"), Some("140")),
+            Some(&m("节目.mp4.hsdl")),
+            None,
+            1,
+        )
+        .unwrap();
+        let task = get(&tx, id).unwrap().unwrap();
+        assert_eq!(task.spec, web_spec(Some("137"), Some("140")));
+        assert_eq!(task.work_dir, Some(m("节目.mp4.hsdl")));
+        assert!(
+            taken_paths(&tx)
+                .unwrap()
+                .contains(&naming::path_key(&text("节目.mp4")))
+        );
+        assert!(matches!(
+            insert(&tx, &web_spec(None, None), Some(&m("别的.hsdl")), None, 2),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            insert(&tx, &web_spec(Some("18"), None), None, None, 2),
+            Err(Error::InvalidInput(_))
+        ));
+        // 每种网页视频的失败都写得进、读得回
+        for kind in [
+            FailureKind::WebLogin,
+            FailureKind::WebGeo,
+            FailureKind::WebExtract,
+            FailureKind::WebGone,
+            FailureKind::WebChanged,
+            FailureKind::WebDenied,
+            FailureKind::WebBlocked,
+            FailureKind::WebCookies,
+            FailureKind::WebComponents,
+        ] {
+            let failure = Failure {
+                kind,
+                message: "m".into(),
+            };
+            set_status(&tx, id, &Status::Failed(failure.clone())).unwrap();
+            assert_eq!(
+                get(&tx, id).unwrap().unwrap().status,
+                Status::Failed(failure)
+            );
+        }
+    }
+
+    /// 第 11 版的存储（含云离线任务与文件、网盘账号）升到第 12 版：行原样搬过来，编号接着数。
+    #[test]
+    fn rebuilding_for_web_keeps_rows_and_the_id_counter() {
+        let dir = scratch("v11-rows");
+        let path = dir.join("tasks.sqlite");
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in &MIGRATIONS[..11] {
+                migration(&tx).unwrap();
+            }
+            tx.execute(
+                "INSERT INTO task (kind, title, url, headers, cloud_provider, cloud_user, cloud_job, cloud_folder,
+                                   status, created_at)
+                 VALUES ('cloud', '节目', 'magnet:?xt=urn:btih:x', '[]', 'pikpak', 'u', 'VTask', ?1, 'paused', 3)",
+                params![text("")],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO task (kind, title, url, headers, cloud_provider, cloud_user, cloud_folder, status,
+                                   created_at)
+                 VALUES ('cloud', '删了', 'magnet:?xt=urn:btih:y', '[]', 'pikpak', 'u', ?1, 'paused', 4)",
+                params![text("")],
+            )
+            .unwrap();
+            tx.execute("DELETE FROM task WHERE title = '删了'", [])
+                .unwrap();
+            tx.pragma_update(None, "user_version", 11).unwrap();
+            tx.commit().unwrap();
+        }
+        let mut store = Store::open(&path).unwrap();
+        let tx = store.transaction().unwrap();
+        let tasks = list(&tx).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].spec.cloud().unwrap().job.as_deref(), Some("VTask"));
+        let id = insert(
+            &tx,
+            &web_spec(Some("18"), None),
+            Some(&m("节目.mp4.hsdl")),
+            None,
+            5,
+        )
+        .unwrap();
+        assert_eq!(id, TaskId(3));
+        drop(tx);
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn rebuilding_for_cloud_keeps_rows_and_the_id_counter() {
         let dir = scratch("v10-rows");
@@ -2955,6 +3506,22 @@ mod tests {
         );
         set_torrent_proxy(&tx, None).unwrap();
         assert_eq!(settings(&tx).unwrap().torrent_proxy, None);
+        // 读 Cookie 的浏览器与用户资料一起存、一起清；有用户资料没有浏览器的由表拦下
+        let source = hs_dlx_ytdlp::CookieSource {
+            browser: hs_dlx_ytdlp::Browser::Chrome,
+            profile: Some(m("Chrome/Profile 2")),
+        };
+        set_web_browser(&tx, Some(&source)).unwrap();
+        assert_eq!(settings(&tx).unwrap().web_browser, Some(source));
+        set_web_browser(&tx, None).unwrap();
+        assert_eq!(settings(&tx).unwrap().web_browser, None);
+        assert!(
+            tx.execute(
+                "UPDATE settings SET web_browser_profile = '/p' WHERE id = 1",
+                []
+            )
+            .is_err()
+        );
         // 做种：改成不做种再改回时分享率与时长照旧；只按时长
         assert_eq!(read.seeding, Seeding::default());
         set_seeding(&tx, Seeding::Off).unwrap();

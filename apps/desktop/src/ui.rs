@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, Bounds, BoxShadow, ClickEvent, Div, ElementId, FontFallbacks, FontFeatures,
-    FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    Stateful, StatefulInteractiveElement as _, Styled, Window, canvas, div, fill,
+    AnyElement, App, Bounds, BoxShadow, ClickEvent, ClipboardItem, Div, ElementId, FontFallbacks,
+    FontFeatures, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled, Window, canvas, div, fill,
     linear_color_stop, linear_gradient, point, px, relative,
 };
 
@@ -507,6 +507,25 @@ pub fn note(text: impl Into<SharedString>, warn: bool) -> Div {
     } else {
         note
     }
+}
+
+/// 出错的说明：同 [`note`] 的警示样式，右下角有「复制」（见 [`copy_link`]）。
+pub fn error_note(id: impl Into<ElementId>, text: impl Into<SharedString>) -> Div {
+    let text: SharedString = text.into();
+    let link = copy_link(id, text.to_string());
+    note(text, true).child(div().flex().justify_end().mt(px(6.)).child(link))
+}
+
+/// 小字的「复制」：点了把 `text` 原样放进剪贴板。界面上的文字选不中，报告问题时靠它取出完整的说明。
+pub fn copy_link(id: impl Into<ElementId>, text: String) -> Stateful<Div> {
+    div()
+        .id(id)
+        .text_size(px(12.))
+        .text_color(theme::muted())
+        .cursor_pointer()
+        .hover(|s| s.text_color(theme::text()))
+        .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(text.clone())))
+        .child("复制")
 }
 
 /// 状态胶囊：发光的小圆点与一句状态（标题栏里用）。

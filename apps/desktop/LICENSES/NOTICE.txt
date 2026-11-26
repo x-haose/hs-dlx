@@ -4,7 +4,7 @@ hs-dlx 桌面应用静态链接或随带了以下软件：
 
 1. FFmpeg 9.0.2（https://ffmpeg.org），按 GNU Lesser General Public License（LGPL）2.1 或更高版本授权，全文见
    FFmpeg-LGPL-2.1.txt。FFmpeg 的源码未作修改，只编译了转封装用到的组件，configure 参数见 hs-m3u8 的构建脚本：
-   https://github.com/x-haose/hs-m3u8/blob/639c95b1c6dd6714b577fde07937f339e57785e7/third_party/ffmpeg/build.sh
+   https://github.com/x-haose/hs-m3u8/blob/08046bb758128e20426db14ef8a884a2f9864697/third_party/ffmpeg/build.sh
    对应的源码包 ffmpeg-9.0.2.tar.xz 可从
    https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz 取得，SHA-256 为
    8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e。
@@ -34,3 +34,15 @@ hs-dlx 桌面应用静态链接或随带了以下软件：
 
 7. Boost 1.92.0（https://www.boost.org），按 Boost Software License 1.0 授权，全文见 Boost-LICENSE_1_0.txt；
    libtorrent 用到它的头文件，未作修改。
+
+8. Python 3.13.18（CPython，https://www.python.org，© Python Software Foundation），按 Python Software
+   Foundation License Version 2 授权；取自 python-build-standalone 20261110
+   （https://github.com/astral-sh/python-build-standalone），去掉了 Tcl/Tk、头文件、测试、idle 等不用的部分，其余未作
+   修改，网页视频用它运行 yt-dlp。它链入的 bzip2、OpenSSL、expat、libffi、liblzma（xz）、mpdecimal、SQLite、
+   libuuid、zlib、zlib-ng（Linux 版另有 libedit、ncurses）的许可证全文与 CPython 的一起见 Python-LICENSES.txt；附带的
+   pip 按 MIT 授权，许可证随它在包里。
+
+9. QuickJS-NG 0.18.0（https://github.com/quickjs-ng/quickjs，© Fabrice Bellard、Charlie Gordon、
+   Ben Noordhuis 等），按 MIT 许可证授权；随带的可执行文件取自它的发布，未作修改，yt-dlp 用它解 YouTube 的
+   JavaScript 挑战。它静态链入的 mimalloc（MIT）、musl（Linux 版，MIT）、mingw-w64 运行时（Windows 版）的许可证全文与
+   QuickJS-NG 的一起见 QuickJS-NG-LICENSES.txt。

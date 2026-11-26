@@ -77,8 +77,8 @@ pub enum Error {
     /// 应用更新换到一半，新旧两份都没在原来的位置：说明里写明各在哪、怎么处理；不能再试
     #[error("更新没换完：{0}")]
     UpdateStranded(String),
-    /// BT 任务在做种：要先停止做种（[`crate::Service::stop_seeding`]）
-    #[error("{0}正在做种，先停止做种")]
+    /// BT 任务在做种：再开始做种时，或从列表移除等它停下的期间又开始了做种
+    #[error("{0}正在做种")]
     Seeding(TaskId),
     /// 新建的 BT 任务的种子已在这个任务里：两个任务会写同一批文件
     #[error("这个种子已在{0}里")]
@@ -89,6 +89,18 @@ pub enum Error {
     /// 用云离线前要先登录网盘
     #[error("没登录 PikPak")]
     NotLoggedIn,
+    /// 这个平台没有网页视频（yt-dlp）的组件
+    #[error("这个平台上用不了网页视频的解析")]
+    WebUnavailable,
+    /// 网页视频的组件还没装好
+    #[error("还没装网页视频的解析组件")]
+    WebNotReady,
+    /// 网页视频的组件正在安装、更新或换回：等它做完
+    #[error("网页视频的组件正在安装或更新")]
+    WebInstalling,
+    /// 有网页视频任务在跑，重装组件要先暂停它们（在用的组件换不下）
+    #[error("有网页视频任务在跑：先暂停它们再重装")]
+    WebInUse,
     /// 调网盘的接口失败（提交、登录等不在任务里做的）
     #[error(transparent)]
     PikPak(#[from] hs_dlx_cloud::pikpak::Error),

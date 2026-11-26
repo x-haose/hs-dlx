@@ -18,6 +18,9 @@ hs-m3u8 之后运行 `make ffmpeg`；装的不是当前那份脚本编出来的�
 BT 引擎（`crates/torrent`）用的 libtorrent、OpenSSL 静态库与 Boost 的头文件由 `third_party/libtorrent/build.sh` 编译，装到
 `third_party/libtorrent/dist`（十几分钟）。第一次与改了这个脚本之后运行 `make libtorrent`，检查同样核对。
 
+网页视频要的 Python（python-build-standalone）与 QuickJS-NG 由 `scripts/runtime.py` 下载、核对、裁剪后放到
+`third_party/runtime/dist`，桌面应用构建时编进程序。第一次与改了这个脚本之后运行 `make runtime`，检查同样核对。
+
 ## 检查
 
 ```sh

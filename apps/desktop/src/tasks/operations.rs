@@ -127,6 +127,11 @@ impl Tasks {
                     Kind::File(file) => (None, Some(file.path.clone())),
                     Kind::Torrent(torrent) => (None, Some(torrent.root.clone())),
                     Kind::Cloud(cloud) => (None, cloud.root.clone()),
+                    Kind::Web(web) => match web.container {
+                        hs_dlx_app::web::Container::Mp4 => (Some(web.path.clone()), None),
+                        hs_dlx_app::web::Container::Matroska
+                        | hs_dlx_app::web::Container::Original => (None, Some(web.path.clone())),
+                    },
                 };
                 let checking = cx.background_executor().spawn(async move {
                     let mp4 = mp4.filter(|p| p.is_file());
@@ -153,16 +158,21 @@ impl Tasks {
     /// 读任务目录里已完成的内容（BT 任务读存着的续传数据）；`then_resume` 时读完即继续，读到的片数作本次运行的起点
     /// （读不出时不估剩余时间）。读完（及继续）后，选了退出、都已停下的即退出。
     fn inspect(&mut self, id: TaskId, then_resume: bool, cx: &mut Context<Self>) {
-        let Some((reading, torrent, cloud)) = self.row(id).map(|row| {
+        let Some((reading, torrent, cloud, web)) = self.row(id).map(|row| {
             (
                 row.reading,
                 row.task.spec.torrent().is_some(),
                 row.task.spec.cloud().is_some(),
+                row.task.spec.web().is_some(),
             )
         }) else {
             return;
         };
-        let read = if cloud {
+        let read = if web {
+            let handle = self.service.inspect_web(id);
+            cx.background_executor()
+                .spawn(async move { handle.await.map(|result| result.map(Disk::Web)) })
+        } else if cloud {
             // 只读存储，不碰磁盘
             let files = self.service.cloud_files(id).map(Disk::Cloud);
             cx.background_executor().spawn(async move { Ok(files) })
@@ -251,6 +261,29 @@ impl Tasks {
         started
     }
 
+    /// 网页视频合并时内容放不进 MP4，改用 MKV 再跑；退出中不改。改了并发起了再跑时为 true，没成的原因写进提示。
+    pub fn switch_to_matroska(&mut self, id: TaskId, cx: &mut Context<Self>) -> bool {
+        let title = self.title(id);
+        if self.quitting() {
+            self.tell(format!("正在退出，「{title}」没有改用 MKV"), cx);
+            return false;
+        }
+        if !self.row(id).is_some_and(Row::idle) {
+            return false;
+        }
+        match self.service.switch_web_to_matroska(id) {
+            Ok(task) => {
+                let row = self.row_mut(id).expect("上面刚找到这一行");
+                row.set_spec(task.spec);
+            }
+            Err(error) => {
+                self.tell(format!("「{title}」没能改用 MKV：{error}"), cx);
+                return false;
+            }
+        }
+        self.resume(id, cx)
+    }
+
     /// 内容放不进 MP4 时改存本地 HLS 再跑：直播只写出已录的，点播接着下；退出中不改。改了并发起了再跑时为 true，没成的
     /// 原因写进提示。
     pub fn switch_to_hls(&mut self, id: TaskId, cx: &mut Context<Self>) -> bool {
@@ -312,6 +345,7 @@ impl Tasks {
                 let done: u64 = files.iter().filter(|f| f.done).map(|f| f.size).sum();
                 (Some(0), None, (done > 0).then(|| format::bytes(done)))
             }
+            Disk::Web(bytes) => (Some(0), None, (*bytes > 0).then(|| format::bytes(*bytes))),
             Disk::Unread | Disk::Unreadable(_) => (None, None, None),
         };
         let label = resume_label(
@@ -326,6 +360,7 @@ impl Tasks {
                 row.file_progress = None;
                 row.torrent_progress = None;
                 row.cloud_progress = None;
+                row.web_progress = None;
                 row.rate = Rate::new(Instant::now(), baseline);
                 if let Some(start) = start {
                     row.timeline.begin(start);
@@ -416,15 +451,44 @@ impl Tasks {
         cx.notify();
     }
 
-    /// 从列表移除已完成的任务（输出归用户）与没有自己的任务目录的任务：只删记录。
+    /// 从列表移除已完成的任务（输出归用户；在做种的先停止做种）与没有自己的任务目录的任务：只删记录；做完时移除这一行，
+    /// 移除不了的提示原因（正在退出时不再退出，让用户看到）。正在继续、放弃或移除的不做。
     pub fn forget(&mut self, id: TaskId, cx: &mut Context<Self>) {
-        match self.service.forget(id) {
-            Ok(()) => self.rows.retain(|row| row.task.id != id),
-            Err(error) => {
-                let title = self.title(id);
-                self.add_notice(format!("移除「{title}」失败：{error}"));
-            }
+        let title = self.title(id);
+        let Some(row) = self.row_mut(id) else {
+            return;
+        };
+        if !row.idle() {
+            return;
         }
+        row.forgetting = true;
+        let handle = self.service.forget(id);
+        cx.spawn(async move |this, cx| {
+            let result = handle.await;
+            // 等待期间应用退出时不再需要结果；移除本身在服务里照常做完
+            let _gone = this.update(cx, |this, cx| {
+                let problem = match result {
+                    Ok(Ok(())) => {
+                        this.rows.retain(|row| row.task.id != id);
+                        None
+                    }
+                    Ok(Err(error)) => Some(format!("移除「{title}」失败：{error}")),
+                    Err(join) => Some(format!("移除「{title}」中途出错：{join}")),
+                };
+                if let Some(row) = this.row_mut(id) {
+                    row.forgetting = false;
+                }
+                if let Some(text) = problem {
+                    if this.quitting() {
+                        this.cancel_quit("从列表移除没做成，没有退出".to_owned());
+                    }
+                    this.add_notice(text);
+                }
+                this.quit_if_idle(cx);
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
     }
 

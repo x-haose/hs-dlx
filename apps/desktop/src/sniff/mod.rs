@@ -1,8 +1,9 @@
 //! 网页里的视频流：网页在后台加载、不显示，主体列出找到的视频流，每条在后台探测好（几档清晰度、时长或直播），用户
 //! 挑一条下载。要登录、认证或手动点播放时可以打开网页（左边网页、右边列表），弄完收起。
 //!
-//! 页面的地址、加载、标题与故障由网页引擎报；脚本发回的只有找到的流、顶层文档的类型与正文是否为播放列表，按不可信
-//! 数据校验、限量（见 [`script`]、[`inbox`]）。打开的地址是不是网页按第一个顶层文档定论（见 [`verdict`]）。网页要开
+//! 页面的地址、加载、标题、故障与顶层文档的 HTTP 状态码由网页引擎报；脚本发回的只有找到的流与顶层文档的情况（类型、
+//! 页面读到的状态码、正文是否为播放列表、是不是整页的人机验证），按不可信数据校验、限量（见 [`script`]、[`inbox`]）。
+//! 打开的地址是不是网页按第一个顶层文档定论（见 [`verdict`]）。网页要开
 //! 的新窗口与要下载的文件都不放行，列出来由用户决定。网页里的视频与音频只在网页显示着时放。找不到流时，打开的地址
 //! 可以当作播放列表交回新建页（缺请求头时源站回了网页）。
 
@@ -36,7 +37,9 @@ use crate::dial;
 use crate::links::{NOT_HTTP, http_url};
 use crate::new_task::Link;
 use crate::ui::GAP;
+use crate::wait::within;
 use crate::web_route::{Lease, RelayFailure, WebRoute};
+use hs_dlx_webview::cookies::cookies_for;
 
 /// 一个页面里最多列出多少条流：网页能报任意多条，再多的只计数。
 const MAX_FOUND: usize = 200;
@@ -74,6 +77,8 @@ pub struct SniffView {
     webview: Result<Entity<WebView>, String>,
     /// 网页显示着（左边网页、右边列表）；否则只有列表，网页在后台
     page_shown: bool,
+    /// 网页此刻是整页的人机验证（见 [`script::SCRIPT`]）：要用户在网页里过了验证才找得到流
+    challenge: bool,
     /// 嗅探页正显示着（由外面告诉，见 [`SniffView::set_on_screen`]）
     on_screen: bool,
     address: Entity<InputState>,
@@ -102,6 +107,8 @@ pub struct SniffView {
     navigated: Option<String>,
     /// 正在后台探测的一条（一次一条）；释放即取消
     checking: Option<Task<()>>,
+    /// 在读网页的 Cookie、好把网页交给网页视频解析（见 [`SniffView::open_page_as_web`]）；释放即取消
+    opening_web: Option<Task<()>>,
     _engine: Task<()>,
     /// 找流中逐帧重画、加载够久时重画一次好给出建议（见 [`SniffView::wait_to_suggest`]）
     _suggest: Task<()>,
@@ -163,6 +170,11 @@ impl SniffView {
                     });
                 }
             });
+        // macOS 上报 Safari 的标识（见 hs_dlx_webview::user_agent），网站的人机验证才把它当浏览器
+        let builder = match hs_dlx_webview::user_agent() {
+            Some(agent) => builder.with_user_agent(&agent),
+            None => builder,
+        };
         // 网页的出口进程里共用（见 crate::web_route）；中转连不过去的报来时看是不是打开的地址
         let route = WebRoute::get(cx);
         let relay_failures = cx.subscribe(&route, |this: &mut Self, _, failure, cx| {
@@ -172,21 +184,31 @@ impl SniffView {
             .settings()
             .map_err(|error| format!("读不出设置：{error}"))
             .and_then(|settings| route.update(cx, |route, _| route.acquire(&settings.proxy)));
-        let failed = {
+        let engine_events = {
             let inbox = inbox.clone();
-            move |failure| {
-                inbox.offer(match failure {
-                    hs_dlx_webview::Failure::LoadFailed(reason) => Engine::LoadFailed(reason),
-                    hs_dlx_webview::Failure::ProcessGone => Engine::Crashed,
+            move |event| {
+                inbox.offer(match event {
+                    hs_dlx_webview::Event::LoadFailed(reason) => Engine::LoadFailed(reason),
+                    hs_dlx_webview::Event::ProcessGone => Engine::Crashed,
+                    hs_dlx_webview::Event::Responded { url, status } => {
+                        Engine::Responded { url, status }
+                    }
+                    hs_dlx_webview::Event::Completed(status) => Engine::Completed(status),
                 });
             }
         };
         let (lease, proxy_note, webview) = match acquired {
             Ok((lease, note)) => {
-                let webview =
-                    WebView::build(builder, url.as_str(), &lease.proxy, failed, window, cx)
-                        .map(|webview| cx.new(|_| webview))
-                        .map_err(|error| format!("建不出网页：{error}"));
+                let webview = WebView::build(
+                    builder,
+                    url.as_str(),
+                    &lease.proxy,
+                    engine_events,
+                    window,
+                    cx,
+                )
+                .map(|webview| cx.new(|_| webview))
+                .map_err(|error| format!("建不出网页：{error}"));
                 (Some(lease), note, webview)
             }
             Err(reason) => (None, None, Err(reason)),
@@ -246,6 +268,7 @@ impl SniffView {
             opened: url,
             webview,
             page_shown: false,
+            challenge: false,
             on_screen: false,
             address,
             title: None,
@@ -267,6 +290,7 @@ impl SniffView {
             download: None,
             navigated: None,
             checking: None,
+            opening_web: None,
             _engine: engine,
             _suggest: Task::ready(()),
             _deadline: deadline,
@@ -315,6 +339,7 @@ impl SniffView {
                 self.download = None;
                 self.failure = None;
                 self.checking = None;
+                self.judge.started(&url);
                 self.load.shown = Some(url.clone());
                 self.load.finished = false;
                 self.navigated = Some(url);
@@ -334,6 +359,11 @@ impl SniffView {
                 self.failure = Some(reason.clone());
                 self.judge.fail(reason)
             }
+            Engine::Responded { url, status } => {
+                self.judge.responded(url, status);
+                false
+            }
+            Engine::Completed(status) => self.judge.completed(status),
             Engine::Crashed => {
                 let reason = "网页进程意外退出了".to_owned();
                 self.failure = Some(reason.clone());
@@ -346,8 +376,24 @@ impl SniffView {
                     self.add(Found::new(url, frame, top, agent), cx);
                     false
                 }
-                Some(Report::Document { content_type }) => self.judge.document(&content_type),
-                Some(Report::Content { playlist }) => self.judge.content(playlist),
+                Some(Report::Document {
+                    content_type,
+                    status,
+                }) => {
+                    self.challenge = false;
+                    self.judge.document(&content_type, status)
+                }
+                // 验证页藏在后台时用户不知道要先过验证：是验证页即把网页显示出来
+                Some(Report::Content {
+                    playlist,
+                    challenge,
+                }) => {
+                    self.challenge = challenge;
+                    if challenge && !self.page_shown {
+                        self.show_page(true, cx);
+                    }
+                    self.judge.content(playlist, challenge)
+                }
                 None => return,
             },
             // 单页应用换页时地址变了而不重新加载，常伴着改标题：顺带读一次地址
@@ -530,6 +576,49 @@ impl SniffView {
     /// 把网页要下载的文件 `url` 不带请求头交给新建页去探测；任务照网页的标题取名。
     fn open_download(&self, url: Url, cx: &mut Context<Self>) {
         self.open_link(url, self.title.clone(), Vec::new(), None, cx);
+    }
+
+    /// 把正显示的网页交给新建页按网页视频解析（yt-dlp），带上网页引擎里发往它的 Cookie：在这里登录过的网站，解析与
+    /// 下载都带着登录状态。读不出 Cookie 时写明原因、不交。
+    fn open_page_as_web(&mut self, cx: &mut Context<Self>) {
+        let Some(webview) = self.webview().cloned() else {
+            return;
+        };
+        let page = self
+            .load
+            .shown
+            .as_deref()
+            .and_then(http_url)
+            .unwrap_or_else(|| self.opened.clone());
+        let cookies = cookies_for(webview.read(cx).raw(), &page);
+        self.opening_web = Some(cx.spawn(async move |this, cx| {
+            let executor = cx.background_executor().clone();
+            let cookies = within(
+                std::pin::pin!(cookies),
+                executor.timer(check::COOKIE_TIMEOUT),
+            )
+            .await
+            .unwrap_or_else(|| {
+                Err(format!(
+                    "网页引擎 {} 秒没有回出 Cookie",
+                    check::COOKIE_TIMEOUT.as_secs()
+                ))
+            });
+            // 关了时不再需要
+            let _closed = this.update(cx, |this, cx| {
+                this.opening_web = None;
+                match cookies {
+                    Ok(cookies) => {
+                        let headers = request::cookie_header(&cookies).into_iter().collect();
+                        this.open_link(page, None, headers, None, cx);
+                    }
+                    Err(reason) => {
+                        this.error = Some(format!("没读出网页的 Cookie：{reason}"));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
     }
 
     /// 把打开的地址当作播放列表交给新建页：它取到的是网页（多为缺请求头时源站回的拦截页），网页的标题不是视频的，

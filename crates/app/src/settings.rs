@@ -22,6 +22,12 @@ pub struct Settings {
     /// BT 的节点连接、tracker 与 DHT 经的 SOCKS5 代理（`socks5://` 或 `socks5h://`，带端口，可带用户名与密码）；None
     /// 为直连。与 `proxy` 无关：那个只管 HTTP 的请求
     pub torrent_proxy: Option<hs_m3u8_core::Url>,
+    /// 网页视频的 yt-dlp 装与更新走的渠道
+    pub web_channel: hs_dlx_ytdlp::Channel,
+    /// 网页视频的画质选项按什么挑（见 [`crate::web::choices`]）
+    pub web_preference: crate::web::Preference,
+    /// 解析网页视频时另从这个浏览器的这个用户资料读登录后的 Cookie；None 为不读
+    pub web_browser: Option<hs_dlx_ytdlp::CookieSource>,
 }
 
 impl Default for Settings {
@@ -34,6 +40,9 @@ impl Default for Settings {
             upload_limit: None,
             check_updates: true,
             torrent_proxy: None,
+            web_channel: hs_dlx_ytdlp::Channel::Stable,
+            web_preference: crate::web::Preference::Compatible,
+            web_browser: None,
         }
     }
 }

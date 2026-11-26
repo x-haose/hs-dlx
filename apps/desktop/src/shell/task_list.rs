@@ -29,12 +29,14 @@ const ORBIT: Duration = Duration::from_millis(2800);
 
 impl Shell {
     pub(super) fn render_list(&self, tasks: &Tasks, cx: &Context<Self>) -> impl IntoElement {
+        // 设置开着时盖住了主体的页：哪一项都不算正显示着
+        let shown = self.settings.is_none();
         let new_task = self
             .new_task()
-            .map(|view| new_task_item(view.read(cx).phase()));
-        let dim = self.new_task().is_some();
+            .map(|view| new_task_item(view.read(cx).phase(), shown, cx));
+        let dim = shown && self.new_task().is_some();
         let sniff = self.sniff.as_ref().map(|(view, _)| {
-            let on = matches!(&self.page, Page::Sniff(shown) if shown == view);
+            let on = self.sniff_on_screen().as_ref() == Some(view);
             let read = view.read(cx);
             let (title, found) = (read.page_title(), read.found_count());
             sniff_item(title, found, on, dim, cx)
@@ -90,7 +92,7 @@ impl Shell {
     ) -> Stateful<Div> {
         let id = row.task.id;
         let look = look(row);
-        let on = selected == Some(id) && matches!(self.page, Page::Task);
+        let on = selected == Some(id) && matches!(self.page, Page::Task) && self.settings.is_none();
         let (fraction, color) = (look.fraction, look.orb);
         // 在下的任务：一颗光点沿小环绕行
         let orbit = (row.task.status == Status::Running)
@@ -99,7 +101,11 @@ impl Shell {
         ui::list_item(("task", id.0 as u64), on)
             .when(dim, |s| s.opacity(0.5))
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| this.select(id, cx)))
+            // 设置开着时点的：在设置下面换好再关上设置（嗅探页不先回到屏幕上）
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.select(id, cx);
+                this.close_settings(cx);
+            }))
             .child(
                 div()
                     .relative()
@@ -181,7 +187,10 @@ fn sniff_item(
     ui::list_item("sniff", on)
         .when(dim, |item| item.opacity(0.5))
         .cursor_pointer()
-        .on_click(cx.listener(|this, _, _, cx| this.show_sniff(cx)))
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.show_sniff(cx);
+            this.close_settings(cx);
+        }))
         .child(ui::rings(ORB, 3., 10.))
         .child(two_lines(
             title.unwrap_or_else(|| "网页里的视频流".to_owned()),
@@ -193,8 +202,11 @@ fn sniff_item(
         ))
 }
 
-fn new_task_item(phase: Phase) -> impl IntoElement {
-    ui::list_item("new-task", true)
+/// 新建页那一项：`on` 为正显示着（设置开着时没有）；点它关上设置、露出新建页。
+fn new_task_item(phase: Phase, on: bool, cx: &Context<Shell>) -> impl IntoElement {
+    ui::list_item("new-task", on)
+        .cursor_pointer()
+        .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)))
         .child(
             div()
                 .size(px(ORB))

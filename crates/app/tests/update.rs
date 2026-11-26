@@ -112,6 +112,13 @@ fn updates_are_found_downloaded_and_verified() {
             public_trackers: Vec::new(),
         },
         hs_dlx_app::pikpak::Endpoints::official(),
+        // 网页视频不在这里测：不给组件
+        hs_dlx_app::WebConfig {
+            root: std::env::temp_dir().join("hs-dlx-no-web"),
+            bundle: None,
+            sources: hs_dlx_app::ytdlp::Sources::official(),
+            update_every: None,
+        },
     )
     .unwrap();
     // 系统代理可能不放过回环地址

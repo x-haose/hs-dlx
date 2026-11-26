@@ -52,7 +52,15 @@ impl SniffView {
         } else {
             format!("找到 {} 条视频流", self.found.len())
         };
-        let rows: Vec<AnyElement> = if self.found.is_empty() {
+        let rows: Vec<AnyElement> = if self.challenge {
+            vec![
+                ui::note(
+                    "网站要先验证你是真人：在网页里完成验证，再点播放，找到的流会列在这里",
+                    true,
+                )
+                .into_any_element(),
+            ]
+        } else if self.found.is_empty() {
             vec![
                 ui::caption("在网页里登录、点了播放后，找到的流会列在这里").into_any_element(),
                 self.probe_opened(cx).into_any_element(),
@@ -170,6 +178,17 @@ impl SniffView {
                         Tone::Plain
                     },
                     cx.listener(|this, _, _, cx| this.show_page(true, cx)),
+                )
+                .into_any_element(),
+            );
+        }
+        if self.webview.is_ok() {
+            actions.push(
+                ui::button(
+                    "page-as-web",
+                    "解析网页视频",
+                    Tone::Plain,
+                    cx.listener(|this, _, _, cx| this.open_page_as_web(cx)),
                 )
                 .into_any_element(),
             );

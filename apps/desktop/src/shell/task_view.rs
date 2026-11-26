@@ -8,17 +8,18 @@ use gpui_kit::{
     SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Task, div,
     linear_color_stop, linear_gradient, px,
 };
-use hs_dlx_app::{Check, TaskId};
+use hs_dlx_app::web::Container;
+use hs_dlx_app::{Check, FailureKind, TaskId};
 use hs_dlx_app::{Status, TorrentPhase};
 use hs_m3u8_core::bare_url;
 
 use super::look::{Look, look};
-use super::plan::{Action, Plan, stopped_plan};
+use super::plan::{Action, Instead, Plan, stopped_plan};
 use super::{Shell, live_view};
 use crate::signals::{Level, Signal};
 use crate::tasks::{Amount, Disk, FileAmount, Row, main_output, resume_label, saved_as};
 use crate::ui::{self, GAP, INSPECTOR_MIN_WIDTH, Solid, Tone};
-use crate::{dial, format, motion, ring, theme};
+use crate::{dial, disk_access, format, motion, ring, theme};
 
 /// 在系统的文件管理器里显示输出：各平台的叫法。
 const REVEAL: &str = if cfg!(target_os = "macos") {
@@ -174,6 +175,12 @@ impl Shell {
         if let Some(hint) = look.hint {
             foot.push(ui::note(hint, true).into_any_element());
         }
+        // 读不了浏览器的数据：失败的说明里已写了怎么开权限，这里给直达的按钮
+        if matches!(&row.task.status, Status::Failed(failure) if failure.kind == FailureKind::WebCookies)
+            && self.tasks.read(cx).cookies_denied().is_some()
+        {
+            foot.extend(disk_access::button().map(IntoElement::into_any_element));
+        }
         foot.extend(primary.map(IntoElement::into_any_element));
         if !rest.is_empty() {
             foot.push(
@@ -328,12 +335,18 @@ impl Shell {
             .as_ref()
             .is_some_and(|(at, _)| *at == row.task.id);
         let headers = row.task.spec.torrent().is_none() && row.task.spec.cloud().is_none();
+        let instead = match (row.task.spec.hls(), row.task.spec.web()) {
+            (Some(_), _) => Instead::Hls,
+            (None, Some(web)) if web.container == Container::Mp4 => Instead::Matroska,
+            (None, _) => Instead::Nothing,
+        };
         stopped_plan(
             failure,
             row.recording(),
             row.task.write_only,
             headers,
             editing,
+            instead,
         )
     }
 
@@ -364,6 +377,11 @@ impl Shell {
                     "改存本地 HLS".to_owned(),
                     Some("已下的照样用".into()),
                 ),
+                Action::SwitchToMatroska => (
+                    "switch-mkv",
+                    "改用 MKV".to_owned(),
+                    Some("已下的照样用".into()),
+                ),
                 Action::Resume => (
                     "resume",
                     resume_label(failed, row.task.write_only).to_owned(),
@@ -384,6 +402,7 @@ impl Shell {
                 Action::EditHeaders => this.edit_headers(id, window, cx),
                 Action::WriteRecorded => this.write_recorded(id, cx),
                 Action::SwitchToHls => this.switch_to_hls(id, cx),
+                Action::SwitchToMatroska => this.switch_to_matroska(id, cx),
                 Action::Resume => this.resume(id, cx),
                 Action::OpenFolder => cx.open_with_system(&folder),
                 Action::LogIn => this.log_in_pikpak(window, cx),
@@ -512,10 +531,10 @@ impl Shell {
                         .flex_1(),
                     );
                 }
-                // BT：做种时只能停止做种（停了才能从列表移除），没在做种时可以再做
+                // BT：做种时可停止做种，没在做种时可以再做；做种时从列表移除先停止做种
                 if row.task.spec.torrent().is_some() {
-                    if row.task.seeding {
-                        rest.push(ui::button(
+                    rest.push(if row.task.seeding {
+                        ui::button(
                             "stop-seeding",
                             "停止做种",
                             Tone::Ghost,
@@ -524,17 +543,17 @@ impl Shell {
                                     .update(cx, |tasks, cx| tasks.stop_seeding(id, cx));
                                 cx.notify();
                             }),
-                        ));
-                        return Foot { primary, rest };
-                    }
-                    rest.push(ui::button(
-                        "seed",
-                        "做种",
-                        Tone::Ghost,
-                        cx.listener(move |this, _, _, cx| {
-                            this.tasks.update(cx, |tasks, cx| tasks.seed(id, cx))
-                        }),
-                    ));
+                        )
+                    } else {
+                        ui::button(
+                            "seed",
+                            "做种",
+                            Tone::Ghost,
+                            cx.listener(move |this, _, _, cx| {
+                                this.tasks.update(cx, |tasks, cx| tasks.seed(id, cx))
+                            }),
+                        )
+                    });
                 }
                 rest.push(forget(Tone::Ghost, cx));
                 Foot { primary, rest }
@@ -592,6 +611,9 @@ fn reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
     }
     if row.task.spec.cloud().is_some() {
         return cloud_reads(row, now);
+    }
+    if row.task.spec.web().is_some() {
+        return web_reads(row, now);
     }
     if row.task.spec.hls().is_none() {
         return file_reads(row, now);
@@ -671,6 +693,32 @@ fn file_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
             cell("大小", size),
         ],
     }
+}
+
+/// 网页视频任务的 [`reads`]（完成的除外）：下载时为速度、剩余、已下；别的时候为空（停着的已下要重新解析才知道）。
+fn web_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
+    let cell = |label: &'static str, value: String| (SharedString::from(label), value.into());
+    let fetching = matches!(
+        row.web_progress,
+        Some(hs_dlx_app::WebProgress::Fetching { .. })
+    );
+    let Some(amount) = FileAmount::of(row).filter(|_| fetching) else {
+        return Vec::new();
+    };
+    let speed = row.rate.bytes_per_second(now);
+    let left = amount
+        .total
+        .map(|total| total.saturating_sub(amount.bytes))
+        .filter(|_| speed > 0.0)
+        .map_or_else(
+            || "—".to_owned(),
+            |left| format::duration(Duration::from_secs_f64(left as f64 / speed)),
+        );
+    vec![
+        cell("速度", format!("{}/s", format::bytes(speed as u64))),
+        cell("剩余", left),
+        cell("已下", format::bytes(amount.bytes)),
+    ]
 }
 
 /// BT 任务的 [`reads`]（完成的除外）：在下时为速度、剩余、已下、要下的大小、节点数（其中做种的）与上传速度，停着的
@@ -848,13 +896,23 @@ fn signals(signals: &[Signal]) -> Div {
                     })
                     .child(SharedString::from(signal.text.clone())),
             )
-            .child(ui::num(
+            .child(
                 div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
                     .mt(px(2.))
-                    .text_size(px(11.))
-                    .text_color(theme::faint())
-                    .child(when),
-            ))
+                    .child(ui::num(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::faint())
+                            .child(when),
+                    ))
+                    // 警告与出错的给「复制」：报告问题时要完整的原文
+                    .when(level.is_some(), |line| {
+                        line.child(ui::copy_link(("copy-signal", index), signal.text.clone()))
+                    }),
+            )
     });
     div()
         .flex()

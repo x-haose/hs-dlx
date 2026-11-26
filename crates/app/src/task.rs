@@ -62,7 +62,7 @@ pub enum DraftKind {
     },
     /// BT：[`Draft::url`] 为磁力链接或种子文件的 `file:` 地址，没有请求头
     Torrent {
-        /// 种子的续传数据：种子文件转成的（[`crate::torrent_from_file`]）或磁力链接取到的
+        /// 种子的续传数据：种子文件转成的（[`crate::Service::open_torrent_file`]）或磁力链接取到的
         /// （[`crate::Service::fetch_metadata`]）
         resume: Vec<u8>,
         /// 要下的文件（[`crate::TorrentFile::index`]），至少一个
@@ -70,12 +70,26 @@ pub enum DraftKind {
     },
     /// 云离线：[`Draft::url`] 为磁力链接，没有请求头；新建时提交给网盘（要先登录），网盘下完后取回全部文件
     Cloud { provider: CloudProvider },
+    /// 网页视频（yt-dlp 解析）：[`Draft::url`] 为网页地址，请求头只能有 Cookie（解析与下载时带上）
+    Web {
+        /// 解析出的标题：任务的标题与输出的主名照它取
+        title: String,
+        /// 解析器与视频编号（见 [`crate::ytdlp::Info`]）
+        extractor: String,
+        video_id: String,
+        /// 选中的画质（[`crate::web::Choice`] 里的）：视频与另配的音频的格式、合并后的容器与扩展名
+        video: Option<hs_dlx_ytdlp::FormatKey>,
+        audio: Option<hs_dlx_ytdlp::FormatKey>,
+        container: crate::web::Container,
+        ext: String,
+    },
 }
 
 /// 新建任务时给定的内容，续传与续录照它重建请求；之后只有请求头可在任务停着时改（[`crate::Service::set_headers`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskSpec {
-    /// 列表里显示的名字：HLS 为输出的主名，文件为文件名，BT 为内容的根名，云离线为网盘给的名字（定下根之后为根名）
+    /// 列表里显示的名字：HLS 为输出的主名，文件为文件名，BT 为内容的根名，云离线为网盘给的名字（定下根之后为根名），
+    /// 网页视频为输出的主名
     pub title: String,
     pub url: Url,
     /// 额外的请求头，原样存储（含凭据时同样明文，存储文件只有本人可读写）
@@ -90,6 +104,7 @@ pub enum Kind {
     File(FileSpec),
     Torrent(TorrentSpec),
     Cloud(CloudSpec),
+    Web(WebSpec),
 }
 
 /// HLS 任务特有的内容。
@@ -138,6 +153,22 @@ pub struct CloudSpec {
     /// 内容的根：保存目录下的文件（网盘下到的是单个文件）或目录（文件夹），以文件名结尾的绝对路径。网盘下完、列出
     /// 文件时定下，之前为 None；定下时任务目录（[`Task::work_dir`]）随之定下
     pub root: Option<PathBuf>,
+}
+
+/// 网页视频任务特有的内容：每次开始与继续都重新解析网页，按格式编号找到这次的地址（地址会过期、与出口 IP 绑定）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSpec {
+    /// 解析器的名字，如 `Youtube`
+    pub extractor: String,
+    /// 视频在这个网站上的编号
+    pub video_id: String,
+    /// 视频的格式（重新解析后按它认出同一个）；只要音频时为 None
+    pub video: Option<hs_dlx_ytdlp::FormatKey>,
+    /// 另配的音频（或只要音频时那一路）的格式；视频自带音频时为 None。`video` 与 `audio` 至少有一个
+    pub audio: Option<hs_dlx_ytdlp::FormatKey>,
+    pub container: crate::web::Container,
+    /// 输出：以文件名结尾的绝对路径
+    pub path: PathBuf,
 }
 
 /// 提供云离线的网盘。
@@ -190,6 +221,7 @@ impl TaskSpec {
             Kind::File(file) => vec![&file.path],
             Kind::Torrent(torrent) => vec![&torrent.root],
             Kind::Cloud(cloud) => cloud.root.iter().map(PathBuf::as_path).collect(),
+            Kind::Web(web) => vec![&web.path],
         }
     }
 
@@ -197,7 +229,7 @@ impl TaskSpec {
     pub fn hls(&self) -> Option<&HlsSpec> {
         match &self.kind {
             Kind::Hls(hls) => Some(hls),
-            Kind::File(_) | Kind::Torrent(_) | Kind::Cloud(_) => None,
+            Kind::File(_) | Kind::Torrent(_) | Kind::Cloud(_) | Kind::Web(_) => None,
         }
     }
 
@@ -205,7 +237,7 @@ impl TaskSpec {
     pub fn file(&self) -> Option<&FileSpec> {
         match &self.kind {
             Kind::File(file) => Some(file),
-            Kind::Hls(_) | Kind::Torrent(_) | Kind::Cloud(_) => None,
+            Kind::Hls(_) | Kind::Torrent(_) | Kind::Cloud(_) | Kind::Web(_) => None,
         }
     }
 
@@ -213,7 +245,7 @@ impl TaskSpec {
     pub fn torrent(&self) -> Option<&TorrentSpec> {
         match &self.kind {
             Kind::Torrent(torrent) => Some(torrent),
-            Kind::Hls(_) | Kind::File(_) | Kind::Cloud(_) => None,
+            Kind::Hls(_) | Kind::File(_) | Kind::Cloud(_) | Kind::Web(_) => None,
         }
     }
 
@@ -221,7 +253,15 @@ impl TaskSpec {
     pub fn cloud(&self) -> Option<&CloudSpec> {
         match &self.kind {
             Kind::Cloud(cloud) => Some(cloud),
-            Kind::Hls(_) | Kind::File(_) | Kind::Torrent(_) => None,
+            Kind::Hls(_) | Kind::File(_) | Kind::Torrent(_) | Kind::Web(_) => None,
+        }
+    }
+
+    /// 网页视频任务特有的内容；别的任务为 None。
+    pub fn web(&self) -> Option<&WebSpec> {
+        match &self.kind {
+            Kind::Web(web) => Some(web),
+            Kind::Hls(_) | Kind::File(_) | Kind::Torrent(_) | Kind::Cloud(_) => None,
         }
     }
 }

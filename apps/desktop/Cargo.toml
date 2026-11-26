@@ -9,10 +9,10 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-chrono.workspace = true
 dirs.workspace = true
 fs4.workspace = true
 gpui-kit.workspace = true
+jiff.workspace = true
 hs-dlx-app = { path = "../../crates/app" }
 hs-m3u8-core.workspace = true
 hs-dlx-instance = { path = "../../crates/instance" }
@@ -22,6 +22,7 @@ hs-dlx-webview = { path = "../../crates/webview" }
 hs-dlx-scene = { path = "../../crates/scene" }
 # 背景的每一帧交给 GPUI 时用它的帧类型；与 gpui-pre 用的同一版，不另编一份
 image = { version = "0.25.10", default-features = false }
+percent-encoding.workspace = true
 psl.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -47,6 +48,9 @@ product-name = "hs-dlx"
 identifier = "io.github.x-haose.hs-dlx"
 description = "HLS（m3u8）视频下载器：点播、直播录制、在网页里找视频流"
 before-packaging-command = "cargo build --release --locked -p hs-dlx"
+# macOS 上打 dmg 之前给 .app 签名、公证（设了签名身份时，见 scripts/macos_sign.py）；别的格式与平台什么也不做。脚本只用
+# 标准库，不依赖项目的虚拟环境建没建；Python 版本同 pyproject.toml 的 requires-python
+before-each-package-command = { script = "uv run --no-project --python 3.12 python -I scripts/macos_sign.py hook target/release/hs-dlx.app", dir = "../.." }
 out-dir = "../../target/release"
 binaries = [{ path = "hs-dlx", main = true }]
 icons = [

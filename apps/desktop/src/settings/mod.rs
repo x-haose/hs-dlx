@@ -4,12 +4,13 @@ mod about;
 mod appearance;
 mod cloud;
 mod general;
+mod proxy_editor;
 mod torrent;
+mod web;
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 
-use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AppContext as _, ClickEvent, Context, Div, ElementId, Entity, EventEmitter, FontWeight,
@@ -19,8 +20,7 @@ use gpui_kit::{
 use hs_dlx_app::{Seeding, Settings};
 use hs_m3u8_core::Proxy;
 
-use self::general::PROXY_EXAMPLE;
-use self::torrent::TORRENT_PROXY_EXAMPLE;
+use self::proxy_editor::{ProxyEditor, ProxyEditorEvent};
 use crate::route::Route;
 use crate::tasks::Tasks;
 use crate::theme;
@@ -43,16 +43,19 @@ pub enum Section {
     Torrent,
     /// 云离线的网盘账号
     Cloud,
+    /// 网页视频的组件、更新渠道与画质
+    Web,
     Appearance,
     /// 更新、版本与第三方声明
     About,
 }
 
 impl Section {
-    const ALL: [Section; 5] = [
+    const ALL: [Section; 6] = [
         Section::Download,
         Section::Torrent,
         Section::Cloud,
+        Section::Web,
         Section::Appearance,
         Section::About,
     ];
@@ -62,6 +65,7 @@ impl Section {
             Section::Download => "下载",
             Section::Torrent => "BT",
             Section::Cloud => "网盘",
+            Section::Web => "网页视频",
             Section::Appearance => "外观",
             Section::About => "更新与关于",
         }
@@ -72,6 +76,7 @@ impl Section {
             Section::Download => "settings-download",
             Section::Torrent => "settings-torrent",
             Section::Cloud => "settings-cloud",
+            Section::Web => "settings-web",
             Section::Appearance => "settings-appearance",
             Section::About => "settings-about",
         }
@@ -99,7 +104,7 @@ pub struct SettingsView {
     proxy: Proxy,
     /// 选中的方式：选了「指定代理」而还没保存地址时与 `proxy` 不同
     mode: Mode,
-    address: Entity<InputState>,
+    address: Entity<ProxyEditor>,
     /// 跟随系统时一般的网址经哪里走；还没读到时为 None
     system: Option<Route>,
     /// 保存目录最近一次没换成的原因
@@ -126,7 +131,7 @@ pub struct SettingsView {
     /// 存着的 BT 代理（None 为直连）与选中的方式：选了经代理而还没存进地址时为 true
     torrent_proxy: Option<hs_m3u8_core::Url>,
     torrent_proxy_picked: bool,
-    torrent_address: Entity<InputState>,
+    torrent_address: Entity<ProxyEditor>,
     /// BT 代理最近一次没存进去的原因
     torrent_proxy_error: Option<String>,
     /// 网络检测：在做时有（释放即取消），做完的结果或没做成的原因
@@ -137,6 +142,11 @@ pub struct SettingsView {
     section: Section,
     /// 右边各行的滚动位置：换组时回到顶上
     scroll: ScrollHandle,
+    web: web::WebSettings,
+    /// 看着网页视频组件的状态
+    _web: Task<()>,
+    /// 看着后台查新的 yt-dlp 的结果
+    _web_auto_check: Task<()>,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
@@ -154,38 +164,50 @@ impl SettingsView {
         let watched = cx.observe(&updates, |_, _, cx| cx.notify());
         let tasks_watched = cx.observe(&tasks, |_, _, cx| cx.notify());
         let proxy = settings.proxy;
-        let address = cx.new(|cx| InputState::new(window, cx).placeholder(PROXY_EXAMPLE));
+        let saved = match &proxy {
+            Proxy::Url(url) => Some(url),
+            Proxy::System | Proxy::Direct => None,
+        };
+        let address = cx.new(|cx| ProxyEditor::new(tasks.clone(), false, saved, window, cx));
         let torrent_address = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(format!("如 {TORRENT_PROXY_EXAMPLE}"))
+            ProxyEditor::new(
+                tasks.clone(),
+                true,
+                settings.torrent_proxy.as_ref(),
+                window,
+                cx,
+            )
         });
-        if let Some(url) = &settings.torrent_proxy {
-            torrent_address.update(cx, |input, cx| input.set_value(url.to_string(), window, cx));
-        }
         let torrent_typed = cx.subscribe_in(
             &torrent_address,
             window,
-            |this: &mut Self, _, event: &InputEvent, _, cx| match event {
-                InputEvent::PressEnter { .. } => this.save_torrent_proxy(cx),
-                InputEvent::Change => {
+            |this: &mut Self, editor, event: &ProxyEditorEvent, window, cx| match event {
+                ProxyEditorEvent::Identified(url) => {
+                    this.save_torrent_proxy(url.clone(), cx);
+                    if this.torrent_proxy.as_ref() == Some(url) {
+                        editor.update(cx, |editor, cx| editor.fill(url, window, cx));
+                    }
+                }
+                ProxyEditorEvent::Changed => {
                     this.torrent_proxy_error = None;
                     cx.notify();
                 }
-                InputEvent::Focus | InputEvent::Blur => {}
             },
         );
-        if let Proxy::Url(url) = &proxy {
-            address.update(cx, |input, cx| input.set_value(url.to_string(), window, cx));
-        }
         let typed = cx.subscribe_in(
             &address,
             window,
-            |this: &mut Self, _, event: &InputEvent, _, cx| match event {
-                InputEvent::PressEnter { .. } => this.save_custom(cx),
-                InputEvent::Change => {
+            |this: &mut Self, editor, event: &ProxyEditorEvent, window, cx| match event {
+                ProxyEditorEvent::Identified(url) => {
+                    this.save_custom(url.clone(), cx);
+                    if this.proxy == Proxy::Url(url.clone()) {
+                        editor.update(cx, |editor, cx| editor.fill(url, window, cx));
+                    }
+                }
+                ProxyEditorEvent::Changed => {
                     this.proxy_error = None;
                     cx.notify();
                 }
-                InputEvent::Focus | InputEvent::Blur => {}
             },
         );
         // 读系统代理要调操作系统的接口，在后台读
@@ -199,6 +221,28 @@ impl SettingsView {
             });
         });
         let mode = mode_of(&proxy);
+        let web_states = tasks.read(cx).service().web_state();
+        let web_auto = tasks.read(cx).service().web_auto_check();
+        let web = web::WebSettings {
+            state: web_states.borrow().clone(),
+            channel: settings.web_channel,
+            preference: settings.web_preference,
+            shown: settings.web_browser.as_ref().map(|source| source.browser),
+            listing: None,
+            listing_task: settings
+                .web_browser
+                .as_ref()
+                .map(|source| Self::list_profiles(source.browser, false, cx)),
+            browser: settings.web_browser,
+            browsers: tasks.read(cx).service().web_browsers(),
+            latest: None,
+            checking: None,
+            previous: tasks.read(cx).service().web_previous(),
+            error: None,
+            auto_check: web_auto.borrow().clone(),
+        };
+        let web_watch = Self::watch_web(cx, web_states);
+        let web_auto_watch = Self::watch_web_auto_check(cx, web_auto);
         SettingsView {
             tasks,
             home,
@@ -228,6 +272,9 @@ impl SettingsView {
             _torrent_typed: torrent_typed,
             section: Section::Download,
             scroll: ScrollHandle::new(),
+            web,
+            _web: web_watch,
+            _web_auto_check: web_auto_watch,
         }
     }
 
@@ -253,6 +300,12 @@ impl Render for SettingsView {
                 ]
             }
             Section::Cloud => vec![self.render_pikpak(cx)],
+            Section::Web => vec![
+                self.render_web_components(cx),
+                self.render_web_channel(cx),
+                self.render_web_preference(cx),
+                self.render_web_browser(cx),
+            ],
             Section::Appearance => vec![self.render_theme(cx)],
             Section::About => vec![self.render_updates(cx), self.render_about(cx)],
         };

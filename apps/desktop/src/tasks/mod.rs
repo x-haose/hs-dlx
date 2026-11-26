@@ -12,6 +12,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::{Context, EventEmitter, Subscription, Task};
+use hs_dlx_app::ytdlp::Browser;
 use hs_dlx_app::{Event, Events, Finished, SeedEnd, Service, Status, TaskId};
 use hs_dlx_instance::{Handoff, Handoffs, Received};
 use hs_m3u8_core::Stage;
@@ -87,6 +88,11 @@ pub struct Tasks {
     /// 保存目录所在盘的可用空间（字节）：还没读到时为 None，读不出、目录不在或读超时时为原因
     free_space: Option<Result<u64, String>>,
     pikpak: PikPak,
+    /// 设置里选的、本进程没有权限读它的数据的浏览器（见 [`Browser::access`]）；没选或读得了时为 None。打开应用与改了
+    /// 选的浏览器时查（见 [`Tasks::check_cookie_access`]）：macOS 上给了权限的进程要重开才拿得到，开着时不会变
+    cookies_denied: Option<Browser>,
+    /// 在后台查 `cookies_denied`：释放即取消（再查时换掉）
+    _cookie_check: Task<()>,
     /// 收得了后打开的实例转交来的（再次打开应用会回到窗口）；macOS 上总能点程序坞回到窗口，用不到
     #[cfg(not(target_os = "macos"))]
     receives_handoffs: bool,
@@ -178,6 +184,8 @@ impl Tasks {
             early: Vec::new(),
             free_space: None,
             pikpak: PikPak::default(),
+            cookies_denied: None,
+            _cookie_check: Task::ready(()),
             #[cfg(not(target_os = "macos"))]
             receives_handoffs,
             _events: receiving,
@@ -190,6 +198,7 @@ impl Tasks {
             tasks.add_notice(problem);
         }
         tasks.reload_pikpak();
+        tasks.check_cookie_access(cx);
         let ids: Vec<TaskId> = tasks.rows.iter().map(|r| r.task.id).collect();
         for id in ids {
             tasks.after_stop(id, cx);
@@ -283,6 +292,19 @@ impl Tasks {
                         row.signal(level, text);
                     }
                     row.cloud_progress = Some(*progress);
+                }
+            }
+            Event::WebProgress { id, progress } => {
+                if let Some(row) = self.row_mut(id) {
+                    if let hs_dlx_app::WebProgress::Fetching { received, .. } = progress.as_ref() {
+                        row.rate.update(Instant::now(), *received, 0);
+                    }
+                    for (level, text) in
+                        crate::signals::between_web(row.web_progress.as_ref(), &progress)
+                    {
+                        row.signal(level, text);
+                    }
+                    row.web_progress = Some(*progress);
                 }
             }
             Event::Renamed { id } => match self.service.task(id) {
@@ -543,6 +565,38 @@ impl Tasks {
 
     pub fn free_space(&self) -> Option<&Result<u64, String>> {
         self.free_space.as_ref()
+    }
+
+    /// 见 [`Tasks::cookies_denied`] 字段。
+    pub fn cookies_denied(&self) -> Option<Browser> {
+        self.cookies_denied
+    }
+
+    /// 在后台重查设置里选的浏览器的数据读不读得了，变了时通知窗口重画；读不出设置时提示原因。
+    pub fn check_cookie_access(&mut self, cx: &mut Context<Self>) {
+        let browser = match self.service.settings() {
+            Ok(settings) => settings.web_browser.map(|source| source.browser),
+            Err(error) => {
+                self.tell(
+                    format!("读不出设置，查不了能不能读浏览器的登录信息：{error}"),
+                    cx,
+                );
+                return;
+            }
+        };
+        let checking = cx
+            .background_executor()
+            .spawn(async move { browser.filter(|browser| browser.access().is_err()) });
+        self._cookie_check = cx.spawn(async move |this, cx| {
+            let denied = checking.await;
+            // 应用在退出时不再需要结果
+            let _closed = this.update(cx, |this, cx| {
+                if denied != this.cookies_denied {
+                    this.cookies_denied = denied;
+                    cx.notify();
+                }
+            });
+        });
     }
 
     pub fn notices(&self) -> &[Notice] {

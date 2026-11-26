@@ -1,19 +1,21 @@
 //! 新建页右边的检查面板：标题与主机；探测中为进行到哪一步与请求经哪里走；认出播放列表为探测结果的读数、清晰度之外
 //! 的选择（音轨、输出、保存位置、请求头）与开始；认出文件为大小、类型、能否续传与保存位置、请求头、开始；探测失败为
-//! 错误与能做的事（改请求头重新探测、重新探测、在网页里找视频流）；磁力链接取种子信息时为连着的节点数，取到后（种子
-//! 文件读到后）为大小、要下的文件、保存位置与开始。磁力链接在这几步都可以改用 PikPak 云离线。
+//! 错误与能做的事（改请求头、重新探测、网页视频要登录或被拦截时到网页里登录、在网页里找视频流）；磁力链接取种子信息时为连着的节点数，取到后（种子
+//! 文件读到后）为大小、要下的文件、保存位置与开始。磁力链接在这几步都可以改用 PikPak 云离线。地址是网页时：yt-dlp
+//! 解析中只写请求经哪里走，组件没装时为安装与进度，解析出来后为时长、上传者、画质选项、保存位置与开始（见 web.rs）。
 
 use gpui_kit::{
     AnyElement, Context, Div, IntoElement, ParentElement as _, SharedString, Styled as _, div, px,
 };
 use gpui_kit::{InteractiveElement as _, StatefulInteractiveElement as _};
-use hs_dlx_app::{Failure, MetadataProgress, OutputKind};
+use hs_dlx_app::{Failure, FailureKind, MetadataProgress, OutputKind};
 use hs_m3u8_core::{FileInfo, Probe};
 
 use super::{NewTask, NewTaskEvent, PageCheck, Probing, Route, TorrentChoice, duration_of};
 
 /// 磁力链接取种子信息多久还没有节点时提示去检测网络。
 const NO_PEERS_HINT: std::time::Duration = std::time::Duration::from_secs(60);
+use crate::disk_access;
 use crate::format;
 use crate::theme;
 use crate::ui::{self, Solid, Step, Tone};
@@ -48,11 +50,19 @@ impl NewTask {
             Probing::Failed(failure) => self.failed_inspector(title, host, failure, cx),
             Probing::Ready(probe) => self.ready_inspector(title, host, probe, cx),
             Probing::File(info) => self.file_inspector(title, host, info, cx),
+            Probing::Resolving => ui::inspector(
+                title,
+                host,
+                self.reads_with_route(Vec::new()),
+                [self.cancel(Tone::Plain, cx)],
+            ),
+            Probing::NeedsWeb(state) => self.needs_web_inspector(title, host, state, cx),
+            Probing::Web(choice) => self.web_inspector(title, host, choice, cx),
         }
     }
 
     /// 退出新建页的按钮，独占底栏一行。
-    fn cancel(&self, tone: Tone, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn cancel(&self, tone: Tone, cx: &mut Context<Self>) -> AnyElement {
         ui::button(
             "cancel",
             "取消",
@@ -75,7 +85,10 @@ impl NewTask {
 
     /// 读数格 `cells`，后面接一格占满一行的「网络」（读到系统代理之后），代理用不了时下面写原因。
     /// 两样都没有时为 None。
-    fn reads_with_route(&self, cells: Vec<(SharedString, SharedString)>) -> Option<AnyElement> {
+    pub(super) fn reads_with_route(
+        &self,
+        cells: Vec<(SharedString, SharedString)>,
+    ) -> Option<AnyElement> {
         let (route, broken) = self.route().unzip();
         if cells.is_empty() && route.is_none() {
             return None;
@@ -90,8 +103,11 @@ impl NewTask {
         Some(shown)
     }
 
-    /// 探测失败：错误（与看过不是网页的说明）、请求经哪里走、缺请求头时的编辑框；底栏是重新探测与另找。被拒或取到错误
-    /// 页的多半缺请求头，带上再探测；再试也一样的不给重新探测。不是从嗅探页来的还可以在网页里打开它找视频流。
+    /// 探测失败：错误、这类失败怎么办（见 [`format::failure`]；要登录时换成怎么登录）、看过不是网页的说明、请求经哪里
+    /// 走、缺请求头时的编辑框；底栏是重新探测与另找。被拒或取到错误页的多半缺请求头，改了再探测；再试也一样的不给重新
+    /// 探测。网页视频要登录时主按钮是到网页里登录（嗅探页里登录、回到视频页后点「解析网页视频」，带着登录后的 Cookie
+    /// 解析；从嗅探页来的回嗅探页），另给重新探测（在常用的浏览器里登录了、或在设置里选了从浏览器读之后，再解析时现
+    /// 读）；被拦截时另给到网页里登录。不是从嗅探页来的还可以在网页里打开它找视频流。
     fn failed_inspector(
         &self,
         title: String,
@@ -100,10 +116,29 @@ impl NewTask {
         cx: &mut Context<Self>,
     ) -> Div {
         let headers = failure.kind.headers_likely_missing();
+        let needs_login = failure.kind == FailureKind::WebLogin;
+        let login = needs_login && !self.from_sniff;
         let again = headers || failure.kind.retry_helps();
-        let mut body = vec![ui::note(failure.message.clone(), true).into_any_element()];
+        let mut body =
+            vec![ui::error_note("copy-failure", failure.message.clone()).into_any_element()];
+        if !needs_login {
+            body.push(ui::note(format::failure(failure.kind).1, false).into_any_element());
+        }
+        // 读不了浏览器的数据：失败的说明里已写了怎么开权限，这里给直达的按钮
+        if failure.kind == FailureKind::WebCookies && self.tasks.read(cx).cookies_denied().is_some()
+        {
+            body.extend(disk_access::button().map(IntoElement::into_any_element));
+        }
         if let PageCheck::NotPage(note) = &self.page_check {
             body.push(ui::note(note.clone(), false).into_any_element());
+        }
+        if needs_login {
+            let how = if self.from_sniff {
+                "回到网页里登录，回到视频页后再点顶上的「解析网页视频」；或在设置的「网页视频 → 登录信息」里选你常用的浏览器（已选的在它里面登录这个网站），再点重新探测"
+            } else {
+                "在打开的网页里登录，回到视频页后点顶上的「解析网页视频」；或在设置的「网页视频 → 登录信息」里选你常用的浏览器（已选的在它里面登录这个网站），再点重新探测"
+            };
+            body.push(ui::note(how.to_owned(), false).into_any_element());
         }
         body.extend(self.reads_with_route(Vec::new()));
         if headers {
@@ -112,15 +147,37 @@ impl NewTask {
             );
         }
         let mut foot = Vec::new();
-        if again {
+        if login {
+            let url = self.url.clone();
+            foot.push(
+                ui::primary(
+                    "login",
+                    "到网页里登录",
+                    None,
+                    Solid::Amber,
+                    true,
+                    cx.listener(move |_, _, _, cx| cx.emit(NewTaskEvent::Sniff(url.clone()))),
+                )
+                .into_any_element(),
+            );
+        } else if needs_login {
+            // 从嗅探页来的：退出新建页即回到嗅探页
+            foot.push(
+                ui::primary(
+                    "back-to-page",
+                    "回到网页里登录",
+                    None,
+                    Solid::Amber,
+                    true,
+                    cx.listener(|_, _, _, cx| cx.emit(NewTaskEvent::Dismissed)),
+                )
+                .into_any_element(),
+            );
+        } else if again {
             foot.push(
                 ui::primary(
                     "reprobe",
-                    if headers {
-                        "带上请求头重新探测"
-                    } else {
-                        "重新探测"
-                    },
+                    "重新探测",
                     None,
                     Solid::Amber,
                     true,
@@ -130,12 +187,28 @@ impl NewTask {
             );
         }
         let mut row = Vec::new();
-        if !self.from_sniff {
+        if needs_login && again {
+            row.push(
+                ui::button(
+                    "reprobe",
+                    "重新探测",
+                    Tone::Plain,
+                    cx.listener(|this, _, window, cx| this.reprobe(window, cx)),
+                )
+                .flex_1()
+                .into_any_element(),
+            );
+        }
+        if !self.from_sniff && !needs_login {
             let url = self.url.clone();
             row.push(
                 ui::button(
                     "sniff",
-                    "在网页里找视频流",
+                    if failure.kind == FailureKind::WebBlocked {
+                        "到网页里登录"
+                    } else {
+                        "在网页里找视频流"
+                    },
                     Tone::Plain,
                     cx.listener(move |_, _, _, cx| cx.emit(NewTaskEvent::Sniff(url.clone()))),
                 )
@@ -296,7 +369,7 @@ impl NewTask {
         offer
     }
 
-    /// 取不到种子信息、读不出种子文件：错误，能再试的给再试。
+    /// 取不到种子信息、读不出种子文件：错误与这类失败怎么办（见 [`format::failure`]），能再试的给再试。
     fn torrent_failed_inspector(
         &self,
         title: String,
@@ -304,7 +377,10 @@ impl NewTask {
         failure: &Failure,
         cx: &mut Context<Self>,
     ) -> Div {
-        let body = [ui::note(failure.message.clone(), true).into_any_element()];
+        let body = [
+            ui::error_note("copy-failure", failure.message.clone()).into_any_element(),
+            ui::note(format::failure(failure.kind).1, false).into_any_element(),
+        ];
         let mut foot = self.cloud_offer(cx);
         if failure.kind.retry_helps() {
             foot.push(
@@ -423,7 +499,7 @@ impl NewTask {
     }
 
     /// 「保存到」一组：现在的保存位置与更改。
-    fn folder_group(&self, cx: &mut Context<Self>) -> Div {
+    pub(super) fn folder_group(&self, cx: &mut Context<Self>) -> Div {
         group(
             "保存到",
             [div()
@@ -640,7 +716,7 @@ fn file_row(at: usize, path: &str, size: u64, wanted: bool) -> gpui_kit::Statefu
 }
 
 /// 带小标题的一组。
-fn group(title: &'static str, children: impl IntoIterator<Item = AnyElement>) -> Div {
+pub(super) fn group(title: &'static str, children: impl IntoIterator<Item = AnyElement>) -> Div {
     div()
         .flex()
         .flex_col()

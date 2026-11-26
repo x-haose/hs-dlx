@@ -15,8 +15,10 @@ impl Shell {
         let request = match links::request(text) {
             Ok(request) => request,
             Err(reason) => {
-                // 嗅探页与设置页不放粘贴栏（转交来的内容可能在这时到）：回任务页，原因才看得见
-                if matches!(self.page, Page::Sniff(_) | Page::Settings { .. }) {
+                // 嗅探页与设置页不放粘贴栏（转交来的内容可能在这时到）：关上设置露出主体的页，是嗅探页时再回任务页，
+                // 原因才看得见
+                self.close_settings(cx);
+                if matches!(self.page, Page::Sniff(_)) {
                     self.show(Page::Task, cx);
                 }
                 self.dock.update(cx, |dock, cx| dock.refuse(reason, cx));
@@ -52,10 +54,10 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let tasks = self.tasks.read(cx);
-        let (service, folder) = (tasks.service().clone(), tasks.folder().clone());
-        let dock = self.dock.clone();
-        let view = cx.new(|cx| NewTask::new(service, link, from_sniff, folder, dock, window, cx));
+        // 粘贴的、转交来的、嗅探页里点的：都是用户要看的，设置开着时关上
+        self.close_settings(cx);
+        let (tasks, dock) = (self.tasks.clone(), self.dock.clone());
+        let view = cx.new(|cx| NewTask::new(tasks, link, from_sniff, dock, window, cx));
         let subscription = cx.subscribe_in(
             &view,
             window,
@@ -79,8 +81,21 @@ impl Shell {
                         }
                     }
                     NewTaskEvent::Ready => this.focus_new_task(view, window, cx),
-                    NewTaskEvent::NotAPlaylist => this.check_page(view, window, cx),
+                    NewTaskEvent::MaybePage => this.check_page(view, window, cx),
                     NewTaskEvent::Sniff(url) => this.open_sniff(url.clone(), window, cx),
+                    // 同一个种子不能有两个任务：换到已有的那个，说一声（新建页随之关掉；设置开着时换在设置下面）。新建页
+                    // 已换走的不再管
+                    NewTaskEvent::Taken(existing) => {
+                        let title = this
+                            .tasks
+                            .read(cx)
+                            .row(*existing)
+                            .map(|row| row.task.spec.title.clone());
+                        if let Some(title) = title.filter(|_| this.new_task() == Some(view)) {
+                            this.select(*existing, cx);
+                            this.tell(format!("这个种子已在「{title}」里，换到了它"), cx);
+                        }
+                    }
                     // 这个任务照选的存；记成之后新建的默认位置，记不下时提示
                     NewTaskEvent::FolderChanged(folder) => {
                         let saved = this
@@ -122,6 +137,10 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 在设置后面探测好的不抢焦点（用户在设置里打字）
+        if self.settings.is_some() || self.new_task() != Some(view) {
+            return;
+        }
         let dock = self.dock.read(cx);
         let typing = dock.typing(window, cx);
         let same = links::target(&dock.text(cx)).is_some_and(|url| &url == view.read(cx).url());
@@ -130,8 +149,8 @@ impl Shell {
         }
     }
 
-    /// 新建页 `view` 第一次探测取到的不是播放列表：粘贴来的、地址也不像播放列表的，在后台的网页里打开它，网页引擎
-    /// 认出是网页就换到嗅探页找视频流（见 [`Shell::checked_page`]）；从嗅探页来的流、像播放列表的地址照常显示失败。
+    /// 新建页 `view` 第一次探测的结果说明地址可能是网页：粘贴来的、地址也不像播放列表的，在后台的网页里打开它，认出是
+    /// 网页就换到嗅探页找视频流（见 [`Shell::checked_page`]）；从嗅探页来的流、像播放列表的地址照常显示失败。
     fn check_page(&mut self, view: &Entity<NewTask>, window: &mut Window, cx: &mut Context<Self>) {
         let url = view.read(cx).url().clone();
         let Page::NewTask {
@@ -163,8 +182,8 @@ impl Shell {
         self.checked_page(&sniff, window, cx);
     }
 
-    /// 后台的网页 `sniff` 有了是不是网页的结论：是网页就换到嗅探页，否则在新建页的失败下面写明。新建页已换走、或用户
-    /// 已改了请求头重新探测的，不再需要它。
+    /// 后台的网页 `sniff` 有了是不是网页的结论（见 [`Verdict`]）：是网页就换到嗅探页，否则在新建页的失败下面写明（新建页
+    /// 留着，可改请求头重新探测）。新建页已换走、或用户已改了请求头重新探测的，不再需要它。
     fn checked_page(
         &mut self,
         sniff: &Entity<SniffView>,
@@ -190,6 +209,10 @@ impl Shell {
         let note = match sniff.read(cx).verdict() {
             Verdict::Pending => return,
             Verdict::Page => None,
+            Verdict::Refused(status) => Some(format!("网页引擎打开它回 HTTP {status}")),
+            Verdict::Unknown => {
+                Some("网页引擎没报出它的 HTTP 状态码，判断不了这一页是不是出错页".to_owned())
+            }
             Verdict::NotPage(Some(kind)) => Some(format!("网页引擎打开它是 {kind}，不是网页")),
             Verdict::NotPage(None) => Some("网页引擎打开它也不是网页".to_owned()),
             Verdict::Playlist => Some("网页引擎打开它是 HLS 播放列表，不是网页".to_owned()),

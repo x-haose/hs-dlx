@@ -1,7 +1,11 @@
 //! 本机两个会话互传：一个做种，另一个用磁力链接（只有信息哈希）连上它取种子信息，或直接用种子文件，再照选择加入、
 //! 下完内容。不用 DHT、tracker 与端口映射，不出本机。
 
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use hs_dlx_torrent::{
@@ -34,8 +38,13 @@ fn scratch(name: &str) -> PathBuf {
 
 /// 只在回环地址上监听（端口由系统挑）、不找外面的节点的会话。
 fn local_session() -> Session {
+    session_on("127.0.0.1:0")
+}
+
+/// 只在 `listen` 上监听、不找外面节点的会话。
+fn session_on(listen: &str) -> Session {
     Session::new(&SessionConfig {
-        listen_interfaces: "127.0.0.1:0".into(),
+        listen_interfaces: listen.into(),
         dht: false,
         dht_bootstrap_nodes: String::new(),
         upnp: false,
@@ -559,4 +568,236 @@ fn added_trackers_stay_out_of_resume_data() {
     wait_until(&session, Duration::from_secs(10), |s| !s.removing(&id));
     let again = session.add_magnet(&uri, path_str(&dir)).unwrap();
     assert_eq!(session.add_trackers(&again, &urls).unwrap(), 1);
+}
+
+/// 每个监听地址都路由不到的 tracker（只在 IPv4 回环上监听时的 IPv6 地址）报出错，说明是中文的；被拒的照常报
+/// libtorrent 的原因。
+#[test]
+fn a_tracker_no_listen_address_can_route_to_is_reported_as_unroutable() {
+    let dir = scratch("unroutable-tracker");
+    let session = local_session();
+    let unroutable = "http://[2001:db8::1]/announce";
+    // 本机这个端口没人监听：通告随即被拒
+    let refused = "http://127.0.0.1:9/announce";
+    let hash = "1123456789abcdef0123456789abcdef01234567";
+    let uri = format!(
+        "magnet:?xt=urn:btih:{hash}&tr=http%3A%2F%2F%5B2001%3Adb8%3A%3A1%5D%2Fannounce&tr={refused}"
+    );
+    let id = session.add_magnet(&uri, path_str(&dir)).unwrap();
+    let errors = tracker_errors_until_failed(&session, &id);
+    let about = |url: &str| -> Vec<&String> { errors.iter().filter(|m| m.contains(url)).collect() };
+    assert!(!about(unroutable).is_empty(), "{errors:?}");
+    assert!(
+        about(unroutable)
+            .iter()
+            .all(|m| m.contains("本机的网络地址都连不到它")),
+        "{errors:?}"
+    );
+    assert!(
+        about(refused)
+            .iter()
+            .all(|m| !m.contains("本机的网络地址都连不到它") && !m.contains("skipping")),
+        "{errors:?}"
+    );
+    let message = tracker_message(&session, &id, unroutable);
+    assert!(message.contains("本机的网络地址都连不到它"), "{message}");
+
+    drop(session);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 跳过的事件还在队列里时种子移除完了：照样取得出事件，不因查不到这个种子的 tracker 出错。
+#[test]
+fn a_skipped_announce_of_a_removed_torrent_still_pops() {
+    let dir = scratch("skipped-then-removed");
+    let session = local_session();
+    let hash = "3123456789abcdef0123456789abcdef01234567";
+    let uri =
+        format!("magnet:?xt=urn:btih:{hash}&tr=http%3A%2F%2F%5B2001%3Adb8%3A%3A1%5D%2Fannounce");
+    let id = session.add_magnet(&uri, path_str(&dir)).unwrap();
+    // 先不取事件：跳过的事件留在队列里
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !session.trackers(&id).unwrap().iter().all(|t| t.failed) {
+        assert!(Instant::now() < deadline, "没等到 tracker 算连不上");
+    }
+    session.remove(&id, Removal::Keep).unwrap();
+    // 没有种子信息的种子没有存储：移除在会话的线程上做完时随即发出移除的事件。之后的同步调用（取监听端口）在会话的线程
+    // 上排在移除之后，返回时移除已做完、事件已在队列里
+    session.listen_port();
+    let kinds: Vec<AlertKind> = session
+        .pop_alerts(100)
+        .unwrap()
+        .into_iter()
+        .map(|a| a.kind)
+        .collect();
+    assert!(kinds.contains(&AlertKind::Removed), "{kinds:?}");
+
+    drop(session);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 只有部分监听地址路由不到的 tracker（在 IPv6 与 IPv4 回环上监听时的 IPv4 地址，被跳过的 IPv6
+/// 地址排在前面）：跳过的那个地址不报错，查 tracker 时说明是能通告的那个地址的真正原因。
+#[test]
+fn a_tracker_skipped_on_some_listen_addresses_reports_the_real_failure() {
+    let dir = scratch("partly-skipped-tracker");
+    let session = session_on("[::1]:0,127.0.0.1:0");
+    let refused = "http://127.0.0.1:9/announce";
+    let hash = "2123456789abcdef0123456789abcdef01234567";
+    let uri = format!("magnet:?xt=urn:btih:{hash}&tr={refused}");
+    let id = session.add_magnet(&uri, path_str(&dir)).unwrap();
+    let errors = tracker_errors_until_failed(&session, &id);
+    assert!(!errors.is_empty());
+    assert!(
+        errors
+            .iter()
+            .all(|m| !m.contains("skipping") && !m.contains("本机的网络地址都连不到它")),
+        "{errors:?}"
+    );
+    let message = tracker_message(&session, &id, refused);
+    assert!(
+        !message.is_empty() && !message.contains("skipping"),
+        "{message}"
+    );
+
+    drop(session);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// tracker 出错的说明为「tracker 的地址：原因」：回了 failure reason 的取它，连不上的取错误说明；不带种子、监听地址与
+/// 连续失败的次数。
+#[test]
+fn tracker_errors_read_as_the_url_and_the_reason() {
+    let dir = scratch("tracker-error-text");
+    let session = local_session();
+    let failing = LocalTracker::start(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 33\r\nConnection: close\r\n\r\nd14:failure reason11:not allowede",
+    );
+    let missing = LocalTracker::start(
+        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+    let refused = "http://127.0.0.1:9/announce";
+    let hash = "4123456789abcdef0123456789abcdef01234567";
+    let uri = format!(
+        "magnet:?xt=urn:btih:{hash}&tr={}&tr={}&tr={refused}",
+        failing.url, missing.url
+    );
+    let id = session.add_magnet(&uri, path_str(&dir)).unwrap();
+    let errors = tracker_errors_until_failed(&session, &id);
+    assert!(
+        errors.contains(&format!("{}：not allowed", failing.url)),
+        "{errors:?}"
+    );
+    assert!(
+        errors.contains(&format!("{}：404 Not Found", missing.url)),
+        "{errors:?}"
+    );
+    let refusals: Vec<&str> = errors
+        .iter()
+        .filter_map(|m| m.strip_prefix(&format!("{refused}：")))
+        .collect();
+    assert!(!refusals.is_empty(), "{errors:?}");
+    assert!(
+        refusals
+            .iter()
+            .all(|reason| !reason.is_empty() && !reason.contains(['"', '['])),
+        "{errors:?}"
+    );
+    assert!(
+        errors.iter().all(|m| [&failing.url, &missing.url, refused]
+            .iter()
+            .any(|url| m.starts_with(&format!("{url}：")))),
+        "{errors:?}"
+    );
+
+    drop(session);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 回环地址上的 HTTP tracker，在自己的线程上：每次通告都原样回 `reply`。释放时让线程停下并等它结束。
+struct LocalTracker {
+    /// 通告的地址
+    url: String,
+    address: SocketAddr,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LocalTracker {
+    fn start(reply: &'static [u8]) -> LocalTracker {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let thread = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stopping.load(Ordering::Relaxed) {
+                    return;
+                }
+                let mut stream = stream.unwrap();
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let read = stream.read(&mut buf).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    head.extend_from_slice(&buf[..read]);
+                }
+                stream.write_all(reply).unwrap();
+            }
+        });
+        LocalTracker {
+            url: format!("http://{address}/announce"),
+            address,
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for LocalTracker {
+    /// 置位后连一次，把线程从等连接里叫醒；测试已在 panic 时不再因线程出错 panic（同时两个 panic 会直接中止进程）。
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let woken = TcpStream::connect(self.address);
+        let joined = self.thread.take().expect("只在这里取走").join();
+        if !std::thread::panicking() {
+            woken.unwrap();
+            joined.unwrap();
+        }
+    }
+}
+
+/// 等到 `id` 的每个 tracker 都算连不上，返回期间报的 tracker 出错的说明。状态先于事件更新：都算连不上之后再取一次，
+/// 那时报的事件必已在队列里。
+fn tracker_errors_until_failed(session: &Session, id: &TorrentId) -> Vec<String> {
+    let mut errors = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let failed = session.trackers(id).unwrap().iter().all(|t| t.failed);
+        errors.extend(
+            session
+                .pop_alerts(100)
+                .unwrap()
+                .into_iter()
+                .filter(|alert| alert.kind == AlertKind::TrackerError)
+                .map(|alert| alert.message),
+        );
+        if failed {
+            return errors;
+        }
+        assert!(Instant::now() < deadline, "没等到每个 tracker 都算连不上");
+    }
+}
+
+/// 查 tracker 时 `url` 的说明。
+fn tracker_message(session: &Session, id: &TorrentId, url: &str) -> String {
+    session
+        .trackers(id)
+        .unwrap()
+        .into_iter()
+        .find(|t| t.url == url)
+        .unwrap()
+        .message
 }

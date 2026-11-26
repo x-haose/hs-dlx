@@ -7,7 +7,7 @@ use gpui_kit::{
     MouseButton, ParentElement as _, Pixels, Point, StatefulInteractiveElement as _, Styled,
     canvas, div, px,
 };
-use hs_dlx_app::Failure;
+use hs_dlx_app::{Failure, WebState};
 use hs_m3u8_core::{FileInfo, Probe, VariantInfo};
 
 use super::{NewTask, PageCheck, Probing, TorrentChoice, duration_of};
@@ -154,6 +154,20 @@ impl NewTask {
             Probing::Ready(probe) => self.rings_figure(probe, cx).into_any_element(),
             Probing::File(info) => file_dial(info).into_any_element(),
             Probing::Torrent(choice) => torrent_dial(choice).into_any_element(),
+            Probing::Web(choice) => super::web::web_dial(choice).into_any_element(),
+            Probing::Resolving => {
+                // 解不出 JavaScript 挑战时解析要等 yt-dlp 换上新版：写出在换到哪一步，免得看着像卡住
+                let line = match &*self.service.web_state().borrow() {
+                    WebState::Updating { progress, .. } => {
+                        format!("在换新的 yt-dlp：{}", format::web_install(progress))
+                    }
+                    _ => "yt-dlp 在解析网页".to_owned(),
+                };
+                self.probing_dial("解析中", line, cx).into_any_element()
+            }
+            Probing::NeedsWeb(_) => self
+                .probing_dial("网页视频", "要先装网页视频的组件".to_owned(), cx)
+                .into_any_element(),
             Probing::Failed(failure) if self.page_check != PageCheck::Opening => {
                 failed_dial(failure).into_any_element()
             }
@@ -307,7 +321,19 @@ impl NewTask {
             Probing::File(_) | Probing::Torrent(_) => {
                 return Some(ui::caption("回车开始").into_any_element());
             }
-            Probing::Running | Probing::Failed(_) | Probing::Metadata(_) => return None,
+            Probing::Web(choice) => {
+                let text = if choice.resolved.choices.len() > 1 {
+                    "↑ ↓ 换一档 · 回车开始"
+                } else {
+                    "回车开始"
+                };
+                return Some(ui::caption(text).into_any_element());
+            }
+            Probing::Running
+            | Probing::Failed(_)
+            | Probing::Metadata(_)
+            | Probing::Resolving
+            | Probing::NeedsWeb(_) => return None,
         };
         let text = if probe.master.as_ref().is_some_and(|m| m.variants.len() > 1) {
             "↑ ↓ 换一档 · 回车开始"
@@ -468,16 +494,16 @@ fn torrent_dial(choice: &TorrentChoice) -> Div {
     )
 }
 
-/// 探测失败的表盘：整圈暗的警告色，圆盘里写状态码或种类与这类失败多半是怎么回事（见 [`format::failure`]）。
+/// 探测失败的表盘：整圈暗的警告色，圆盘里写状态码或种类（见 [`format::failure`]）；怎么办写在检查面板里。
 fn failed_dial(failure: &Failure) -> Div {
-    let (mark, hint) = format::failure(failure.kind);
+    let (mark, _) = format::failure(failure.kind);
     let ticks = Ticks::full(ring::COMET_TICKS, theme::alpha(theme::warn(), 0.45), false);
     dial::dial(
         theme::warn(),
         dial::figure(move |bounds, window, _| {
             ring::paint_ticks(bounds, ring::RADIUS, &ticks, window)
         }),
-        dial::readout("探测失败", theme::warn(), dial::Big::Figure(mark), hint),
+        dial::readout("探测失败", theme::warn(), dial::Big::Figure(mark), ""),
     )
 }
 

@@ -4,6 +4,7 @@ members = [
     "apps/desktop",
     "crates/app",
     "crates/cloud",
+    "crates/ytdlp",
     "crates/instance",
     "crates/macos",
     "crates/relay",
@@ -13,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT"
@@ -26,8 +27,6 @@ unsafe_code = "forbid"
 axum = "0.8.9"
 # Basic 认证头的值：relay 给上游代理、粘贴的 curl 命令里的 -u
 base64 = "0.23.1"
-# 桌面界面的事件时刻按本地时区显示
-chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 dirs = "7.0.0"
 # 顶栏显示保存目录所在盘的可用空间
 fs4 = { version = "1.1.0", default-features = false }
@@ -36,9 +35,11 @@ gpui-kit = "=0.9.1"
 # Linux 上嵌网页用的 GTK 3 绑定，与 wry 0.57.2 用的同一版
 gtk = "0.18"
 # HLS 的探测、下载、直播录制与转封装（hs-m3u8 的核心库）；固定到 hs-m3u8 主干上的提交，升级时与下面的 ffmpeg-sys-next 一起改
-hs-m3u8-core = { git = "https://github.com/x-haose/hs-m3u8", rev = "639c95b1c6dd6714b577fde07937f339e57785e7" }
+hs-m3u8-core = { git = "https://github.com/x-haose/hs-m3u8", rev = "08046bb758128e20426db14ef8a884a2f9864697" }
 # 比较路径时统一 Unicode 写法（NFC）
 icu_normalizer = { version = "2.4.0", default-features = false, features = ["compiled_data"] }
+# 桌面界面的事件时刻按本地时区显示
+jiff = "1.0.0"
 # 应用更新时验安装包的 minisign 签名：没有外部依赖，能边读边验
 minisign-verify = "0.3.0"
 # 新建任务时把地址里的路径段解码成标题
@@ -48,16 +49,18 @@ psl = "2.1.253"
 # bundled：随应用编译 SQLite，不依赖系统里的版本
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 rustls = { version = "0.23.46", default-features = false, features = ["std"] }
+# 网页视频换上输出后中断：认出输出与任务目录里的源是不是同一个文件（硬链接），各平台一样
+same-file = "1.0.6"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.21"
 tokio = "1.54.1"
 tokio-rustls = "0.26.6"
 tokio-util = "0.7.20"
-url = "2.5.8"
+url = "2.5.9"
 # 嗅探页嵌网页；与嵌入层（源自 gpui-webview）一起精确锁定，升级时一起改
 wry = "=0.57.2"
 
 [patch.crates-io]
 # hs-m3u8 对 ffmpeg-sys-next 的本地修改（与上游的差异见那里的 PATCHED.md）：依赖方的 patch 不会传过来，这里照样打上
-ffmpeg-sys-next = { git = "https://github.com/x-haose/hs-m3u8", rev = "639c95b1c6dd6714b577fde07937f339e57785e7" }
+ffmpeg-sys-next = { git = "https://github.com/x-haose/hs-m3u8", rev = "08046bb758128e20426db14ef8a884a2f9864697" }

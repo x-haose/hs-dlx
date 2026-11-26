@@ -1,0 +1,709 @@
+//! 网页视频（yt-dlp 解析出的）的画质选项：每档清晰度挑一个视频、配一条音轨，另有只要音频的；每一路定下由谁下载。
+
+use hs_dlx_ytdlp::{Channel, Format, FormatKey, Info, Protocol, Size, Track};
+use hs_m3u8_core::Url;
+
+/// 视频的编码。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VideoCodec {
+    H264,
+    Hevc,
+    Vp9,
+    Av1,
+    /// 其余，yt-dlp 的写法
+    Other(String),
+    /// 网站没说
+    Unknown,
+}
+
+impl VideoCodec {
+    fn of(track: &Track) -> VideoCodec {
+        let Track::Codec(codec) = track else {
+            return VideoCodec::Unknown;
+        };
+        let lower = codec.to_ascii_lowercase();
+        if lower.starts_with("avc") || lower == "h264" {
+            VideoCodec::H264
+        } else if lower.starts_with("hev") || lower.starts_with("hvc") || lower == "h265" {
+            VideoCodec::Hevc
+        } else if lower.starts_with("vp09") || lower == "vp9" {
+            VideoCodec::Vp9
+        } else if lower.starts_with("av01") || lower == "av1" {
+            VideoCodec::Av1
+        } else {
+            VideoCodec::Other(codec.clone())
+        }
+    }
+}
+
+/// 音频的编码。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioCodec {
+    Aac,
+    Opus,
+    Mp3,
+    Ac3,
+    Eac3,
+    Flac,
+    Alac,
+    Vorbis,
+    Other(String),
+    Unknown,
+}
+
+impl AudioCodec {
+    fn of(track: &Track) -> AudioCodec {
+        let Track::Codec(codec) = track else {
+            return AudioCodec::Unknown;
+        };
+        let lower = codec.to_ascii_lowercase();
+        // mp4a.40.34 是 MP3 放进 MP4 的写法，先于别的 mp4a 判
+        if lower == "mp3" || lower == "mp4a.40.34" {
+            AudioCodec::Mp3
+        } else if lower.starts_with("mp4a") || lower == "aac" {
+            AudioCodec::Aac
+        } else if lower == "opus" {
+            AudioCodec::Opus
+        } else if lower == "ac-3" || lower == "ac3" {
+            AudioCodec::Ac3
+        } else if lower == "ec-3" || lower == "eac3" {
+            AudioCodec::Eac3
+        } else if lower == "flac" {
+            AudioCodec::Flac
+        } else if lower == "alac" {
+            AudioCodec::Alac
+        } else if lower == "vorbis" {
+            AudioCodec::Vorbis
+        } else {
+            AudioCodec::Other(codec.clone())
+        }
+    }
+}
+
+/// 一路由谁下载。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    /// 自己的引擎：http(s) 文件走分段下载，HLS 走 HLS 引擎
+    Own,
+    /// 交回 yt-dlp 自己下：要模拟浏览器 TLS 指纹的、可能有 DRM 的（yt-dlp 会试）、地址不是 http(s) 的（如解析器只给了
+    /// 播放列表内容时的 `data:` 地址）、HLS 要另给密钥或参数的（见 [`Format::hls_extras`]）、DASH 分片与其余 yt-dlp
+    /// 能下而我们没有引擎的协议
+    YtDlp,
+    /// 这一版下不了：原因
+    Unsupported(&'static str),
+}
+
+/// 格式 `format` 由谁下载（确定有 DRM 的格式 yt-dlp 已滤掉，不在这里）。
+pub fn route(format: &Format) -> Route {
+    if format.drm_maybe {
+        return Route::YtDlp;
+    }
+    match &format.protocol {
+        Protocol::Other(protocol) if protocol.starts_with("rtmp") => {
+            Route::Unsupported("RTMP 这一版还不支持")
+        }
+        _ if format.impersonate || !web_address(&format.url) => Route::YtDlp,
+        Protocol::Http => Route::Own,
+        Protocol::Hls if !format.hls_extras => Route::Own,
+        _ => Route::YtDlp,
+    }
+}
+
+/// `url` 是不是 http(s) 地址：自己的两个引擎只认这两种。
+fn web_address(url: &str) -> bool {
+    Url::parse(url).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+}
+
+/// 输出的容器：两路时合并成它，一路时转封装成它（交回 yt-dlp 下的 HLS 写出的是各分片接起来的）或保持原样。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Container {
+    Mp4,
+    /// MP4 放不下的编码（Vorbis 等）
+    Matroska,
+    /// 只有一路、不转封装：保持原来的格式（扩展名见 [`Choice::ext`]）
+    Original,
+}
+
+/// 一个画质选项。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Choice {
+    /// 视频的格式；只要音频时为 None
+    pub video: Option<FormatKey>,
+    /// 另配的音频的格式；视频本身带音频、或没有可配的音频时为 None
+    pub audio: Option<FormatKey>,
+    pub height: Option<u32>,
+    pub fps: Option<f64>,
+    pub video_codec: Option<VideoCodec>,
+    pub audio_codec: Option<AudioCodec>,
+    /// 各路大小之和；有一路不知道时为 None，有一路是估算的则整体是估算的
+    pub size: Option<Size>,
+    pub container: Container,
+    /// 输出的扩展名
+    pub ext: String,
+    /// HDR 等，SDR 为 None
+    pub dynamic_range: Option<String>,
+}
+
+/// 画质的取向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Preference {
+    /// 同一清晰度先选 H.264 + AAC、SDR：合出的 MP4 在各平台自带的播放器里都能放
+    Compatible,
+    /// 同一清晰度选码率最高的（多为 AV1 或 VP9 + Opus）
+    Quality,
+}
+
+/// `info` 的画质选项：每档清晰度一个（高的在前），最后是只要音频的（有可单独下的音频时）。没有能下的格式时为空。
+/// 要合并的（只有视频的格式配上另一条音轨）两路的编码都要是合并认得的（见 [`VideoCodec`]、[`AudioCodec`] 里有名字的），
+/// 认不出的不拿来合并：两路都下完了才会在合并时失败。
+pub fn choices(info: &Info, preference: Preference) -> Vec<Choice> {
+    let usable: Vec<&Format> = info
+        .formats
+        .iter()
+        .filter(|format| !matches!(route(format), Route::Unsupported(_)))
+        .collect();
+    let audio_only: Vec<&Format> = usable
+        .iter()
+        .copied()
+        .filter(|format| !format.video.maybe() && format.audio.maybe())
+        .collect();
+    let with_video: Vec<&Format> = usable
+        .iter()
+        .copied()
+        .filter(|format| {
+            format.video.maybe()
+                && (!matches!(format.audio, Track::Absent)
+                    || (mergeable(format)
+                        && !matches!(
+                            VideoCodec::of(&format.video),
+                            VideoCodec::Other(_) | VideoCodec::Unknown
+                        )))
+        })
+        .collect();
+    let pairable: Vec<&Format> = audio_only
+        .iter()
+        .copied()
+        .filter(|format| {
+            mergeable(format)
+                && !matches!(
+                    AudioCodec::of(&format.audio),
+                    AudioCodec::Other(_) | AudioCodec::Unknown
+                )
+        })
+        .collect();
+    let mut heights: Vec<Option<u32>> = with_video.iter().map(|format| format.height).collect();
+    heights.sort_unstable_by(|a, b| b.cmp(a));
+    heights.dedup();
+    let mut found = Vec::new();
+    for height in heights {
+        let best = with_video
+            .iter()
+            .copied()
+            .filter(|format| format.height == height)
+            .max_by(|a, b| video_rank(a, preference).total_cmp(&video_rank(b, preference)))
+            .expect("这一档至少有一个格式");
+        let codec = VideoCodec::of(&best.video);
+        // 视频本身就带音频（或没说）时不另配
+        let paired = if matches!(best.audio, Track::Absent) {
+            best_audio(&pairable, Some(&codec))
+        } else {
+            None
+        };
+        found.push(choice_of(best, paired));
+    }
+    if let Some(audio) = best_audio(&audio_only, None) {
+        found.push(choice_of(audio, None));
+    }
+    found
+}
+
+/// 解不出 JavaScript 挑战（[`Info::challenge_failed`]）、没有能下的格式时，换新的 yt-dlp 为什么没换成。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Freshness {
+    /// 在用的不比渠道上最新的旧（查过，或刚换上最新的仍解不出）；`.0` 为在用的构建出自哪个渠道（见
+    /// [`Channel::of`]），不是设置里的
+    Latest(Channel),
+    /// 渠道上最新的是用户换回时换下的（见 [`hs_dlx_ytdlp::Installed::skipped`]）：不自动装它
+    Skipped(String),
+    /// 查不了或没换成：原因
+    Unknown(String),
+}
+
+/// [`choices`] 为空时的原因：解不出 JavaScript 挑战时按换新的 yt-dlp 的结果 `freshness` 说怎么办；有的格式有 DRM 时说
+/// DRM；有这一版下不了的协议时列出；都不是时为 yt-dlp 给出的格式里没有视频也没有音频（如只有预览图）。解不出挑战与最后
+/// 一种带上 yt-dlp 的警告（网站不给的原因多写在里面，如要登录、要验证不是机器人）。
+pub fn no_choice_reason(info: &Info, freshness: Option<&Freshness>) -> String {
+    let warnings = |said: &str| {
+        if info.warnings.is_empty() {
+            said.to_owned()
+        } else {
+            format!("{said}。yt-dlp 的警告：{}", info.warnings.join("；"))
+        }
+    };
+    if info.challenge_failed {
+        let unsolved = "yt-dlp 解不出网站播放器的 JavaScript 挑战，拿不到视频地址";
+        return warnings(&match freshness {
+            Some(Freshness::Latest(Channel::Stable)) => format!(
+                "{unsolved}；在用的已是最新的稳定版 yt-dlp，多为网站刚换了播放器、yt-dlp 还没跟上：可在设置「网页视频」里换到每日构建（修复最先到那里），或过一阵再试"
+            ),
+            Some(Freshness::Latest(Channel::Nightly)) => format!(
+                "{unsolved}；在用的已是最新的每日构建，多为网站刚换了播放器、yt-dlp 还没跟上：过一阵再试（有新构建时会自动换上）"
+            ),
+            Some(Freshness::Skipped(version)) => format!(
+                "{unsolved}；有新版 {version}，它是之前换回时换下的，没有自动装：到设置「网页视频」里更新到它再试"
+            ),
+            Some(Freshness::Unknown(why)) => format!(
+                "{unsolved}；换新的 yt-dlp 没成（{why}）：到设置「网页视频」里查新版、更新后再试"
+            ),
+            None => format!("{unsolved}：到设置「网页视频」里查新版、更新后再试"),
+        });
+    }
+    if info.has_drm {
+        return "有的格式有 DRM，其余的协议不支持".to_owned();
+    }
+    let unsupported: std::collections::BTreeSet<&str> = info
+        .formats
+        .iter()
+        .filter_map(|format| match route(format) {
+            Route::Unsupported(reason) => Some(reason),
+            Route::Own | Route::YtDlp => None,
+        })
+        .collect();
+    if !unsupported.is_empty() {
+        return unsupported.into_iter().collect::<Vec<_>>().join("；");
+    }
+    warnings("yt-dlp 给出的格式里没有视频也没有音频（如只有预览图）")
+}
+
+/// 合并收不收 `format` 下到的文件：合并只收 MP4（含 M4A）、Matroska（含 WebM）、TS 与裸 AAC、MP3。HLS 与 DASH 下到的
+/// 是 MP4、TS 或分片接起来的 MP4、WebM；别的按扩展名。
+fn mergeable(format: &Format) -> bool {
+    match format.protocol {
+        Protocol::Hls | Protocol::Dash => true,
+        Protocol::Http | Protocol::Other(_) => format.ext.as_deref().is_some_and(|ext| {
+            [
+                "mp4", "m4a", "m4v", "mkv", "mka", "webm", "ts", "aac", "mp3",
+            ]
+            .iter()
+            .any(|known| ext.eq_ignore_ascii_case(known))
+        }),
+    }
+}
+
+/// 同一档清晰度里比较视频的分数：自己下的先于交回 yt-dlp 的；兼容优先时 H.264、SDR 在前；再比帧率与码率。
+fn video_rank(format: &Format, preference: Preference) -> f64 {
+    let own = if route(format) == Route::Own {
+        1e12
+    } else {
+        0.0
+    };
+    let compatible = match preference {
+        Preference::Compatible => {
+            let h264 = if VideoCodec::of(&format.video) == VideoCodec::H264 {
+                1e10
+            } else {
+                0.0
+            };
+            let sdr = if format
+                .dynamic_range
+                .as_deref()
+                .is_none_or(|range| range.eq_ignore_ascii_case("SDR"))
+            {
+                1e9
+            } else {
+                0.0
+            };
+            h264 + sdr
+        }
+        Preference::Quality => 0.0,
+    };
+    let fps = format.fps.unwrap_or(0.0).min(999.0) * 1e5;
+    own + compatible + fps + format.bitrate.unwrap_or(0.0).min(99_999.0)
+}
+
+/// 配给 `video` 编码的音频（`video` 为 None 时为只要音频的选项）：本来的语言在前；配 H.264、HEVC 或只要音频时 AAC 在前
+/// （MP4 与各平台的播放器都认），配 VP9、AV1 时 Opus 在前（同码率下音质好）；自己下的先于交回 yt-dlp 的；再比码率。
+fn best_audio<'a>(audio: &[&'a Format], video: Option<&VideoCodec>) -> Option<&'a Format> {
+    let wants_aac = !matches!(video, Some(VideoCodec::Vp9 | VideoCodec::Av1));
+    let rank = |format: &Format| {
+        let language = f64::from(format.language_preference.unwrap_or(-1).clamp(-100, 100)) * 1e13;
+        let own = if route(format) == Route::Own {
+            1e12
+        } else {
+            0.0
+        };
+        let codec = match AudioCodec::of(&format.audio) {
+            AudioCodec::Aac if wants_aac => 1e10,
+            AudioCodec::Opus if !wants_aac => 1e10,
+            _ => 0.0,
+        };
+        language + own + codec + format.bitrate.unwrap_or(0.0).min(99_999.0)
+    };
+    audio
+        .iter()
+        .copied()
+        .max_by(|a, b| rank(a).total_cmp(&rank(b)))
+}
+
+/// 由视频（或只要音频时的音频）`main` 与另配的音频 `audio` 组成的选项。
+fn choice_of(main: &Format, audio: Option<&Format>) -> Choice {
+    let has_video = main.video.maybe();
+    let video_codec = has_video.then(|| VideoCodec::of(&main.video));
+    let audio_codec = match audio {
+        Some(audio) => Some(AudioCodec::of(&audio.audio)),
+        None if main.audio.maybe() => Some(AudioCodec::of(&main.audio)),
+        None => None,
+    };
+    let size = match audio {
+        Some(audio) => main.size.zip(audio.size).map(|(a, b)| Size {
+            bytes: a.bytes + b.bytes,
+            exact: a.exact && b.exact,
+        }),
+        None => main.size,
+    };
+    let (container, ext) = match audio {
+        // 合并：MP4 放不下的编码出 MKV
+        Some(_) => {
+            let mp4 = !matches!(
+                (&video_codec, &audio_codec),
+                (Some(VideoCodec::Other(_) | VideoCodec::Unknown), _)
+                    | (
+                        _,
+                        Some(AudioCodec::Vorbis | AudioCodec::Other(_) | AudioCodec::Unknown)
+                    )
+            );
+            if mp4 {
+                (Container::Mp4, "mp4".to_owned())
+            } else {
+                (Container::Matroska, "mkv".to_owned())
+            }
+        }
+        // HLS 下完的内容随下载方式不同：自己的引擎写 MP4，交回 yt-dlp 的是各分片接起来的（多为 TS）；下载方式每次运行
+        // 按重新解析的结果定，建任务时定不下来，所以一律转封装成 MP4（yt-dlp 给 HLS 的扩展名可能是 `m3u8`）
+        None if main.protocol == Protocol::Hls => (Container::Mp4, "mp4".to_owned()),
+        None => (
+            Container::Original,
+            main.ext.clone().unwrap_or_else(|| "bin".to_owned()),
+        ),
+    };
+    Choice {
+        video: has_video.then(|| main.key()),
+        audio: match audio {
+            Some(audio) => Some(audio.key()),
+            None if !has_video => Some(main.key()),
+            None => None,
+        },
+        height: main.height,
+        fps: main.fps,
+        video_codec,
+        audio_codec,
+        size,
+        container,
+        ext,
+        dynamic_range: main
+            .dynamic_range
+            .clone()
+            .filter(|range| !range.eq_ignore_ascii_case("SDR")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hs_dlx_ytdlp::Live;
+
+    use super::*;
+
+    fn format(
+        id: &str,
+        video: Option<&str>,
+        audio: Option<&str>,
+        height: Option<u32>,
+        tbr: f64,
+    ) -> Format {
+        let track = |codec: Option<&str>| match codec {
+            Some("none") => Track::Absent,
+            Some(codec) => Track::Codec(codec.to_owned()),
+            None => Track::Unknown,
+        };
+        Format {
+            id: id.to_owned(),
+            url: format!("https://v.example/{id}"),
+            protocol: Protocol::Http,
+            ext: Some(if audio == Some("opus") { "webm" } else { "mp4" }.to_owned()),
+            video: track(video),
+            audio: track(audio),
+            width: None,
+            height,
+            fps: Some(30.0),
+            bitrate: Some(tbr),
+            size: Some(Size {
+                bytes: 1000,
+                exact: true,
+            }),
+            note: None,
+            language: None,
+            language_preference: None,
+            dynamic_range: None,
+            headers: Vec::new(),
+            cookie: None,
+            chunk_size: None,
+            available_at: None,
+            drm_maybe: false,
+            impersonate: false,
+            hls_extras: false,
+        }
+    }
+
+    fn info(formats: Vec<Format>) -> Info {
+        Info {
+            extractor: "Youtube".to_owned(),
+            id: "x".to_owned(),
+            title: "t".to_owned(),
+            page: None,
+            duration: Some(60.0),
+            thumbnail: None,
+            live: Live::No,
+            uploader: None,
+            formats,
+            has_drm: false,
+            entries: None,
+            warnings: Vec::new(),
+            challenge_failed: false,
+            site_cookies: Vec::new(),
+        }
+    }
+
+    /// 只有预览图（没有视频也没有音频）时说明这一点并带上 yt-dlp 的警告；解不出 JavaScript 挑战时叫人更新 yt-dlp；有 RTMP
+    /// 的说 RTMP；有 DRM 的说 DRM。
+    #[test]
+    fn the_reason_for_no_choice_names_what_was_missing() {
+        let mut storyboard = format("sb0", Some("none"), Some("none"), Some(45), 0.0);
+        storyboard.protocol = Protocol::Other("mhtml".to_owned());
+        storyboard.ext = Some("mhtml".to_owned());
+        let mut images = info(vec![storyboard]);
+        assert!(choices(&images, Preference::Compatible).is_empty());
+        assert_eq!(
+            no_choice_reason(&images, None),
+            "yt-dlp 给出的格式里没有视频也没有音频（如只有预览图）"
+        );
+        images.warnings = vec!["Only images are available for download".to_owned()];
+        assert_eq!(
+            no_choice_reason(&images, None),
+            "yt-dlp 给出的格式里没有视频也没有音频（如只有预览图）。yt-dlp 的警告：Only images are available for download"
+        );
+
+        let mut rtmp = format("r", Some("avc1"), Some("mp4a.40.2"), Some(720), 1.0);
+        rtmp.protocol = Protocol::Other("rtmp".to_owned());
+        let streamed = info(vec![rtmp]);
+        assert!(choices(&streamed, Preference::Compatible).is_empty());
+        assert_eq!(no_choice_reason(&streamed, None), "RTMP 这一版还不支持");
+
+        let mut unsolved = info(Vec::new());
+        unsolved.challenge_failed = true;
+        unsolved.warnings = vec!["n challenge solving failed".to_owned()];
+        let latest = no_choice_reason(&unsolved, Some(&Freshness::Latest(Channel::Stable)));
+        assert!(latest.contains("换到每日构建"), "{latest}");
+        let nightly = no_choice_reason(&unsolved, Some(&Freshness::Latest(Channel::Nightly)));
+        assert!(!nightly.contains("换到每日构建"), "{nightly}");
+        assert!(
+            latest.ends_with("yt-dlp 的警告：n challenge solving failed"),
+            "{latest}"
+        );
+        let skipped = no_choice_reason(
+            &unsolved,
+            Some(&Freshness::Skipped("2026.11.23".to_owned())),
+        );
+        assert!(skipped.contains("有新版 2026.11.23"), "{skipped}");
+        let unknown = no_choice_reason(
+            &unsolved,
+            Some(&Freshness::Unknown("连不上 PyPI".to_owned())),
+        );
+        assert!(unknown.contains("（连不上 PyPI）"), "{unknown}");
+
+        let mut locked = info(Vec::new());
+        locked.has_drm = true;
+        assert_eq!(
+            no_choice_reason(&locked, None),
+            "有的格式有 DRM，其余的协议不支持"
+        );
+    }
+
+    /// YouTube 式的格式：1080p 有 H.264 与码率更高的 VP9、AV1，音频有 AAC 与 Opus。
+    fn youtube() -> Vec<Format> {
+        vec![
+            format("140", Some("none"), Some("mp4a.40.2"), None, 129.0),
+            format("251", Some("none"), Some("opus"), None, 135.0),
+            format("137", Some("avc1.640028"), Some("none"), Some(1080), 4000.0),
+            format(
+                "248",
+                Some("vp09.00.40.08"),
+                Some("none"),
+                Some(1080),
+                5000.0,
+            ),
+            format(
+                "399",
+                Some("av01.0.08M.08"),
+                Some("none"),
+                Some(1080),
+                4500.0,
+            ),
+            format("136", Some("avc1.4d401f"), Some("none"), Some(720), 2000.0),
+            format(
+                "18",
+                Some("avc1.42001E"),
+                Some("mp4a.40.2"),
+                Some(360),
+                500.0,
+            ),
+        ]
+    }
+
+    /// 选项的清晰度、视频与音频的格式编号、容器。
+    type Summary<'a> = (Option<u32>, Option<&'a str>, Option<&'a str>, Container);
+
+    #[test]
+    fn compatible_choices_pair_h264_with_aac_into_mp4() {
+        let found = choices(&info(youtube()), Preference::Compatible);
+        let summary: Vec<Summary<'_>> = found
+            .iter()
+            .map(|c| {
+                (
+                    c.height,
+                    c.video.as_ref().map(|key| key.id.as_str()),
+                    c.audio.as_ref().map(|key| key.id.as_str()),
+                    c.container,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (Some(1080), Some("137"), Some("140"), Container::Mp4),
+                (Some(720), Some("136"), Some("140"), Container::Mp4),
+                // 自带音频的不另配
+                (Some(360), Some("18"), None, Container::Original),
+                // 只要音频：AAC
+                (None, None, Some("140"), Container::Original),
+            ]
+        );
+        assert_eq!(
+            found[0].size,
+            Some(Size {
+                bytes: 2000,
+                exact: true
+            })
+        );
+    }
+
+    #[test]
+    fn quality_choices_take_the_highest_bitrate_and_pair_opus() {
+        let found = choices(&info(youtube()), Preference::Quality);
+        assert_eq!(
+            found[0].video.as_ref().map(|key| key.id.as_str()),
+            Some("248")
+        );
+        assert_eq!(found[0].video_codec, Some(VideoCodec::Vp9));
+        assert_eq!(
+            found[0].audio.as_ref().map(|key| key.id.as_str()),
+            Some("251")
+        );
+        assert_eq!(found[0].container, Container::Mp4);
+        assert_eq!(found[0].ext, "mp4");
+    }
+
+    #[test]
+    fn the_original_language_wins_over_a_dub() {
+        let mut formats = youtube();
+        // 配音的 AAC 码率更高，原声的 AAC 标着本来的语言
+        let mut dub = format("140-dub", Some("none"), Some("mp4a.40.2"), None, 192.0);
+        dub.language_preference = Some(-10);
+        formats.push(dub);
+        formats[0].language_preference = Some(10);
+        let found = choices(&info(formats), Preference::Compatible);
+        assert_eq!(
+            found[0].audio.as_ref().map(|key| key.id.as_str()),
+            Some("140")
+        );
+    }
+
+    #[test]
+    fn routes_follow_protocol_possible_drm_impersonation_and_hls_extras() {
+        let mut own = format("a", Some("avc1"), Some("none"), Some(720), 1.0);
+        assert_eq!(route(&own), Route::Own);
+        own.protocol = Protocol::Hls;
+        assert_eq!(route(&own), Route::Own);
+        // 单路 HLS 不管谁下都转封装：下载方式每次运行重新定
+        assert_eq!(
+            choices(&info(vec![own.clone()]), Preference::Compatible)[0].container,
+            Container::Mp4
+        );
+        own.impersonate = true;
+        assert_eq!(route(&own), Route::YtDlp);
+        own.impersonate = false;
+        own.hls_extras = true;
+        assert_eq!(route(&own), Route::YtDlp);
+        own.hls_extras = false;
+        own.url = "data:application/x-mpegurl;base64,I0VYVE0zVQ==".to_owned();
+        assert_eq!(route(&own), Route::YtDlp);
+        own.url = "https://e.test/v".to_owned();
+        own.protocol = Protocol::Dash;
+        assert_eq!(route(&own), Route::YtDlp);
+        own.protocol = Protocol::Other("rtmp".to_owned());
+        assert!(matches!(route(&own), Route::Unsupported(_)));
+        // 只有下不了的格式时没有选项
+        assert_eq!(
+            choices(&info(vec![own.clone()]), Preference::Compatible),
+            []
+        );
+        own.protocol = Protocol::Http;
+        own.drm_maybe = true;
+        assert_eq!(route(&own), Route::YtDlp);
+    }
+
+    #[test]
+    fn mp3_in_mp4_is_mp3_and_unknown_codecs_are_not_merged() {
+        assert_eq!(
+            AudioCodec::of(&Track::Codec("mp4a.40.34".into())),
+            AudioCodec::Mp3
+        );
+        assert_eq!(
+            AudioCodec::of(&Track::Codec("mp4a.40.2".into())),
+            AudioCodec::Aac
+        );
+        // 只有视频、编码认不出的不出选项；认不出的音频不拿去配（只要音频的照样给）
+        let odd_video = format("vp8", Some("vp8"), Some("none"), Some(720), 1.0);
+        let h264 = format("avc", Some("avc1"), Some("none"), Some(480), 1.0);
+        let odd_audio = format("dts", Some("none"), Some("dtsc"), None, 9.0);
+        let found = choices(&info(vec![odd_video, h264, odd_audio]), Preference::Quality);
+        let summary: Vec<_> = found
+            .iter()
+            .map(|c| {
+                (
+                    c.height,
+                    c.video.as_ref().map(|key| key.id.as_str()),
+                    c.audio.as_ref().map(|key| key.id.as_str()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [(Some(480), Some("avc"), None), (None, None, Some("dts"))]
+        );
+    }
+
+    #[test]
+    fn a_vorbis_pairing_goes_into_matroska_and_own_routes_win() {
+        let mut slow = format("dash", Some("avc1"), Some("none"), Some(480), 9000.0);
+        slow.protocol = Protocol::Dash;
+        let fast = format("http", Some("avc1"), Some("none"), Some(480), 100.0);
+        let vorbis = format("v", Some("none"), Some("vorbis"), None, 128.0);
+        let found = choices(&info(vec![slow, fast, vorbis]), Preference::Quality);
+        assert_eq!(
+            found[0].video.as_ref().map(|key| key.id.as_str()),
+            Some("http")
+        );
+        assert_eq!(found[0].container, Container::Matroska);
+        assert_eq!(found[0].ext, "mkv");
+    }
+}

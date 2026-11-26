@@ -11,12 +11,17 @@ publish = false
 [dependencies]
 base64.workspace = true
 hs-dlx-cloud = { path = "../cloud" }
+# 网页视频：yt-dlp 的组件安装与解析
+hs-dlx-ytdlp = { path = "../ytdlp" }
 hs-dlx-torrent = { path = "../torrent" }
 hs-m3u8-core.workspace = true
 icu_normalizer.workspace = true
 minisign-verify.workspace = true
 percent-encoding.workspace = true
+# 网页视频带的 Cookie 发往网页所在的可注册域名
+psl.workspace = true
 rusqlite.workspace = true
+same-file.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

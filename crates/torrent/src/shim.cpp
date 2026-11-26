@@ -9,6 +9,7 @@
 #include <libtorrent/add_torrent_params.hpp>
 #include <libtorrent/alert_types.hpp>
 #include <libtorrent/create_torrent.hpp>
+#include <libtorrent/error_code.hpp>
 #include <libtorrent/fingerprint.hpp>
 #include <libtorrent/hex.hpp>
 #include <libtorrent/load_torrent.hpp>
@@ -33,6 +34,31 @@ rust::String text_of(std::string const& text) { return rust::String::lossy(text)
 // 加入时定下的编号：有 v1 信息哈希时为它，否则为截到 20 字节的 v2 的，都写成十六进制
 std::string canonical(lt::info_hash_t const& hashes) {
 	return lt::aux::to_hex(hashes.has_v1() ? hashes.v1 : hashes.get(lt::protocol_version::V2));
+}
+
+// 本机每个监听地址都路由不到 tracker 时的说明
+char const* const UNROUTABLE = "本机的网络地址都连不到它：本机没联网，或它只有另一种 IP 版本的地址（如只有 IPv6，而本机只连着 IPv4）";
+
+bool skipped(lt::announce_infohash const& ih) { return ih.last_error == lt::errors::announce_skipped; }
+
+// `entry` 在每个监听地址上都被跳过（路由不到），没有一次成功
+bool skipped_everywhere(lt::announce_entry const& entry) {
+	return !entry.endpoints.empty()
+		&& std::all_of(entry.endpoints.begin(), entry.endpoints.end(), [](lt::announce_endpoint const& endpoint) {
+			return std::none_of(endpoint.info_hashes.begin(), endpoint.info_hashes.end(),
+					   [](lt::announce_infohash const& ih) { return ih.start_sent && ih.fails == 0; })
+				&& std::any_of(endpoint.info_hashes.begin(), endpoint.info_hashes.end(), skipped);
+		});
+}
+
+// `handle` 的 tracker；种子已移除完（它的事件还在队列里）时为空
+std::vector<lt::announce_entry> trackers_of(lt::torrent_handle const& handle) {
+	try {
+		return handle.trackers();
+	} catch (lt::system_error const& error) {
+		if (error.code() == lt::errors::invalid_torrent_handle) return {};
+		throw;
+	}
 }
 
 // `id` 是 `hashes` 里 v1 或（截短的）v2 信息哈希的十六进制串
@@ -376,9 +402,11 @@ rust::Vec<TrackerState> Session::trackers(rust::Str id) const {
 		state.updating = false;
 		state.seeds = -1;
 		state.leechers = -1;
-		// 各监听地址（IPv4、IPv6）各通告一次，每次 v1 与 v2 各一：有一次成功就算正常；每个地址都失败过才算连不上（只有
-		// IPv4 的机器上 IPv6 的那次立即失败，IPv4 的还在等）；人数取最多的，说明取第一条
+		// 各监听地址（IPv4、IPv6、回环）各通告一次，每次 v1 与 v2 各一：有一次成功就算正常；每个地址都失败过才算连不上
+		// （路由不到 tracker 的地址立即以跳过失败，别的还在等）；人数取最多的。说明取第一条不是跳过的（回环地址对任何
+		// 外面的 tracker 都跳过，它的说明会盖住真正的原因），每个地址都被跳过时为 UNROUTABLE
 		bool every_endpoint_failed = !entry.endpoints.empty();
+		std::string message;
 		for (lt::announce_endpoint const& endpoint : entry.endpoints) {
 			bool endpoint_failed = false;
 			for (lt::announce_infohash const& ih : endpoint.info_hashes) {
@@ -387,14 +415,14 @@ rust::Vec<TrackerState> Session::trackers(rust::Str id) const {
 				if (ih.updating) state.updating = true;
 				state.seeds = std::max(state.seeds, ih.scrape_complete);
 				state.leechers = std::max(state.leechers, ih.scrape_incomplete);
-				if (state.message.empty()) {
-					std::string const message = !ih.message.empty() ? ih.message
-						: ih.last_error ? ih.last_error.message() : std::string();
-					state.message = text_of(message);
-				}
+				std::string const said = !ih.message.empty() ? ih.message
+					: ih.last_error ? ih.last_error.message() : std::string();
+				if (message.empty() && !skipped(ih)) message = said;
 			}
 			if (!endpoint_failed) every_endpoint_failed = false;
 		}
+		state.unroutable = message.empty() && skipped_everywhere(entry);
+		state.message = text_of(state.unroutable ? std::string(UNROUTABLE) : message);
 		state.failed = !state.working && every_endpoint_failed;
 		out.push_back(std::move(state));
 	}
@@ -529,9 +557,25 @@ rust::Vec<Alert> Session::pop_alerts(std::uint32_t wait_ms) const {
 			out.push_back(alert_of(AlertKind::DeleteFailed, *a, id));
 			removed(id, true);
 		} else if (auto* t = lt::alert_cast<lt::tracker_error_alert>(a)) {
+			// 跳过（announce_skipped）：这个监听地址路由不到 tracker（回环地址、只有 IPv4 的网络上的 IPv6 地址；HTTP 的
+			// 在取网卡、UDP 的在解析时），别的地址照常通告，不算出错；每个地址都被跳过才报，说明为 UNROUTABLE。会话暂停、关闭时
+			// 撤下的通告（bittorrent）也以跳过结束，不报
+			bool const skip = t->error == lt::errors::announce_skipped;
+			if (skip) {
+				bool const unroutable = t->op == lt::operation_t::get_interface || t->op == lt::operation_t::hostname_lookup;
+				std::vector<lt::announce_entry> const trackers = unroutable ? trackers_of(t->handle) : std::vector<lt::announce_entry>();
+				std::string const url = t->tracker_url();
+				bool const everywhere = std::any_of(trackers.begin(), trackers.end(),
+					[&](lt::announce_entry const& entry) { return entry.url == url && skipped_everywhere(entry); });
+				if (!everywhere) continue;
+			}
 			std::string const id = id_of(t->handle);
 			bool const added = added_tracker(id, t->tracker_url());
-			out.push_back(alert_of(added ? AlertKind::AddedTrackerError : AlertKind::TrackerError, *a, id));
+			Alert alert = alert_of(added ? AlertKind::AddedTrackerError : AlertKind::TrackerError, *a, id);
+			// tracker 回了 failure reason 时为它，别的（连不上、HTTP 状态不是 200 等）为错误说明
+			std::string const said = t->error == lt::errors::tracker_failure ? std::string(t->failure_reason()) : t->error.message();
+			alert.message = text_of(std::string(t->tracker_url()) + "：" + (skip ? std::string(UNROUTABLE) : said));
+			out.push_back(std::move(alert));
 		} else if (lt::alert_cast<lt::alerts_dropped_alert>(a)) {
 			mark_lost();
 			out.push_back(alert_of(AlertKind::AlertsDropped, *a, std::string()));

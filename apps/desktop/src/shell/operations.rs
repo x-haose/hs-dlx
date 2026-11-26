@@ -35,6 +35,15 @@ impl Shell {
         }
     }
 
+    pub(super) fn switch_to_matroska(&mut self, id: TaskId, cx: &mut Context<Self>) {
+        if self
+            .tasks
+            .update(cx, |tasks, cx| tasks.switch_to_matroska(id, cx))
+        {
+            self.editing_headers = None;
+        }
+    }
+
     /// 放弃任务：要删已下载内容的，第一次点只是要求确认。
     pub(super) fn discard(&mut self, id: TaskId, confirmed: bool, cx: &mut Context<Self>) {
         if !confirmed {

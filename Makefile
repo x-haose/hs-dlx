@@ -1,4 +1,4 @@
-.PHONY: check ffmpeg ffmpeg_present libtorrent libtorrent_present icons licenses package \
+.PHONY: acceptance check ffmpeg ffmpeg_present libtorrent libtorrent_present icons licenses package \
 	rs_check rs_fmt rs_lint rs_clippy rs_doc rs_test rs_cov py_env py_check py_test
 
 FFMPEG_DIST := third_party/ffmpeg/dist
@@ -46,34 +46,45 @@ icons: py_env
 # 桌面应用的安装包（配置见 apps/desktop/Cargo.toml 的 package.metadata.packager），放在 target/release。各平台的
 # 格式与 .github/workflows/desktop.yml 的矩阵一致：Linux 只打 deb，不打 AppImage（它带上打包机器的 WebKitGTK，在别的
 # 发行版上网页起不来）。cargo-packager 在哪个平台上都能打 .app 与 NSIS，所以格式要按平台指定
+# macOS 上设了 HS_DLX_SIGN_IDENTITY（签名身份）时签名、按 HS_DLX_NOTARY_PROFILE（notarytool 存进钥匙串的凭据名）公证
+# 并钉上票据，见 scripts/macos_sign.py：.app 在打 dmg 之前（packager 的 before-each-package-command），dmg 在打完之后
 ifeq ($(OS),Windows_NT)
 PACKAGE_FORMATS := nsis
 else ifeq ($(shell uname -s),Darwin)
 PACKAGE_FORMATS := app,dmg
+PACKAGE_SIGN := uv run --no-project --python 3.12 python -I scripts/macos_sign.py dmg target/release
 else
 PACKAGE_FORMATS := deb
 endif
-package: ffmpeg_present libtorrent_present
+package: ffmpeg_present libtorrent_present runtime_present
 	@cargo packager --version >/dev/null 2>&1 || { echo "缺少 cargo-packager，版本见 .github/workflows/desktop.yml"; exit 1; }
 	cd apps/desktop && cargo packager --release --formats $(PACKAGE_FORMATS)
+	$(PACKAGE_SIGN)
 
-rs_clippy: ffmpeg_present libtorrent_present
+rs_clippy: ffmpeg_present libtorrent_present runtime_present
 	cargo clippy --workspace --all-targets -- -D warnings
 
 # 文档注释里的链接须都能解析（含私有项）：改名、删除后留下的断链在这里失败
-rs_doc: ffmpeg_present libtorrent_present
+rs_doc: ffmpeg_present libtorrent_present runtime_present
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
 
-rs_test: ffmpeg_present libtorrent_present
+rs_test: ffmpeg_present libtorrent_present runtime_present
 	cargo test --workspace
 
-# 任务存储与生命周期（app）、网盘的登录与接口（cloud）的行覆盖各不低于 80%
-rs_cov: ffmpeg_present libtorrent_present
+# 发版前的验收（crates/app/tests/acceptance.rs）：对真实网站、PyPI、BT 网络与 PikPak 跑，要联网；只填端口的代理一项要
+# 环境变量 HS_DLX_ACCEPT_PROXY_PORT（本机代理的端口），PikPak 一项要在浏览器里确认登录。逐个串行跑、打出过程；
+# ONLY 为测试名里的一段时只跑匹配的（如 make acceptance ONLY=youtube）
+acceptance: ffmpeg_present libtorrent_present runtime_present
+	cargo test -p hs-dlx-app --test acceptance -- --ignored --test-threads=1 --nocapture $(ONLY)
+
+# 任务存储与生命周期（app）、网盘的登录与接口（cloud）、yt-dlp 组件的核对安装与解析（ytdlp）的行覆盖各不低于 80%
+rs_cov: ffmpeg_present libtorrent_present runtime_present
 	@cargo llvm-cov --version >/dev/null 2>&1 || { echo "缺少 cargo-llvm-cov，版本见 .github/workflows/check.yml"; exit 1; }
 	# 源码改动后旧的插桩产物会混进统计，先清掉
 	cargo llvm-cov clean --workspace
 	cargo llvm-cov -p hs-dlx-app --fail-under-lines 80 --summary-only
 	cargo llvm-cov -p hs-dlx-cloud --fail-under-lines 80 --summary-only
+	cargo llvm-cov -p hs-dlx-ytdlp --fail-under-lines 80 --summary-only
 
 # FFmpeg 用 hs-m3u8（Cargo.lock 固定的提交）的构建脚本编译，组件与核心库出自同一个提交；源码包与编译的中间文件放在
 # third_party/ffmpeg/build。打印脚本路径的命令：
@@ -102,13 +113,25 @@ libtorrent_present:
 libtorrent:
 	bash $(LIBTORRENT_SCRIPT)
 
+# 随应用带的 Python 与 QuickJS-NG（网页视频用），由 scripts/runtime.py 下载、核对、裁剪、压缩，桌面应用编进程序；备好
+# 的须是当前那份脚本备的（标记文件是脚本的副本）：换了版本或裁剪而本地没重新备时在这里失败
+RUNTIME_DIST := third_party/runtime/dist
+RUNTIME_SCRIPT := scripts/runtime.py
+
+# 不是发布的平台（没有随带的运行时）时算备好了
+runtime_present: py_env
+	@uv run --no-sync python -I $(RUNTIME_SCRIPT) --present
+
+runtime: py_env
+	uv run --no-sync python -I $(RUNTIME_SCRIPT)
+
 py_env:
 	uv sync --locked
 
 # 仓库里 Python 脚本的格式、检查与类型检查
 py_check: py_env
-	uv run --no-sync ruff format --check scripts tests
-	uv run --no-sync ruff check scripts tests
+	uv run --no-sync ruff format --check scripts tests crates/ytdlp/src
+	uv run --no-sync ruff check scripts tests crates/ytdlp/src
 	uv run --no-sync mypy
 	uv run --no-sync basedpyright
 

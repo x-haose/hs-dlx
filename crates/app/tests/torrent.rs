@@ -129,6 +129,13 @@ fn service_with(
         NonZeroUsize::new(8).unwrap(),
         TorrentNetwork::Loopback { public_trackers },
         hs_dlx_app::pikpak::Endpoints::official(),
+        // 网页视频不在这里测：不给组件
+        hs_dlx_app::WebConfig {
+            root: std::env::temp_dir().join("hs-dlx-no-web"),
+            bundle: None,
+            sources: hs_dlx_app::ytdlp::Sources::official(),
+            update_every: None,
+        },
     )
     .unwrap()
 }
@@ -253,7 +260,12 @@ fn a_magnet_link_downloads_the_chosen_file() {
         matches!(again, Err(Error::TorrentTaken(at)) if at == task.id),
         "{again:?}"
     );
-    service.forget(task.id).unwrap();
+    // 再取同一个磁力链接的种子信息：说出占着它的任务，不加进会话
+    assert!(matches!(
+        service.fetch_metadata(uri.clone()),
+        Err(Error::TorrentTaken(at)) if at == task.id
+    ));
+    rt.block_on(service.forget(task.id)).unwrap().unwrap();
 
     service.close().unwrap();
     // 关闭后不再建 BT 会话
@@ -402,7 +414,8 @@ fn torrent_drafts_are_checked() {
         );
     }
     assert!(matches!(
-        hs_dlx_app::torrent_from_file(b"not bencode"),
+        rt.block_on(service.open_torrent_file(b"not bencode".to_vec()))
+            .unwrap(),
         Err(Error::InvalidInput(_))
     ));
     assert!(service.tasks().unwrap().is_empty());
@@ -478,8 +491,8 @@ async fn seeding(events: &mut mpsc::UnboundedReceiver<Event>, id: TaskId) -> Tor
     .await
 }
 
-/// 照默认的设置下完接着做种，做种时不能从列表移除；重开应用接着做；设置改成下完不做种即停；手动停止与再做种；文件
-/// 不全时停下、不补下。
+/// 照默认的设置下完接着做种；重开应用接着做；设置改成下完不做种即停；手动停止与再做种；文件不全时停下、不补下；做种
+/// 时从列表移除，先停止做种、停下后删掉记录。
 #[test]
 fn a_finished_task_seeds_until_stopped_or_the_setting_says_so() {
     let dir = test_dir("seeding");
@@ -502,7 +515,6 @@ fn a_finished_task_seeds_until_stopped_or_the_setting_says_so() {
     let progress = rt.block_on(seeding(&mut events, task.id));
     assert_eq!(progress.done, u64::from(A + B));
     assert!(service.task(task.id).unwrap().seeding);
-    assert!(matches!(service.forget(task.id), Err(Error::Seeding(_))));
     // 别的 BT 任务没在做种，不能停
     service.stop_seeding(TaskId(task.id.0 + 100)).unwrap();
 
@@ -554,12 +566,14 @@ fn a_finished_task_seeds_until_stopped_or_the_setting_says_so() {
     std::fs::copy(dir.join("seed").join("album").join("b.bin"), &b).unwrap();
     service.seed(task.id).unwrap();
     rt.block_on(seeding(&mut events, task.id));
-    service.stop_seeding(task.id).unwrap();
+    let forgetting = service.forget(task.id);
     assert_eq!(
         rt.block_on(seeding_ended(&mut events, task.id)),
         SeedEnd::Stopped
     );
-    service.forget(task.id).unwrap();
+    rt.block_on(forgetting).unwrap().unwrap();
+    assert!(matches!(service.task(task.id), Err(Error::NotFound(_))));
+    assert!(b.exists(), "移除删了下好的文件");
     drop(service);
     drop(seeder);
 }
@@ -602,7 +616,7 @@ fn the_part_file_stays_for_seeding_until_the_task_is_forgotten() {
         SeedEnd::Stopped
     );
     assert!(part.exists());
-    service.forget(task.id).unwrap();
+    rt.block_on(service.forget(task.id)).unwrap().unwrap();
     // .parts 在后台删：关闭时等后台的收尾做完
     service.close().unwrap();
     assert!(!part.exists(), "从列表移除时删掉 .parts");
@@ -612,6 +626,34 @@ fn the_part_file_stays_for_seeding_until_the_task_is_forgotten() {
     );
     drop(service);
     drop(seeder);
+}
+
+/// 还没连上过节点时 tracker 报错照常报出，为「tracker 的地址：原因」：磁力链接只带一个连不上的 tracker、不给节点，取
+/// 种子信息时报它连不上。
+#[test]
+fn a_tracker_error_is_shown_while_no_peer_has_connected() {
+    // 本机这个端口没人监听：通告随即被拒
+    let refused = "http://127.0.0.1:9/announce";
+    let rt = runtime();
+    let (service, _events) = service(&test_dir("tracker-error").join("tasks.sqlite"));
+    // 系统代理可能不放过回环地址
+    service.set_proxy(&Proxy::Direct).unwrap();
+    let uri = format!("magnet:?xt=urn:btih:5123456789abcdef0123456789abcdef01234567&tr={refused}");
+    let mut fetch = service.fetch_metadata(uri).unwrap();
+    let shown = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Some(error) = fetch.progress.borrow_and_update().tracker_error.clone() {
+                    return error;
+                }
+                fetch.progress.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("20 秒内没报 tracker 出错")
+    });
+    assert!(shown.starts_with(&format!("{refused}：")), "{shown}");
+    assert_eq!(fetch.progress.borrow().peers, 0);
 }
 
 /// 测试的 tracker：在回环地址上的 HTTP 服务，`/list` 为只有它自己的公共 tracker 列表，`/announce` 回一个节点（建时
@@ -773,8 +815,10 @@ fn public_trackers_go_to_bare_magnet_links_and_never_to_private_torrents() {
         },
     );
     own.point_to(&private_seeder);
-    let resume = hs_dlx_app::torrent_from_file(&torrent).unwrap();
-    let info = TorrentInfo::of(&resume).unwrap();
+    let (resume, info) = rt
+        .block_on(service.open_torrent_file(torrent.clone()))
+        .unwrap()
+        .unwrap();
     assert!(info.private);
     let all = info.files.iter().map(|file| file.index).collect();
     let file = dir.join("private.torrent");
@@ -794,6 +838,11 @@ fn public_trackers_go_to_bare_magnet_links_and_never_to_private_torrents() {
         !public.announced(&private_id),
         "私有种子的信息哈希通告给了公共 tracker"
     );
+    // 再打开同一个种子文件：读出时即说出占着它的任务
+    assert!(matches!(
+        rt.block_on(service.open_torrent_file(torrent)).unwrap(),
+        Err(Error::TorrentTaken(at)) if at == task.id
+    ));
     drop(service);
     drop(seeder);
     drop(private_seeder);

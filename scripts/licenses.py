@@ -1,8 +1,12 @@
 """生成随桌面应用的安装包分发的声明（apps/desktop/LICENSES，打包时放进安装包）；`--check` 时只核对是否最新。
 
 声明有 NOTICE.txt、THIRD-PARTY-RUST.txt 与随带的许可证全文的副本（本项目、FFmpeg、libtorrent、OpenSSL、Boost、字体、
-gpui-webview）。libtorrent、OpenSSL、Boost 的许可证原文取自 third_party/libtorrent/build.sh 下载核对过的源码包，存在
-third_party/libtorrent/licenses/（升级它们时一并换），NOTICE.txt 里的版本取自 build.sh。
+gpui-webview、随带的 Python 与 QuickJS-NG 和它们链入的库）。libtorrent、OpenSSL、Boost 的许可证原文取自
+third_party/libtorrent/build.sh 下载核对过的源码包，存在 third_party/libtorrent/licenses/（升级它们时一并换），
+NOTICE.txt 里的版本取自 build.sh。随带的 Python 与 QuickJS-NG 和它们链入的库的许可证原文存在
+third_party/runtime/licenses/（Python 的取自 python-build-standalone 完整包的 python/licenses；QuickJS-NG 的取自它的
+仓库，它的发布构建静态链入的 mimalloc、musl（Linux 版）、mingw-w64 运行时（Windows 版）的取自各自的仓库；换版本时按
+发布流程与可执行文件里的字符串一并核对），版本取自 scripts/runtime.py。
 
 THIRD-PARTY-RUST.txt 收录桌面应用（hs-dlx）在各发布平台（deny.toml 的 `[graph] targets`）上依赖的 Rust crate：
 按 `cargo tree` 解析特性后的正常依赖，过程宏与工作区成员不算。各 crate 根目录里的许可证文件原样收录，内容相同的只收
@@ -23,6 +27,7 @@ from pathlib import Path
 from typing import NamedTuple, NoReturn
 
 from hs_m3u8 import FfmpegScript, cargo, ffmpeg_script
+from runtime import PYTHON_RELEASE, PYTHON_VERSION, QUICKJS_VERSION
 
 ROOT = Path(__file__).resolve().parent.parent
 SUPPLIED = ROOT / "third_party/crate-licenses"
@@ -430,7 +435,73 @@ hs-dlx 桌面应用静态链接或随带了以下软件：
 
 7. Boost {bt["BOOST"]}（https://www.boost.org），按 Boost Software License 1.0 授权，全文见 Boost-LICENSE_1_0.txt；
    libtorrent 用到它的头文件，未作修改。
+
+8. Python {PYTHON_VERSION}（CPython，https://www.python.org，© Python Software Foundation），按 Python Software
+   Foundation License Version 2 授权；取自 python-build-standalone {PYTHON_RELEASE}
+   （https://github.com/astral-sh/python-build-standalone），去掉了 Tcl/Tk、头文件、测试、idle 等不用的部分，其余未作
+   修改，网页视频用它运行 yt-dlp。它链入的 bzip2、OpenSSL、expat、libffi、liblzma（xz）、mpdecimal、SQLite、
+   libuuid、zlib、zlib-ng（Linux 版另有 libedit、ncurses）的许可证全文与 CPython 的一起见 Python-LICENSES.txt；附带的
+   pip 按 MIT 授权，许可证随它在包里。
+
+9. QuickJS-NG {QUICKJS_VERSION}（https://github.com/quickjs-ng/quickjs，© Fabrice Bellard、Charlie Gordon、
+   Ben Noordhuis 等），按 MIT 许可证授权；随带的可执行文件取自它的发布，未作修改，yt-dlp 用它解 YouTube 的
+   JavaScript 挑战。它静态链入的 mimalloc（MIT）、musl（Linux 版，MIT）、mingw-w64 运行时（Windows 版）的许可证全文与
+   QuickJS-NG 的一起见 QuickJS-NG-LICENSES.txt。
 """
+
+
+RUNTIME_LICENSES = ROOT / "third_party/runtime/licenses"
+# 随带的 Python 静态链入或随带的库（裁掉 Tcl/Tk 与 _dbm 之后，按 python-build-standalone 三个发布平台的 PYTHON.json
+# 合计）与 third_party/runtime/licenses/ 里它的许可证文件（python-<名字>.txt）
+PYTHON_LIBRARIES = (
+    ("CPython", "cpython"),
+    ("bzip2", "bzip2"),
+    ("OpenSSL", "openssl-3"),
+    ("expat", "expat"),
+    ("libffi", "libffi"),
+    ("liblzma（xz）", "liblzma"),
+    ("mpdecimal", "mpdecimal"),
+    ("SQLite", "sqlite"),
+    ("libuuid", "libuuid"),
+    ("zlib", "zlib"),
+    ("zlib-ng", "zlib-ng"),
+    ("libedit（Linux 版）", "libedit"),
+    ("ncurses（Linux 版）", "ncurses"),
+)
+
+
+# 随带的 QuickJS-NG 与它的发布构建静态链入的库（三个发布平台合计）和 third_party/runtime/licenses/ 里的许可证文件
+# （quickjs-<名字>.txt）
+QUICKJS_LIBRARIES = (
+    ("QuickJS-NG", "ng"),
+    ("mimalloc", "mimalloc"),
+    ("musl（Linux 版）", "musl"),
+    ("mingw-w64 运行时（Windows 版）", "mingw-w64-runtime"),
+)
+
+
+def runtime_licenses(prefix: str, libraries: tuple[tuple[str, str], ...]) -> str:
+    """`libraries`（标题与 third_party/runtime/licenses/<prefix>-<名字>.txt 的名字）的许可证全文依次接起来。"""
+    return "\n".join(
+        f"{RULE}\n{label}\n{RULE}\n\n{read_text(RUNTIME_LICENSES / f'{prefix}-{name}.txt').strip()}\n"
+        for label, name in libraries
+    )
+
+
+def python_licenses() -> str:
+    """Python-LICENSES.txt：CPython 与它链入的各个库的许可证全文。"""
+    return (
+        f"随 hs-dlx 带的 Python {PYTHON_VERSION} 与它链入的库的许可证全文。由 scripts/licenses.py 生成。\n\n"
+        + runtime_licenses("python", PYTHON_LIBRARIES)
+    )
+
+
+def quickjs_licenses() -> str:
+    """QuickJS-NG-LICENSES.txt：QuickJS-NG 与它静态链入的各个库的许可证全文。"""
+    return (
+        f"随 hs-dlx 带的 QuickJS-NG {QUICKJS_VERSION} 与它链入的库的许可证全文。由 scripts/licenses.py 生成。\n\n"
+        + runtime_licenses("quickjs", QUICKJS_LIBRARIES)
+    )
 
 
 def found_crates(root: str) -> list[Crate]:
@@ -458,6 +529,8 @@ def main() -> int:
         out / "libtorrent-LICENSE.txt": read_text(LIBTORRENT_LICENSES / "libtorrent-LICENSE.txt"),
         out / "OpenSSL-LICENSE.txt": read_text(LIBTORRENT_LICENSES / "OpenSSL-LICENSE.txt"),
         out / "Boost-LICENSE_1_0.txt": read_text(LIBTORRENT_LICENSES / "Boost-LICENSE_1_0.txt"),
+        out / "Python-LICENSES.txt": python_licenses(),
+        out / "QuickJS-NG-LICENSES.txt": quickjs_licenses(),
     }
     stale: list[Path] = []
     for path, content in expected.items():

@@ -1,7 +1,10 @@
 //! 任务此刻在界面上的样子：中央圆盘的字与颜色、刻度、任务栏的小环与失败时的说明。
 
 use gpui_kit::Hsla;
-use hs_dlx_app::{CloudPhase, CloudProgress, Failure, Status, TorrentPhase};
+use hs_dlx_app::web::Container;
+use hs_dlx_app::{
+    CloudPhase, CloudProgress, Failure, FailureKind, Status, TorrentPhase, WebProgress,
+};
 use hs_m3u8_core::Stage;
 
 use crate::ring::Ticks;
@@ -59,6 +62,7 @@ pub fn look(row: &Row) -> Look {
         ),
         Status::Running if torrent => running_torrent(row),
         Status::Running if cloud => running_cloud(row),
+        Status::Running if row.task.spec.web().is_some() => running_web(row),
         Status::Running if row.task.spec.hls().is_none() => running_file(row),
         Status::Running => running(row, Amount::of(row).unwrap_or_default()),
         Status::Paused => stopped(row, Stopped::Paused),
@@ -120,7 +124,17 @@ fn stopped(row: &Row, why: Stopped<'_>) -> Look {
             }
         }
         Stopped::Failed(failure) => {
-            let (big, hint) = format::failure(failure.kind);
+            let (big, mut hint) = format::failure(failure.kind);
+            // 网页视频放不进 MP4：没有本地 HLS 可改
+            if failure.kind == FailureKind::Mp4Unsupported
+                && let Some(web) = row.task.spec.web()
+            {
+                hint = if web.container == Container::Original {
+                    "这一路的内容放不进 MP4：放弃后重新新建，选别的画质"
+                } else {
+                    "内容放不进 MP4：改用 MKV，已下的照样用"
+                };
+            }
             let line = kept.line;
             Look {
                 state: state("需要处理"),
@@ -158,6 +172,20 @@ fn kept(row: &Row, paused: bool) -> Kept {
     }
     if row.task.spec.cloud().is_some() {
         return kept_cloud(row, paused);
+    }
+    if row.task.spec.web().is_some() {
+        return Kept {
+            done: 0,
+            total: FILE_TICKS,
+            known: false,
+            fraction: 0.0,
+            big: "‖".to_owned(),
+            line: if paused {
+                "已下的保留 · 继续时重新解析网页、接着下".to_owned()
+            } else {
+                "已下的保留".to_owned()
+            },
+        };
     }
     if row.task.spec.hls().is_none() {
         return kept_file(row, paused);
@@ -519,6 +547,61 @@ fn running_file(row: &Row) -> Look {
         ticks,
         short: fraction.map_or_else(|| "…".to_owned(), percent),
         big,
+        line,
+        hint: None,
+        fraction: fraction.unwrap_or(0.0),
+        orb: theme::accent(),
+    }
+}
+
+/// 在下的网页视频任务：解析、等网站允许开始时为准备中；下载与合并时刻度按字节的比例。
+fn running_web(row: &Row) -> Look {
+    let preparing = |line: String| Look {
+        state: "准备中".to_owned(),
+        color: theme::accent(),
+        ticks: Ticks::of(0, 0, true),
+        big: "—".to_owned(),
+        line,
+        hint: None,
+        fraction: 0.0,
+        orb: theme::accent(),
+        short: "…".to_owned(),
+    };
+    let (state, which) = match row.web_progress.as_ref() {
+        None | Some(WebProgress::Resolving) => return preparing("解析网页".to_owned()),
+        Some(WebProgress::Waiting { until }) => {
+            let at = crate::clock::local(*until, "%H:%M:%S").unwrap_or_default();
+            return preparing(format!("网站要求等到 {at} 才能开始下"));
+        }
+        Some(WebProgress::Fetching { part, parts, .. }) => (
+            "下载中",
+            match (*parts, *part) {
+                (1, _) => String::new(),
+                (_, 0) => "视频 · ".to_owned(),
+                _ => "音频 · ".to_owned(),
+            },
+        ),
+        Some(WebProgress::Merging { .. }) => ("合并中", "不联网 · ".to_owned()),
+    };
+    let amount = FileAmount::of(row).unwrap_or(FileAmount {
+        bytes: 0,
+        total: None,
+    });
+    let fraction = amount.fraction();
+    let line = match amount.total {
+        Some(total) => format!(
+            "{which}{} / {}",
+            format::bytes(amount.bytes),
+            format::bytes(total)
+        ),
+        None => format!("{which}{}", format::bytes(amount.bytes)),
+    };
+    Look {
+        state: state.to_owned(),
+        color: theme::accent(),
+        ticks: Ticks::of(FILE_TICKS, lit(fraction), true),
+        short: fraction.map_or_else(|| "…".to_owned(), percent),
+        big: fraction.map_or_else(|| format::bytes(amount.bytes), percent),
         line,
         hint: None,
         fraction: fraction.unwrap_or(0.0),

@@ -54,17 +54,12 @@ enum Page {
     Task,
     /// 新建页：视图与对它的订阅（它的事件、它的探测进度推给粘贴栏），离开新建页时一起释放；`from_sniff` 为从嗅探页
     /// 打开的，关掉时回到嗅探页；
-    /// `page_check` 为第一次探测取到的不是播放列表时，在后台打开它、看是不是网页的嗅探视图与对它的订阅
+    /// `page_check` 为第一次探测说明地址可能是网页时，在后台打开它、看是不是网页的嗅探视图与对它的订阅
     NewTask {
         view: Entity<NewTask>,
         _subscriptions: [Subscription; 2],
         from_sniff: bool,
         page_check: Option<(Entity<SniffView>, Subscription)>,
-    },
-    /// 设置页：视图与对它的订阅，离开时一起释放
-    Settings {
-        view: Entity<SettingsView>,
-        _subscription: Subscription,
     },
     /// 网页里的视频流：只经 [`Shell::show_sniff`] 换上，视图即 [`Shell::sniff`] 里的；网页显示着时占满主体，不显示任务
     /// 列表
@@ -78,8 +73,10 @@ pub struct Shell {
     updates: Entity<Updates>,
     /// 选中的任务：打开窗口时与选中的被移除时为最新的一个；没有任务时为 None
     selected: Option<TaskId>,
-    /// 主体显示的页，只经 [`Shell::show`] 换
+    /// 主体的页，只经 [`Shell::show`] 换；设置开着时在它后面照常运行（新建页照常探测、后台的结论照常换页）
     page: Page,
+    /// 设置页与对它的订阅：开着时盖在主体的页上，关上即露出那一页；关上时一起释放
+    settings: Option<(Entity<SettingsView>, Subscription)>,
     /// 嗅探页与对它的订阅：关掉之前一直留着（不显示时网页藏起来、不出声），任务栏里有一项可以回去
     sniff: Option<(Entity<SniffView>, Subscription)>,
     /// 粘贴栏：任务页、待机页与新建页的舞台里放的同一个
@@ -173,6 +170,7 @@ impl Shell {
             updates,
             selected,
             page: Page::Task,
+            settings: None,
             sniff: None,
             dock,
             home: dirs::home_dir(),
@@ -256,13 +254,25 @@ impl Shell {
         self.show(Page::Task, cx);
     }
 
-    /// 换到 `page`（原来的新建页随之释放）；告诉离开与换上的嗅探视图（见 [`SniffView::set_on_screen`]）。
+    /// 换到 `page`（原来的新建页随之释放）；设置开着时照样换，关上设置即露出它。
     fn show(&mut self, page: Page, cx: &mut Context<Self>) {
-        let sniff_of = |page: &Page| match page {
-            Page::Sniff(view) => Some(view.clone()),
-            Page::Task | Page::NewTask { .. } | Page::Settings { .. } => None,
-        };
-        let (was, will) = (sniff_of(&self.page), sniff_of(&page));
+        self.change_screen(|this| this.page = page, cx);
+    }
+
+    /// 在屏幕上的嗅探视图：主体是嗅探页、设置没开着时为它。
+    fn sniff_on_screen(&self) -> Option<Entity<SniffView>> {
+        match &self.page {
+            Page::Sniff(view) if self.settings.is_none() => Some(view.clone()),
+            Page::Sniff(_) | Page::Task | Page::NewTask { .. } => None,
+        }
+    }
+
+    /// 做 `change`（换主体的页、开关设置），再告诉离开与换上屏幕的嗅探视图（见 [`SniffView::set_on_screen`]）、更新
+    /// 粘贴栏与待机页。
+    fn change_screen(&mut self, change: impl FnOnce(&mut Self), cx: &mut Context<Self>) {
+        let was = self.sniff_on_screen();
+        change(self);
+        let will = self.sniff_on_screen();
         if was != will {
             if let Some(was) = was {
                 was.update(cx, |sniff, cx| sniff.set_on_screen(false, cx));
@@ -271,7 +281,6 @@ impl Shell {
                 will.update(cx, |sniff, cx| sniff.set_on_screen(true, cx));
             }
         }
-        self.page = page;
         self.sync_dock(cx);
         self.sync_standby(cx);
         cx.notify();
@@ -290,7 +299,8 @@ impl Shell {
     /// 显示着待机页（任务页、没有任务）时每隔 [`dial::frame`]（按 [`dial::STANDBY_TURN`]） 重画一次，让彗尾慢慢扫、背光起伏（系统要求减少动态
     /// 效果时不画）；离开待机页即停。
     fn sync_standby(&mut self, cx: &mut Context<Self>) {
-        let standby = matches!(self.page, Page::Task) && self.selected.is_none();
+        let standby =
+            matches!(self.page, Page::Task) && self.selected.is_none() && self.settings.is_none();
         if !standby {
             self.standby_frames = None;
             return;
@@ -325,16 +335,23 @@ impl Shell {
 
     /// 打开设置页；已开着时关上。
     fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.page, Page::Settings { .. }) {
-            self.show(Page::Task, cx);
+        if self.settings.is_some() {
+            self.close_settings(cx);
         } else {
             self.open_settings(window, cx);
         }
     }
 
+    /// 关上设置页，露出主体的页；没开着时什么也不做。
+    pub(super) fn close_settings(&mut self, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            self.change_screen(|this| this.settings = None, cx);
+        }
+    }
+
     /// 打开设置页；已开着时什么也不做。读不出设置时提示原因。
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.page, Page::Settings { .. }) {
+        if self.settings.is_some() {
             return;
         }
         let settings = match self.tasks.read(cx).service().settings() {
@@ -349,17 +366,11 @@ impl Shell {
         let view = cx.new(|cx| SettingsView::new(tasks, updates, home, settings, window, cx));
         let subscription = cx.subscribe(&view, |this: &mut Self, _, event: &SettingsEvent, cx| {
             match event {
-                SettingsEvent::Dismissed => this.show(Page::Task, cx),
+                SettingsEvent::Dismissed => this.close_settings(cx),
             }
             cx.notify();
         });
-        self.show(
-            Page::Settings {
-                view,
-                _subscription: subscription,
-            },
-            cx,
-        );
+        self.change_screen(|this| this.settings = Some((view, subscription)), cx);
     }
 
     /// 打开设置页的「更新与关于」一组。
@@ -370,7 +381,7 @@ impl Shell {
     /// 打开设置页（已开着时照旧）并换到 `section` 这一组。
     fn open_settings_at(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
         self.open_settings(window, cx);
-        if let Page::Settings { view, .. } = &self.page {
+        if let Some((view, _)) = &self.settings {
             view.update(cx, |view, cx| view.show(section, cx));
         }
     }
@@ -382,11 +393,11 @@ impl Shell {
         }
     }
 
-    /// 显示着的新建视图；不在新建页时为 None。
+    /// 主体的新建视图（设置开着时在它后面）；主体不是新建页时为 None。
     fn new_task(&self) -> Option<&Entity<NewTask>> {
         match &self.page {
             Page::NewTask { view, .. } => Some(view),
-            Page::Task | Page::Sniff(_) | Page::Settings { .. } => None,
+            Page::Task | Page::Sniff(_) => None,
         }
     }
 }
@@ -405,15 +416,17 @@ impl Render for Shell {
             .px(px(PAD))
             .pb(px(PAD));
         // 网页显示着时占满主体，不显示任务栏
-        let page_shown = matches!(&self.page, Page::Sniff(sniff) if sniff.read(cx).page_shown());
+        let page_shown = self
+            .sniff_on_screen()
+            .is_some_and(|sniff| sniff.read(cx).page_shown());
         if !page_shown {
             body = body.child(self.render_list(tasks, cx));
         }
-        body = match &self.page {
-            Page::NewTask { view, .. } => body.child(view.clone()),
-            Page::Sniff(view) => body.child(view.clone()),
-            Page::Settings { view, .. } => body.child(view.clone()),
-            Page::Task => match self.selected_row(tasks) {
+        body = match (&self.settings, &self.page) {
+            (Some((view, _)), _) => body.child(view.clone()),
+            (None, Page::NewTask { view, .. }) => body.child(view.clone()),
+            (None, Page::Sniff(view)) => body.child(view.clone()),
+            (None, Page::Task) => match self.selected_row(tasks) {
                 Some(row) => {
                     let (stage, inspector) = self.render_task(row, now, cx);
                     body.child(stage).child(inspector)

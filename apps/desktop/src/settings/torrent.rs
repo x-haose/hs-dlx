@@ -2,8 +2,7 @@
 
 use std::num::NonZeroU32;
 
-use gpui_kit::component::input::Input;
-use gpui_kit::{Context, Div, FontWeight, ParentElement as _, Styled as _, div, px};
+use gpui_kit::{Context, Div, FontWeight, ParentElement as _, Styled as _, Window, div, px};
 use hs_dlx_app::Seeding;
 
 use super::{SettingsView, row};
@@ -23,9 +22,6 @@ const UPLOAD_CHOICES: [(&str, &str, Option<u32>); 4] = [
     ("upload-2m", "2 MB/s", Some(2 << 20)),
     ("upload-10m", "10 MB/s", Some(10 << 20)),
 ];
-
-/// BT 代理的输入框里的示例。
-pub(super) const TORRENT_PROXY_EXAMPLE: &str = "socks5://127.0.0.1:1080";
 
 impl SettingsView {
     /// 换做种的设置：存进了才选中，在做种的随即照它判停不停。
@@ -103,15 +99,19 @@ impl SettingsView {
         ]
     }
 
-    /// 改 BT 代理：`via` 为经代理（存输入框里的地址），否则改回直连；存进了才换。
-    fn pick_torrent_proxy(&mut self, via: bool, cx: &mut Context<Self>) {
+    /// 改 BT 代理：`via` 为经代理（填了端口时核对后存），否则改回直连；存进了才换。
+    fn pick_torrent_proxy(&mut self, via: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.torrent_proxy_error = None;
         if via {
             self.torrent_proxy_picked = true;
-            if !self.torrent_address.read(cx).value().trim().is_empty() {
-                self.save_torrent_proxy(cx);
+            if self.torrent_address.read(cx).has_port(cx) {
+                self.torrent_address
+                    .update(cx, |editor, cx| editor.save(window, cx));
             }
         } else {
+            // 在做的核对回来时不再存
+            self.torrent_address
+                .update(cx, |editor, cx| editor.cancel(cx));
             match self.tasks.read(cx).service().set_torrent_proxy(None) {
                 Ok(()) => {
                     self.torrent_proxy = None;
@@ -126,22 +126,18 @@ impl SettingsView {
         cx.notify();
     }
 
-    /// 存输入框里的 BT 代理地址。
-    pub(super) fn save_torrent_proxy(&mut self, cx: &mut Context<Self>) {
-        let text = self.torrent_address.read(cx).value().trim().to_owned();
-        let saved = hs_m3u8_core::Url::parse(&text)
-            .map_err(|_| format!("不是代理地址，应形如 {TORRENT_PROXY_EXAMPLE}"))
-            .and_then(|url| {
-                self.tasks
-                    .read(cx)
-                    .service()
-                    .set_torrent_proxy(Some(url.clone()))
-                    .map(|()| url)
-                    .map_err(|error| error.to_string())
-            });
+    /// 存核对过的 BT 代理地址 `url`。
+    pub(super) fn save_torrent_proxy(&mut self, url: hs_m3u8_core::Url, cx: &mut Context<Self>) {
+        let saved = self
+            .tasks
+            .read(cx)
+            .service()
+            .set_torrent_proxy(Some(url.clone()))
+            .map_err(|error| error.to_string());
         match saved {
-            Ok(url) => {
+            Ok(()) => {
                 self.torrent_proxy = Some(url);
+                self.torrent_proxy_picked = true;
                 self.torrent_proxy_error = None;
                 // 检测结果（与在做的检测）是按旧的设置量的
                 self.network_report = None;
@@ -216,12 +212,13 @@ impl SettingsView {
     /// BT 代理一行。
     pub(super) fn render_torrent_proxy(&self, cx: &mut Context<Self>) -> Div {
         let picked = self.torrent_proxy_picked;
-        let typed = self.torrent_address.read(cx).value().trim().to_owned();
+        let edited = self.torrent_address.read(cx).edited();
         let unsaved = match &self.torrent_proxy {
             None if picked => Some("保存之前照旧直连".to_owned()),
-            Some(url) if hs_m3u8_core::Url::parse(&typed).ok().as_ref() != Some(url) => Some(
-                format!("改的地址还没保存，照旧经 {}", hs_m3u8_core::bare_url(url)),
-            ),
+            Some(url) if edited => Some(format!(
+                "改的还没保存，照旧经 {}",
+                hs_m3u8_core::bare_url(url)
+            )),
             _ => None,
         };
         let chips = div()
@@ -232,39 +229,22 @@ impl SettingsView {
                 "torrent-direct",
                 "直连",
                 !picked,
-                cx.listener(|this, _, _, cx| this.pick_torrent_proxy(false, cx)),
+                cx.listener(|this, _, window, cx| this.pick_torrent_proxy(false, window, cx)),
             ))
             .child(ui::chip(
                 "torrent-socks",
                 "经 SOCKS5 代理",
                 picked,
-                cx.listener(|this, _, _, cx| this.pick_torrent_proxy(true, cx)),
+                cx.listener(|this, _, window, cx| this.pick_torrent_proxy(true, window, cx)),
             ));
         let input = picked.then(|| {
             div()
                 .flex()
                 .flex_col()
                 .gap(px(8.))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .child(
-                            ui::input_frame()
-                                .flex_1()
-                                .px(px(6.))
-                                .child(Input::new(&self.torrent_address).appearance(false)),
-                        )
-                        .child(ui::button(
-                            "save-torrent-proxy",
-                            "保存",
-                            Tone::Glow,
-                            cx.listener(|this, _, _, cx| this.save_torrent_proxy(cx)),
-                        )),
-                )
+                .child(self.torrent_address.clone())
                 .child(ui::caption(
-                    "IPv4 地址或主机名，写明端口，可带用户名与密码；代理要转发 UDP（UDP ASSOCIATE），DHT 才经得了它",
+                    "主机为 IPv4 地址或主机名；代理要转发 UDP（UDP ASSOCIATE），DHT 才经得了它",
                 ))
                 .children(unsaved.map(ui::caption))
         });

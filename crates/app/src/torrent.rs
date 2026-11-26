@@ -148,9 +148,8 @@ pub(crate) fn place(resume: &[u8], root: &str, wanted: &[i32]) -> Result<Vec<u8>
         .map_err(|error| Error::InvalidInput(format!("定不下种子的根名与要下的文件：{error}")))
 }
 
-/// 种子文件（bencode 写的内容）转成续传数据，供新建任务（[`crate::DraftKind::Torrent`]）；不是种子文件时报
-/// [`Error::InvalidInput`]。
-pub fn torrent_from_file(torrent: &[u8]) -> Result<Vec<u8>, Error> {
+/// 种子文件（bencode 写的内容）转成续传数据；不是种子文件时报 [`Error::InvalidInput`]。
+pub(crate) fn torrent_from_file(torrent: &[u8]) -> Result<Vec<u8>, Error> {
     hs_dlx_torrent::resume_from_torrent_file(torrent)
         .map_err(|error| Error::InvalidInput(format!("不是种子文件：{error}")))
 }
@@ -160,12 +159,31 @@ pub fn torrent_from_file(torrent: &[u8]) -> Result<Vec<u8>, Error> {
 pub struct MetadataProgress {
     /// 连着的节点数
     pub peers: u32,
-    /// 最近一次 tracker 报的错（libtorrent 的说明，英文，含 tracker 的地址）；没报过时为 None
+    /// 最近一次 tracker 报的错，「tracker 的地址：原因」（见 [`hs_dlx_torrent::AlertKind::TrackerError`]）；没报过，或这次
+    /// 取已连上过节点（连不上的 tracker 不妨碍找节点）时为 None
     pub tracker_error: Option<String>,
     /// 磁力链接没带 tracker、要补公共 tracker，而列表这次没取到时为原因（隔一阵再取）；别的时候为 None
     pub public_trackers_error: Option<String>,
     /// BT 代理的问题（探出用不了，或经它的 UDP 最近出错）；直连或没问题时为 None
     pub proxy_problem: Option<String>,
+}
+
+/// 一次运行（取种子信息、下载或做种）里 tracker 报的错，与连没连上过节点。
+#[derive(Debug, Default)]
+struct TrackerErrors {
+    /// 最近一次报的，「tracker 的地址：原因」
+    latest: Option<String>,
+    /// 这次运行里连上过节点（连上的不会是自己：libtorrent 认出连到自己的连接即断开）
+    connected: bool,
+}
+
+impl TrackerErrors {
+    /// 记下这一刻连着 `peers` 个节点，返回要显示的报错：这次运行里连上过节点时为 None（连不上的 tracker 不妨碍找节点），
+    /// 没报过时也为 None。
+    fn shown(&mut self, peers: u32) -> Option<String> {
+        self.connected |= peers > 0;
+        self.latest.clone().filter(|_| !self.connected)
+    }
 }
 
 /// 运行中的 BT 任务在做什么。
@@ -205,8 +223,8 @@ pub struct TorrentProgress {
     pub reachable: u32,
     /// 资源不足：下载中连着节点，凑不齐全部内容已持续 3 秒以上
     pub scarce: bool,
-    /// 这次运行里最近一次 tracker 报的错（libtorrent 的说明，英文，含 tracker 的地址）；没报过时为 None。私有种子只经
-    /// tracker 找节点，它报错时多半一直连不上节点
+    /// 这次运行里最近一次 tracker 报的错；没报过，或这次运行里已连上过节点时为 None（同
+    /// [`MetadataProgress::tracker_error`]）。私有种子只经 tracker 找节点，它报错时多半一直连不上节点
     pub tracker_error: Option<String>,
     /// BT 代理的问题（同 [`MetadataProgress::proxy_problem`]）
     pub proxy_problem: Option<String>,
@@ -1000,7 +1018,7 @@ pub(crate) async fn fetch_metadata(
         .is_empty();
     let mut public = owner.supplement(bare);
     let mut ticks = tokio::time::interval(STATUS_INTERVAL);
-    let mut tracker_error = None;
+    let mut trackers = TrackerErrors::default();
     // 登记之前已取到的，事件不会再来：每次先看状态
     loop {
         let status = owner
@@ -1010,9 +1028,10 @@ pub(crate) async fn fetch_metadata(
         if status.has_metadata {
             break;
         }
+        let peers = u32::try_from(status.peers).expect("libtorrent 的计数不为负");
         progress.send_replace(MetadataProgress {
-            peers: u32::try_from(status.peers).expect("libtorrent 的计数不为负"),
-            tracker_error: tracker_error.clone(),
+            peers,
+            tracker_error: trackers.shown(peers),
             public_trackers_error: public.failure(),
             proxy_problem: owner.engine.proxy_problem(),
         });
@@ -1022,7 +1041,7 @@ pub(crate) async fn fetch_metadata(
                 if let Routed::Alert(alert) = routed
                     && alert.kind == AlertKind::TrackerError
                 {
-                    tracker_error = Some(alert.message);
+                    trackers.latest = Some(alert.message);
                 }
             }
             trackers = public.ready() => owner.add_public(&trackers)?,
@@ -1319,7 +1338,7 @@ pub(crate) async fn seed(
     let mut ticks = tokio::time::interval(STATUS_INTERVAL);
     let mut saves =
         tokio::time::interval_at(tokio::time::Instant::now() + SAVE_INTERVAL, SAVE_INTERVAL);
-    let mut tracker_error = None;
+    let mut trackers = TrackerErrors::default();
     let end = loop {
         tokio::select! {
             () = cancel.cancelled() => break SeedEnd::Stopped,
@@ -1344,7 +1363,7 @@ pub(crate) async fn seed(
                 Routed::Alert(alert) => match alert.kind {
                     AlertKind::FileError => break SeedEnd::Failed(format!("读文件出错：{}", alert.message)),
                     AlertKind::TorrentError => break SeedEnd::Failed(format!("种子出错：{}", alert.message)),
-                    AlertKind::TrackerError => tracker_error = Some(alert.message),
+                    AlertKind::TrackerError => trackers.latest = Some(alert.message),
                     _ => {}
                 },
                 // 做种不等哪一步的结果，状态每半秒照查，丢了事件不影响
@@ -1367,7 +1386,7 @@ pub(crate) async fn seed(
                     break SeedEnd::Failed(format!("种子出错：{}", status.error));
                 }
                 let mut progress = TorrentProgress::of(&status);
-                progress.tracker_error.clone_from(&tracker_error);
+                progress.tracker_error = trackers.shown(progress.peers);
                 progress.proxy_problem = owner.engine.proxy_problem();
                 if matches!(progress.phase, TorrentPhase::Checking { .. }) {
                     each(progress);
@@ -1405,7 +1424,7 @@ async fn drive(
     let mut ticks = tokio::time::interval(STATUS_INTERVAL);
     // 连续几次状态凑不齐全部内容（见 SCARCE_TICKS）
     let mut short = 0;
-    let mut tracker_error = None;
+    let mut trackers = TrackerErrors::default();
     loop {
         tokio::select! {
             () = cancel.cancelled() => return Outcome::Paused,
@@ -1424,7 +1443,7 @@ async fn drive(
                             message: format!("BT 种子出错：{}", alert.message),
                         });
                     }
-                    AlertKind::TrackerError => tracker_error = Some(alert.message),
+                    AlertKind::TrackerError => trackers.latest = Some(alert.message),
                     // 续传数据与磁盘对不上时 libtorrent 自己改为整体校验，照常运行
                     _ => {}
                 },
@@ -1454,7 +1473,7 @@ async fn drive(
                         && progress.reachable < progress.pieces;
                     short = if shortfall { short + 1 } else { 0 };
                     progress.scarce = short >= SCARCE_TICKS;
-                    progress.tracker_error.clone_from(&tracker_error);
+                    progress.tracker_error = trackers.shown(progress.peers);
                     progress.proxy_problem = owner.engine.proxy_problem();
                     each(progress);
                 }
@@ -1700,6 +1719,7 @@ pub(crate) async fn diagnose(
         working: tracker.working,
         failed: tracker.failed,
         message: tracker.message.clone(),
+        unroutable: tracker.unroutable,
     };
     let public = match &*engine.public.borrow() {
         PublicTrackers::Off => Public::Off,
@@ -1763,6 +1783,22 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// tracker 的报错在这次运行里还没连上过节点时显示；连上过之后不再显示，节点又断光了也一样。
+    #[test]
+    fn tracker_errors_show_only_until_a_peer_has_connected() {
+        let mut trackers = TrackerErrors::default();
+        assert_eq!(trackers.shown(0), None);
+        trackers.latest = Some("http://t/announce：timed out".to_owned());
+        assert_eq!(
+            trackers.shown(0).as_deref(),
+            Some("http://t/announce：timed out")
+        );
+        assert_eq!(trackers.shown(3), None);
+        assert_eq!(trackers.shown(0), None);
+        trackers.latest = Some("http://t/announce：refused".to_owned());
+        assert_eq!(trackers.shown(0), None);
+    }
 
     /// 记着能用时经代理的 UDP 一次没回不改记，再一次才改；改成写法不同而等价的地址时探到的情况照旧，改成别的才重置。
     #[test]

@@ -1,12 +1,13 @@
 //! 新建任务：带着请求头认出地址是什么（或用嗅探页已探测好的结果）。是播放列表时，舞台上每档清晰度画成一个同心环
 //! （越粗码率越高，引线连到右侧的标签），点环或用方向键选中，再在检查面板里选音轨、输出、保存位置与请求头；是文件时
 //! 舞台上是写着大小的表盘，检查面板里选保存位置与请求头。磁力链接先连节点取种子信息（种子文件直接读），之后舞台上是
-//! 写着所选大小的表盘，检查面板里勾要下的文件、选保存位置。探测被拒时可改请求头重新探测；取到的是网页或不是播放列表时
-//! 外面可以在网页引擎里打开它看是不是网页（见 [`NewTask::opening_page`]）；请求经哪个代理写在检查面板里。舞台底部是
-//! 外面给的粘贴栏。
+//! 写着所选大小的表盘，检查面板里勾要下的文件、选保存位置。探测被拒时可改请求头重新探测；结果说明地址可能是网页（取到的
+//! 不是播放列表，或被拒，见 [`hs_dlx_app::maybe_a_page`]）时外面可以在网页引擎里打开它看是不是网页（见
+//! [`NewTask::opening_page`]）；请求经哪个代理写在检查面板里。舞台底部是外面给的粘贴栏。
 
 mod figure;
 mod inspector;
+mod web;
 
 use self::figure::{FIGURE_HEIGHT, FIGURE_WIDTH};
 
@@ -22,7 +23,7 @@ use gpui_kit::{
 };
 use hs_dlx_app::{
     Draft, DraftKind, Expected, Failure, FailureKind, MetadataFetch, MetadataProgress, OutputKind,
-    Service, TorrentInfo, file_name, not_a_playlist, task_title, torrent_from_file,
+    Service, TaskId, TorrentInfo, file_name, maybe_a_page, task_title,
 };
 use hs_m3u8_core::hls::{AudioChoice, Preference, VariantChoice};
 use hs_m3u8_core::{FileInfo, Probe, Resource, Source, Url};
@@ -32,6 +33,7 @@ use crate::dock::Dock;
 use crate::format;
 use crate::headers::HeadersEditor;
 use crate::route::Route;
+use crate::tasks::Tasks;
 use crate::ui::{self, GAP, INSPECTOR_MIN_WIDTH};
 
 /// 新建页的最小宽：整个同心环区域与收到最窄的检查面板（放得下一行「MP4 · 本地 HLS · 两者」三个选项）。
@@ -62,10 +64,13 @@ pub enum NewTaskEvent {
     FolderChanged(PathBuf),
     /// 探测完成，可以开始：由外面决定要不要把键盘焦点给它（[`NewTask::focus`]）
     Ready,
-    /// 第一次探测（不是改了请求头重新探测）取到的是网页或不是播放列表：由外面决定要不要看它是不是网页
-    NotAPlaylist,
+    /// 第一次探测（不是改了请求头重新探测）的结果说明地址可能是网页（见 [`hs_dlx_app::maybe_a_page`]）：由外面决定要不要
+    /// 在网页引擎里看它是不是网页
+    MaybePage,
     /// 用户要在网页里找视频流（失败页上的按钮）
     Sniff(Url),
+    /// 磁力链接或种子文件的种子已在这个任务里：由外面换到它
+    Taken(TaskId),
 }
 
 /// 探测进行到哪一步，粘贴栏与任务列表据此显示状态。
@@ -87,7 +92,10 @@ impl Phase {
     }
 }
 
-/// 第一次探测取到的不是播放列表后，外面在网页引擎里看它是不是网页（见 [`NewTask::opening_page`]）。
+/// 取不到种子信息的结论：失败，与种子已在里面的任务。
+type TorrentStop = (Failure, Option<TaskId>);
+
+/// 第一次探测的结果说明地址可能是网页后，外面在网页引擎里看它是不是网页（见 [`NewTask::opening_page`]）。
 #[derive(Clone, PartialEq, Eq)]
 enum PageCheck {
     /// 没在看：探测没失败、不是这种失败，或用户已改请求头重新探测
@@ -108,6 +116,12 @@ enum Probing {
     Metadata(MetadataProgress),
     /// 种子信息到手，在选要下的文件
     Torrent(Box<TorrentChoice>),
+    /// 地址是网页，yt-dlp 在解析
+    Resolving,
+    /// 地址是网页，要解析得先装网页视频的组件：组件此刻的状态
+    NeedsWeb(hs_dlx_app::WebState),
+    /// 网页解析出了视频，在选画质
+    Web(Box<web::WebChoice>),
 }
 
 /// 种子的来源。
@@ -189,6 +203,8 @@ fn torrent_title(url: &Url) -> String {
 }
 
 pub struct NewTask {
+    /// 任务列表：读设置里选的浏览器能不能读（见 [`Tasks::cookies_denied`]）
+    tasks: Entity<Tasks>,
     service: Rc<Service>,
     url: Url,
     /// 任务的标题，开始时与已有的重名会加编号
@@ -198,7 +214,7 @@ pub struct NewTask {
     probing: Probing,
     /// 这次探测开始的时刻：探测中的表盘写探测了多久
     since: Instant,
-    /// 取到的不是播放列表后，外面看它是不是网页看到哪一步
+    /// 地址可能是网页时，外面看它是不是网页看到哪一步
     page_check: PageCheck,
     /// 从嗅探页来的流：失败页上不再给「在网页里找视频流」
     from_sniff: bool,
@@ -230,21 +246,26 @@ pub struct NewTask {
     _metadata: Task<()>,
     /// 探测中逐帧重画表盘，探测有了结果即停
     _frames: Task<()>,
+    /// 等网页视频的组件装好（见 [`Probing::NeedsWeb`]）
+    _web: Task<()>,
 }
 
 impl EventEmitter<NewTaskEvent> for NewTask {}
 
 impl NewTask {
-    /// 打开 `link` 的新建页；`from_sniff` 为从嗅探页来的，`dock` 为放在舞台底部的粘贴栏。
+    /// 打开 `link` 的新建页，保存到任务列表的默认目录；`from_sniff` 为从嗅探页来的，`dock` 为放在舞台底部的粘贴栏。
     pub fn new(
-        service: Rc<Service>,
+        tasks: Entity<Tasks>,
         link: Link,
         from_sniff: bool,
-        folder: PathBuf,
         dock: Entity<Dock>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let (service, folder) = {
+            let tasks = tasks.read(cx);
+            (tasks.service().clone(), tasks.folder().clone())
+        };
         let Link {
             url,
             title: page_title,
@@ -275,6 +296,7 @@ impl NewTask {
             task_title(&url, page_title.as_deref())
         };
         let mut view = NewTask {
+            tasks,
             service,
             title,
             page_title,
@@ -300,6 +322,7 @@ impl NewTask {
             _probe: Task::ready(()),
             _metadata: Task::ready(()),
             _frames: Task::ready(()),
+            _web: Task::ready(()),
         };
         match (torrent, probe) {
             (Some(source), _) => view.fetch_torrent(source, cx),
@@ -309,12 +332,21 @@ impl NewTask {
         view
     }
 
-    /// 取种子信息：磁力链接连节点去取，种子文件在后台读（之前的结果作废）。取到即可开始，取不到为失败。
+    /// 取种子信息：磁力链接连节点去取，种子文件在后台读（之前的结果作废）。取到即可开始，取不到为失败；种子已在任务里
+    /// 时为失败并发 [`NewTaskEvent::Taken`]。
     fn fetch_torrent(&mut self, source: TorrentSource, cx: &mut Context<Self>) {
         self.probing = Probing::Metadata(MetadataProgress::default());
         self.since = Instant::now();
         self.animate(cx);
-        let failed = |kind, message: String| Probing::Failed(Failure { kind, message });
+        let failed = |kind, message: String| Failure { kind, message };
+        // 取不到的结论：失败，与种子已在里面的任务
+        let stop = move |kind, error: hs_dlx_app::Error| {
+            let taken = match error {
+                hs_dlx_app::Error::TorrentTaken(existing) => Some(existing),
+                _ => None,
+            };
+            (failed(kind, error.to_string()), taken)
+        };
         let resume = match source {
             TorrentSource::Magnet => {
                 let MetadataFetch {
@@ -322,9 +354,10 @@ impl NewTask {
                     resume,
                 } = match self.service.fetch_metadata(self.url.to_string()) {
                     Ok(fetch) => fetch,
+                    // 打开新建页时就取：结论照样在下一轮交出，这时外面已订阅了它的事件
                     Err(error) => {
-                        self.probing = failed(FailureKind::Other, error.to_string());
-                        cx.notify();
+                        let stopped = stop(FailureKind::Other, error);
+                        self.finish_torrent(Task::ready(Err(stopped)), cx);
                         return;
                     }
                 };
@@ -347,33 +380,54 @@ impl NewTask {
                     match resume.await {
                         Ok(Ok(resume)) => TorrentInfo::of(&resume)
                             .map(|info| (resume, info))
-                            .map_err(|error| failed(FailureKind::Other, error.to_string())),
-                        Ok(Err(error)) => Err(failed(FailureKind::Other, error.to_string())),
-                        Err(join) => Err(failed(
-                            FailureKind::Other,
-                            format!("取种子信息中途出错：{join}"),
+                            .map_err(|error| stop(FailureKind::Other, error)),
+                        Ok(Err(error)) => Err(stop(FailureKind::Other, error)),
+                        Err(join) => Err((
+                            failed(FailureKind::Other, format!("取种子信息中途出错：{join}")),
+                            None,
                         )),
                     }
                 })
             }
-            TorrentSource::File(path) => cx.background_executor().spawn(async move {
-                let bytes = std::fs::read(&path).map_err(|error| {
-                    failed(
-                        FailureKind::Disk,
-                        format!("读不出种子文件 {}：{error}", path.display()),
-                    )
-                })?;
-                let resume = torrent_from_file(&bytes)
-                    .map_err(|error| failed(FailureKind::Malformed, error.to_string()))?;
-                let info = TorrentInfo::of(&resume)
-                    .map_err(|error| failed(FailureKind::Malformed, error.to_string()))?;
-                Ok((resume, info))
-            }),
+            TorrentSource::File(path) => {
+                let service = self.service.clone();
+                let read = cx.background_executor().spawn(async move {
+                    std::fs::read(&path).map_err(|error| {
+                        let message = format!("读不出种子文件 {}：{error}", path.display());
+                        (failed(FailureKind::Disk, message), None)
+                    })
+                });
+                cx.foreground_executor().spawn(async move {
+                    match service.open_torrent_file(read.await?).await {
+                        Ok(Ok(opened)) => Ok(opened),
+                        Ok(Err(error @ hs_dlx_app::Error::InvalidInput(_))) => {
+                            Err(stop(FailureKind::Malformed, error))
+                        }
+                        Ok(Err(error)) => Err(stop(FailureKind::Other, error)),
+                        Err(join) => Err((
+                            failed(FailureKind::Other, format!("读种子文件中途出错：{join}")),
+                            None,
+                        )),
+                    }
+                })
+            }
         };
+        self.finish_torrent(resume, cx);
+    }
+
+    /// 等取种子信息的结论 `resume`：取到为种子与其中的种子信息，取不到为失败与种子已在里面的任务。
+    fn finish_torrent(
+        &mut self,
+        resume: Task<Result<(Vec<u8>, TorrentInfo), TorrentStop>>,
+        cx: &mut Context<Self>,
+    ) {
         self._probe = cx.spawn(async move |this, cx| {
-            let probing = match resume.await {
-                Ok((resume, info)) => Probing::Torrent(Box::new(TorrentChoice::new(resume, info))),
-                Err(failed) => failed,
+            let (probing, taken) = match resume.await {
+                Ok((resume, info)) => (
+                    Probing::Torrent(Box::new(TorrentChoice::new(resume, info))),
+                    None,
+                ),
+                Err((failure, taken)) => (Probing::Failed(failure), taken),
             };
             // 视图在取的期间被关掉时不再需要结果
             let _closed = this.update(cx, |this, cx| {
@@ -384,6 +438,9 @@ impl NewTask {
                 this.probing = probing;
                 if ready {
                     cx.emit(NewTaskEvent::Ready);
+                }
+                if let Some(existing) = taken {
+                    cx.emit(NewTaskEvent::Taken(existing));
                 }
                 cx.notify();
             });
@@ -434,18 +491,15 @@ impl NewTask {
         self.since = Instant::now();
         self.animate(cx);
         self._probe = cx.spawn(async move |this, cx| {
-            let (probing, not_page) = match handle.await {
+            let (probing, maybe_page) = match handle.await {
                 Ok(Ok(Resource::Playlist(probe))) => (Probing::Ready(probe), false),
                 Ok(Ok(Resource::File(info))) => (Probing::File(Box::new(info)), false),
-                // 与 HLS 取到网页时同类：多为登录页或错误页，补上 Cookie 等请求头可能就对了；也可能是有视频的网页
-                Ok(Ok(Resource::Page { content_type })) => (
-                    Probing::Failed(Failure {
-                        kind: FailureKind::Malformed,
-                        message: format!("地址回的是网页（{content_type}），不是视频流或文件"),
-                    }),
-                    true,
-                ),
-                Ok(Err(error)) => (Probing::Failed(Failure::of(&error)), not_a_playlist(&error)),
+                // 网页：交给 yt-dlp 解析（见 web.rs），没有专门的解析器时再在网页引擎里看
+                Ok(Ok(Resource::Page { .. })) => {
+                    let _closed = this.update(cx, |this, cx| this.resolve_page(first, cx));
+                    return;
+                }
+                Ok(Err(error)) => (Probing::Failed(Failure::of(&error)), maybe_a_page(&error)),
                 Err(join) => (
                     Probing::Failed(Failure {
                         kind: FailureKind::Other,
@@ -460,8 +514,8 @@ impl NewTask {
                 this.probed(probing);
                 if ready {
                     cx.emit(NewTaskEvent::Ready);
-                } else if first && not_page {
-                    cx.emit(NewTaskEvent::NotAPlaylist);
+                } else if first && maybe_page {
+                    cx.emit(NewTaskEvent::MaybePage);
                 }
                 cx.notify();
             });
@@ -549,8 +603,10 @@ impl NewTask {
             Probing::Running => Phase::Probing,
             Probing::Failed(_) if self.page_check == PageCheck::Opening => Phase::Probing,
             Probing::Failed(_) => Phase::Failed,
-            Probing::Metadata(_) => Phase::Probing,
-            Probing::Ready(_) | Probing::File(_) | Probing::Torrent(_) => Phase::Ready,
+            Probing::Metadata(_) | Probing::Resolving | Probing::NeedsWeb(_) => Phase::Probing,
+            Probing::Ready(_) | Probing::File(_) | Probing::Torrent(_) | Probing::Web(_) => {
+                Phase::Ready
+            }
         }
     }
 
@@ -561,11 +617,14 @@ impl NewTask {
 
     /// 新建页自己有焦点时的按键：↑ ← 换到码率高一档（外一环），↓ → 换到低一档，回车开始，Esc 关闭。
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        // 开始了就不能取消，也不再换档
+        // 开始了就不能取消，也不再换档（网页视频为换画质）
         if !self.focus.is_focused(window) || self.creating {
             return;
         }
+        let web = matches!(self.probing, Probing::Web(_));
         match event.keystroke.key.as_str() {
+            "up" | "left" if web => self.step_choice(-1, cx),
+            "down" | "right" if web => self.step_choice(1, cx),
             "up" | "left" => self.step_variant(-1, cx),
             "down" | "right" => self.step_variant(1, cx),
             "enter" => self.start(window, cx),
@@ -681,9 +740,25 @@ impl NewTask {
                     wanted,
                 }
             }
-            Probing::Running | Probing::Failed(_) | Probing::Metadata(_) => return,
+            Probing::Web(choice) => {
+                let option = choice.choice();
+                DraftKind::Web {
+                    title: choice.resolved.info.title.clone(),
+                    extractor: choice.resolved.info.extractor.clone(),
+                    video_id: choice.resolved.info.id.clone(),
+                    video: option.video.clone(),
+                    audio: option.audio.clone(),
+                    container: option.container,
+                    ext: option.ext.clone(),
+                }
+            }
+            Probing::Running
+            | Probing::Failed(_)
+            | Probing::Metadata(_)
+            | Probing::Resolving
+            | Probing::NeedsWeb(_) => return,
         };
-        // 磁力链接与种子文件没有请求头
+        // 磁力链接与种子文件没有请求头；网页视频只带 Cookie（别的请求头 yt-dlp 自己定）
         let headers = if self.is_torrent() {
             Vec::new()
         } else {
@@ -691,13 +766,29 @@ impl NewTask {
                 .headers
                 .update(cx, |editor, cx| editor.confirm(window, cx))
             {
+                Some(headers) if matches!(kind, DraftKind::Web { .. }) => headers
+                    .into_iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+                    .collect(),
                 Some(headers) => headers,
                 None => return,
             }
         };
-        // 文件的地址也用原来的：重定向到的多为有时效的签名地址，续传时重新跟随
+        // 文件的地址也用原来的：重定向到的多为有时效的签名地址，续传时重新跟随。网页视频用解析器整理过的网页地址
+        // （短链接 youtu.be、b23.tv 换成视频页）：Cookie 按它的域名带，重新解析也不依赖短链接还在
+        let url = match &self.probing {
+            Probing::Web(choice) => choice
+                .resolved
+                .info
+                .page
+                .as_deref()
+                .and_then(|page| Url::parse(page).ok())
+                .filter(|page| matches!(page.scheme(), "http" | "https"))
+                .unwrap_or_else(|| self.url.clone()),
+            _ => self.url.clone(),
+        };
         let draft = Draft {
-            url: self.url.clone(),
+            url,
             headers,
             folder: self.folder.clone(),
             kind,

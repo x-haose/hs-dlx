@@ -3,7 +3,9 @@
 //! main_window）。
 
 mod backdrop;
+mod clock;
 mod dial;
+mod disk_access;
 mod dock;
 mod format;
 mod headers;
@@ -53,6 +55,32 @@ const FONTS: [&[u8]; 3] = [
     include_bytes!("../assets/fonts/SpaceGrotesk-Medium.ttf"),
     include_bytes!("../assets/fonts/SpaceGrotesk-Bold.ttf"),
 ];
+
+/// 随应用带的 Python 与 QuickJS-NG（make runtime 备好、build.rs 交来，见 scripts/runtime.py）：第一次用网页视频时解进
+/// 组件目录。
+#[cfg(bundled_runtime)]
+fn bundle() -> Option<hs_dlx_app::ytdlp::Bundle> {
+    use std::borrow::Cow;
+    Some(hs_dlx_app::ytdlp::Bundle {
+        python: hs_dlx_app::ytdlp::Bundled {
+            id: env!("HS_DLX_RUNTIME_PYTHON_ID").to_owned(),
+            bytes: Cow::Borrowed(include_bytes!(env!("HS_DLX_RUNTIME_PYTHON_PATH"))),
+            executable: env!("HS_DLX_RUNTIME_PYTHON_EXECUTABLE").to_owned(),
+        },
+        python_abi: env!("HS_DLX_RUNTIME_PYTHON_ABI").to_owned(),
+        quickjs: hs_dlx_app::ytdlp::Bundled {
+            id: env!("HS_DLX_RUNTIME_QUICKJS_ID").to_owned(),
+            bytes: Cow::Borrowed(include_bytes!(env!("HS_DLX_RUNTIME_QUICKJS_PATH"))),
+            executable: env!("HS_DLX_RUNTIME_QUICKJS_FILE").to_owned(),
+        },
+    })
+}
+
+/// 应用不发布的平台没有随带的运行时：网页视频用不了。
+#[cfg(not(bundled_runtime))]
+fn bundle() -> Option<hs_dlx_app::ytdlp::Bundle> {
+    None
+}
 
 /// 任务存储的位置：系统给应用放数据的目录（macOS 为 ~/Library/Application Support）下的 hs-dlx/tasks.sqlite。
 fn store_path() -> Option<PathBuf> {
@@ -144,6 +172,13 @@ fn main() {
                         MAX_REQUESTS,
                         TorrentNetwork::Internet,
                         hs_dlx_app::pikpak::Endpoints::official(),
+                        // 网页视频的组件放在任务存储旁的 components 下
+                        hs_dlx_app::WebConfig {
+                            root: path.with_file_name("components"),
+                            bundle: bundle(),
+                            sources: hs_dlx_app::ytdlp::Sources::official(),
+                            update_every: Some(hs_dlx_app::WebConfig::UPDATE_EVERY),
+                        },
                     )
                         .map_err(|error| Failure::new("启动失败", error.to_string()))?;
                     let settings = service

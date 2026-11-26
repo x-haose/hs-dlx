@@ -167,6 +167,13 @@ fn service(store: &Path) -> (Service, mpsc::UnboundedReceiver<Event>) {
             public_trackers: Vec::new(),
         },
         hs_dlx_app::pikpak::Endpoints::official(),
+        // 网页视频不在这里测：不给组件
+        hs_dlx_app::WebConfig {
+            root: std::env::temp_dir().join("hs-dlx-no-web"),
+            bundle: None,
+            sources: hs_dlx_app::ytdlp::Sources::official(),
+            update_every: None,
+        },
     )
     .unwrap()
 }
@@ -256,7 +263,7 @@ fn a_task_downloads_and_is_recorded_as_done() {
         service.set_headers(task.id, Vec::new()),
         Err(Error::AlreadyDone(_))
     ));
-    service.forget(task.id).unwrap();
+    rt.block_on(service.forget(task.id)).unwrap().unwrap();
     assert!(service.tasks().unwrap().is_empty());
     assert!(folder.join("index.mp4").is_file());
 }
@@ -295,7 +302,10 @@ fn a_paused_task_resumes_after_reopening() {
     let task = service.tasks().unwrap().remove(0);
     assert_eq!((task.status, task.total), (Status::Paused, Some(2)));
     // 没完成的任务不能只从列表移除，任务目录要一起放弃
-    assert!(matches!(service.forget(id), Err(Error::NotFinished(_))));
+    assert!(matches!(
+        rt.block_on(service.forget(id)).unwrap(),
+        Err(Error::NotFinished(_))
+    ));
     let Saved::Hls(saved) = rt.block_on(service.inspect(id)).unwrap().unwrap().unwrap() else {
         panic!("HLS 任务的任务目录");
     };
@@ -358,17 +368,18 @@ fn discarding_a_running_task_removes_it() {
     rt.block_on(first_segment(&mut events, id));
 
     let discarding = service.discard(id);
-    assert!(matches!(
-        service.resume(id),
-        Err(Error::Discarding(_) | Error::Running(_))
-    ));
-    assert!(matches!(
-        service.forget(id),
-        Err(Error::Discarding(_) | Error::Running(_))
-    ));
+    // 放弃很快：机器忙时下面这几步之前它可能已经做完、任务已不在（不在也是拒绝）
+    let refused = |result: Result<(), Error>| {
+        matches!(
+            result,
+            Err(Error::Discarding(_) | Error::Running(_) | Error::NotFound(_))
+        )
+    };
+    assert!(refused(service.resume(id).map(|_| ())));
+    assert!(refused(rt.block_on(service.forget(id)).unwrap()));
     assert!(matches!(
         rt.block_on(service.discard(id)).unwrap(),
-        Err(Error::Discarding(_))
+        Err(Error::Discarding(_) | Error::NotFound(_))
     ));
     let leftovers = rt.block_on(discarding).unwrap().unwrap();
 

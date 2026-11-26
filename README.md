@@ -25,10 +25,10 @@
 </p>
 
 hs-dlx 是用 Rust 写的原生桌面应用，界面用 GPUI 直接绘制，不是 Electron，也不是套在网页里的壳。现在支持 HLS（m3u8）
-的点播与直播录制、在网页里找视频流、多连接分段下载文件、磁力链接与种子文件（含做种、诊断与网络检测），都能断点续传；
-HLS 输出 MP4 或可直接播放的本地 HLS；磁力链接也能交给你自己的 PikPak 账号云离线，再取回本机。HLS 与文件的下载引擎是
-[hs-m3u8](https://github.com/x-haose/hs-m3u8) 的核心库，BT 用 libtorrent。接下来会加入更多网盘、边下边播与站点解析，
-见[路线图](#路线图)。
+的点播与直播录制、YouTube、B 站等网站的视频（经 yt-dlp 解析）、在网页里找视频流、多连接分段下载文件、磁力链接与种子
+文件（含做种、诊断与网络检测），都能断点续传；HLS 输出 MP4 或可直接播放的本地 HLS；磁力链接也能交给你自己的 PikPak
+账号云离线，再取回本机。HLS 与文件的下载引擎是 [hs-m3u8](https://github.com/x-haose/hs-m3u8) 的核心库，BT 用
+libtorrent。接下来会加入更多网盘、边下边播，见[路线图](#路线图)。
 
 <p align="center">
   <img src=".github/screenshots/new-task.jpg" alt="探测出五档清晰度，在同心环上选一档">
@@ -75,6 +75,17 @@ HLS 输出 MP4 或可直接播放的本地 HLS；磁力链接也能交给你自�
 - 断点续传：暂停、退出应用、断网后都能接着下，只补缺的分片。
 - 直播录制的钟面按时间显示录到了哪些时段、哪里缺了；随时停止并写出已录的部分，不联网也能写出。
 
+**网页视频**
+
+- 粘贴 YouTube、B 站等网站的视频页地址：经 [yt-dlp](https://github.com/yt-dlp/yt-dlp) 解析出几档画质，选一档下载。
+  视频与音频分开下再合成一个文件（MP4，编码放不进时改 MKV），能暂停、续传；每次开始都重新解析，下载地址过期也接得上。
+- 只有 yt-dlp 有专门解析器的网站交给它；别的网页到内置网页里找视频流（yt-dlp 还没装时先提示安装，也可以直接改到
+  内置网页里找）。
+- yt-dlp 第一次用时下载（约 11 MB），之后在后台保持最新，可换回上一个版本或改用每日构建；画质可选兼容优先（H.264 +
+  AAC）或画质优先。
+- 要登录才能看的：在内置网页里登录后解析，或在设置里选你常用的浏览器、解析时读它的登录信息（macOS 上要给「完全磁盘
+  访问权限」；Windows 上的 Chrome、Edge、Brave 读不了，用 Firefox）。
+
 **下载文件**
 
 - 粘贴的地址是文件时显示大小、类型与能否续传；服务器支持时多个连接分段并行下载、断点续传，限制连接数时自动减少。
@@ -111,11 +122,14 @@ HLS 输出 MP4 或可直接播放的本地 HLS；磁力链接也能交给你自�
 
 - 粘贴的是网页地址时，在后台打开网页找出里面的视频流，标好清晰度、时长与是否直播。
 - 要登录、或要点了播放才加载的网页，打开网页弄好后，找到的流会列出来。
+- 网站拒绝非浏览器的请求（403、503）时，自动在内置网页里打开它；是 Cloudflare 的人机验证页时把网页显示出来，勾一下
+  验证即接着找。
 - 下载时带上网页存下的 Cookie 与来源地址，按同站与 SameSite 规则决定带哪些。
 
 **网络与出错**
 
-- 代理：跟随系统、直连，或指定 HTTP、HTTPS、SOCKS 代理；嗅探页的网页走同一个出口。
+- 代理：跟随系统、直连，或指定代理：一般只填端口（主机默认 127.0.0.1，保存时自动认出 SOCKS5 还是 HTTP），也可以
+  改主机、指定协议，要登录的填用户名与密码；嗅探页的网页走同一个出口。
 - 请求头：新建时可加；遇到 401、403 时改请求头后重试。
 - 失败按种类说明原因与能做的事：改请求头再试、改存本地 HLS、写出已录的、稍后重试。
 
@@ -141,16 +155,17 @@ HLS 输出 MP4 或可直接播放的本地 HLS；磁力链接也能交给你自�
 
 ## 路线图
 
-方向是围绕视频做深：找得到、下得完、马上能看。顺序如下，完成一项发一个版本。
+方向是围绕视频做深：找得到、下得完、马上能看；普通文件、磁力与云离线也在同一个应用里下。
 
-| | 内容 |
+| 版本 | 内容 |
 |---|---|
-| 1 | **云离线**：PikPak 已做；接着是 115、迅雷云盘 |
-| 2 | **边下边播**：按播放位置优先下载需要的块 |
-| 3 | **站点解析**：接入 yt-dlp 解析视频网站，下载仍由 hs-dlx 自己的引擎完成 |
-| 4 | **DASH**：点播与直播 |
-| 5 | **HTTP-FLV 直播录制**：断线重连、缺口记录 |
-| 6 | **浏览器扩展**、兼容 aria2 的 JSON-RPC 接口 |
+| 0.6 | **以任务为中心与插件**：一个链接从粘贴起就是一个任务，自己往下走、要处理时停下等，可同时粘贴多个；粘贴任何地址都走同一个入口自动认出；本机 WebSocket 控制接口；插件系统（yt-dlp 是第一个插件） |
+| 0.7 | **浏览器扩展**（接管下载、列出网页里的视频）、兼容 aria2 的 JSON-RPC；**批量下载**（多行粘贴、导入列表、地址模板、播放列表与频道整批下）；下载队列、全局限速、计划任务、按类型分目录 |
+| 0.8 | **边下边播与远程**：边下边播；手机等设备用浏览器控制、观看、传到手机；无界面运行（NAS、Docker） |
+| 0.9 | **视频深度**：DASH（点播与直播）、多音轨与字幕、HLS 输出 MKV、只下一段、直播回看、去广告、HTTP-FLV 直播录制 |
+| 0.10 | **搜索插件**：插件可以提供视频与磁力搜索，搜到即下或边下边播；搜索插件在独立的仓库，应用本身不带任何资源 |
+
+穿插在各版之间：115、迅雷云离线；英文界面；HLS 与文件的只下音频（网页视频已能只下音频）。
 
 ## 技术栈与结构
 
@@ -160,6 +175,7 @@ HLS 输出 MP4 或可直接播放的本地 HLS；磁力链接也能交给你自�
 | 嵌入网页 | [wry](https://github.com/tauri-apps/wry)：macOS 用 WKWebView，Windows 用 WebView2，Linux 用 WebKitGTK |
 | 下载引擎 | [hs-m3u8](https://github.com/x-haose/hs-m3u8) 的核心库（Rust、tokio）；BT 为静态链接的 [libtorrent](https://libtorrent.org) |
 | 合并 MP4 | 静态链接的精简 FFmpeg，只做转封装，不需要另装 |
+| 网页视频 | [yt-dlp](https://github.com/yt-dlp/yt-dlp)：第一次用时下载；它要的 Python（python-build-standalone）与 JavaScript 运行时（QuickJS-NG）随应用带着 |
 | 存储 | SQLite（随应用编译） |
 | 打包 | cargo-packager：dmg、NSIS、deb |
 
@@ -174,6 +190,7 @@ flowchart TD
     core["hs-m3u8-core<br/>HLS 与文件的引擎"]
     torrent["crates/torrent<br/>libtorrent 的绑定"]
     cloud["crates/cloud<br/>网盘（PikPak）的接口"]
+    ytdlp["crates/ytdlp<br/>yt-dlp 组件与解析"]
     desktop --> app
     desktop --> webview
     desktop --> relay
@@ -182,6 +199,7 @@ flowchart TD
     app --> core
     app --> torrent
     app --> cloud
+    app --> ytdlp
     cloud --> core
 ```
 
@@ -196,6 +214,7 @@ WebKitGTK 4.1、GTK 3、xkbcommon 与 fontconfig 的开发包。
 ```sh
 make ffmpeg          # 编译静态链接的精简 FFmpeg（只需一次）
 make libtorrent      # 编译 BT 引擎用的 libtorrent 与 OpenSSL（只需一次，要 CMake、Ninja、Perl）
+make runtime         # 备好随应用带的 Python 与 QuickJS-NG（只需一次）
 cargo run -p hs-dlx  # 运行
 make check           # 全部检查
 make package         # 本机平台的安装包

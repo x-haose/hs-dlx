@@ -71,6 +71,11 @@ jobs:
         with:
           cache-key: ${{ runner.os }}-${{ runner.arch }}
 
+      - name: 随应用带的 Python 与 QuickJS-NG
+        uses: ./.github/actions/runtime
+        with:
+          cache-key: ${{ runner.os }}-${{ runner.arch }}
+
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # cargo-packager 的版本只写在这里。从源码装：它不在 install-action 内置的工具里，那边会退回 cargo-binstall

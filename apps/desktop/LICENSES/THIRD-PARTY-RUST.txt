@@ -76,7 +76,7 @@ color_quant 1.1.0  MIT  https://github.com/image-rs/color_quant.git
 concurrent-queue 2.5.0  Apache-2.0 OR MIT  https://github.com/smol-rs/concurrent-queue
 const-oid 0.10.2  Apache-2.0 OR MIT  https://github.com/RustCrypto/formats
 const-random 0.1.18  MIT OR Apache-2.0  https://github.com/tkaitchuck/constrandom
-cookie 0.18.2  MIT OR Apache-2.0  https://github.com/SergioBenitez/cookie-rs
+cookie 0.18.3  MIT OR Apache-2.0  https://github.com/SergioBenitez/cookie-rs
 cookie_store 0.22.1  MIT OR Apache-2.0  https://github.com/pfernie/cookie_store
 core-foundation 0.10.1  MIT OR Apache-2.0  https://github.com/servo/core-foundation-rs
 core-foundation 0.9.4  MIT OR Apache-2.0  https://github.com/servo/core-foundation-rs
@@ -136,6 +136,7 @@ ffmpeg-next 9.0.0  WTFPL  https://github.com/zmwangx/rust-ffmpeg
 ffmpeg-sys-next 9.0.0  WTFPL  https://github.com/zmwangx/rust-ffmpeg-sys
 field-offset 0.3.6  MIT OR Apache-2.0  https://github.com/Diggsey/rust-field-offset
 filedescriptor 0.8.3  MIT  https://github.com/wezterm/wezterm
+filetime 0.2.30  MIT/Apache-2.0  https://github.com/alexcrichton/filetime
 flate2 1.1.11  MIT OR Apache-2.0  https://github.com/rust-lang/flate2-rs
 float-cmp 0.9.0  MIT  https://github.com/mikedilger/float-cmp
 float-ord 0.3.2  MIT / Apache-2.0  https://github.com/notriddle/rust-float-ord
@@ -150,7 +151,7 @@ fontconfig-parser 0.5.8  MIT  https://github.com/Riey/fontconfig-parser
 fontdb 0.23.0  MIT  https://github.com/RazrFalcon/fontdb
 foreign-types 0.5.0  MIT/Apache-2.0  https://github.com/sfackler/foreign-types
 foreign-types-shared 0.3.1  MIT/Apache-2.0  https://github.com/sfackler/foreign-types
-form_urlencoded 1.2.2  MIT OR Apache-2.0  https://github.com/servo/rust-url
+form_urlencoded 1.2.3  MIT OR Apache-2.0  https://github.com/servo/rust-url
 freetype-sys 0.20.1  MIT  https://github.com/PistonDevelopers/freetype-sys.git
 fs4 1.1.0  MIT OR Apache-2.0  https://github.com/al8n/fs4
 futf 0.1.5  MIT / Apache-2.0  https://github.com/servo/futf
@@ -214,7 +215,7 @@ hashbrown 0.14.5  MIT OR Apache-2.0  https://github.com/rust-lang/hashbrown
 hashbrown 0.16.1  MIT OR Apache-2.0  https://github.com/rust-lang/hashbrown
 hashbrown 0.17.1  MIT OR Apache-2.0  https://github.com/rust-lang/hashbrown
 hashlink 0.12.2  MIT OR Apache-2.0  https://github.com/djc/hashlink
-heapless 0.9.3  MIT OR Apache-2.0  https://github.com/rust-embedded/heapless
+heapless 0.9.4  MIT OR Apache-2.0  https://github.com/rust-embedded/heapless
 hex 0.4.3  MIT OR Apache-2.0  https://github.com/KokaKiwi/rust-hex
 hkdf 0.12.4  MIT OR Apache-2.0  https://github.com/RustCrypto/KDFs/
 hmac 0.12.1  MIT OR Apache-2.0  https://github.com/RustCrypto/MACs
@@ -266,6 +267,10 @@ itertools 0.14.0  MIT OR Apache-2.0  https://github.com/rust-itertools/itertools
 itoa 1.0.18  MIT OR Apache-2.0  https://github.com/dtolnay/itoa
 javascriptcore-rs 1.1.2  MIT  https://github.com/tauri-apps/javascriptcore-rs
 javascriptcore-rs-sys 1.1.1  MIT  https://github.com/tauri-apps/javascriptcore-rs
+jiff 1.0.0  Unlicense OR MIT  https://github.com/BurntSushi/jiff
+jiff-core 1.0.0  Unlicense OR MIT  https://github.com/BurntSushi/jiff
+jiff-tzdb 1.0.0  Unlicense OR MIT  https://github.com/BurntSushi/jiff
+jiff-tzdb-platform 1.0.0  Unlicense OR MIT  https://github.com/BurntSushi/jiff
 keyboard-types 0.8.3  MIT OR Apache-2.0  https://github.com/rust-windowing/keyboard-types
 khronos-egl 6.0.0  MIT/Apache-2.0  https://github.com/timothee-haudebourg/khronos-egl
 ksni 0.3.7  Unlicense  https://github.com/iovxw/ksni
@@ -431,6 +436,7 @@ rustls-pki-types 1.15.1  MIT OR Apache-2.0  https://github.com/rustls/pki-types
 rustls-platform-verifier 0.7.1  MIT OR Apache-2.0  https://github.com/rustls/rustls-platform-verifier
 rustls-webpki 0.103.16  ISC  https://github.com/rustls/webpki
 rustybuzz 0.20.1  MIT  https://github.com/harfbuzz/rustybuzz
+ruzstd 0.9.1  MIT  https://github.com/KillingSpark/zstd-rs
 ryu 1.0.23  Apache-2.0 OR BSL-1.0  https://github.com/dtolnay/ryu
 same-file 1.0.6  Unlicense/MIT  https://github.com/BurntSushi/same-file
 schemars 1.2.3  MIT  https://github.com/GREsau/schemars
@@ -449,7 +455,7 @@ serde_urlencoded 0.7.1  MIT/Apache-2.0  https://github.com/nox/serde_urlencoded
 sha1 0.11.0  MIT OR Apache-2.0  https://github.com/RustCrypto/hashes
 sha1_smol 1.0.1  BSD-3-Clause  https://github.com/mitsuhiko/sha1-smol
 sha2 0.10.9  MIT OR Apache-2.0  https://github.com/RustCrypto/hashes
-sha2 0.11.0  MIT OR Apache-2.0  https://github.com/RustCrypto/hashes
+sha2 0.11.1  MIT OR Apache-2.0  https://github.com/RustCrypto/hashes
 signal-hook-registry 1.4.8  MIT OR Apache-2.0  https://github.com/vorner/signal-hook
 simd-adler32 0.3.10  MIT  https://github.com/mcountryman/simd-adler32
 simdutf8 0.1.5  MIT OR Apache-2.0  https://github.com/rusticstuff/simdutf8
@@ -486,6 +492,7 @@ sys-locale 0.3.2  MIT OR Apache-2.0  https://github.com/1Password/sys-locale
 system-configuration 0.7.0  MIT OR Apache-2.0  https://github.com/mullvad/system-configuration-rs
 system-configuration-sys 0.6.0  MIT OR Apache-2.0  https://github.com/mullvad/system-configuration-rs
 taffy 0.15.1  MIT  https://github.com/DioxusLabs/taffy
+tar 0.4.46  MIT OR Apache-2.0  https://github.com/composefs/tar-rs
 target-features 0.1.6  MIT OR Apache-2.0  https://github.com/calebzulawski/target-features
 task-local 0.1.1  MIT OR Apache-2.0  https://github.com/BugenZhao/task-local
 tendril 0.4.3  MIT/Apache-2.0  https://github.com/servo/tendril
@@ -512,6 +519,7 @@ tray-icon 0.26.1  MIT OR Apache-2.0  https://github.com/tauri-apps/tray-icon
 triomphe 0.1.17  MIT OR Apache-2.0  https://github.com/Manishearth/triomphe
 try-lock 0.2.5  MIT  https://github.com/seanmonstar/try-lock
 ttf-parser 0.25.1  MIT OR Apache-2.0  https://github.com/harfbuzz/ttf-parser
+twox-hash 2.1.5  MIT  https://github.com/shepmaster/twox-hash
 typenum 1.20.1  MIT OR Apache-2.0  https://github.com/paholg/typenum
 unicode-bidi 0.3.18  MIT OR Apache-2.0  https://github.com/servo/unicode-bidi
 unicode-bidi-mirroring 0.4.0  MIT/Apache-2.0  https://github.com/RazrFalcon/unicode-bidi-mirroring
@@ -525,7 +533,7 @@ unicode-segmentation 1.13.3  MIT OR Apache-2.0  https://github.com/unicode-rs/un
 unicode-vo 0.1.0  MIT/Apache-2.0  https://github.com/RazrFalcon/unicode-vo
 unicode-width 0.2.2  MIT OR Apache-2.0  https://github.com/unicode-rs/unicode-width
 untrusted 0.9.0  ISC  https://github.com/briansmith/untrusted
-url 2.5.8  MIT OR Apache-2.0  https://github.com/servo/rust-url
+url 2.5.9  MIT OR Apache-2.0  https://github.com/servo/rust-url
 usvg 0.45.1  Apache-2.0 OR MIT  https://github.com/linebender/resvg
 usvg 0.46.0  Apache-2.0 OR MIT  https://github.com/linebender/resvg
 utf-8 0.7.6  MIT OR Apache-2.0  https://github.com/SimonSapin/rust-utf8
@@ -563,27 +571,18 @@ windows-collections 0.3.2  MIT OR Apache-2.0  https://github.com/microsoft/windo
 windows-core 0.58.0  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-core 0.62.2  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-future 0.3.2  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
-windows-link 0.1.3  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-link 0.2.1  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-numerics 0.3.1  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
-windows-registry 0.4.0  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-registry 0.6.1  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-result 0.2.0  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
-windows-result 0.3.4  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-result 0.4.1  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-strings 0.1.0  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
-windows-strings 0.3.1  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-strings 0.5.1  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
-windows-sys 0.48.0  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-sys 0.61.2  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
-windows-targets 0.48.5  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-targets 0.52.6  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
-windows-targets 0.53.5  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-threading 0.2.1  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows-version 0.1.7  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
-windows_x86_64_msvc 0.48.5  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 windows_x86_64_msvc 0.52.6  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
-windows_x86_64_msvc 0.53.1  MIT OR Apache-2.0  https://github.com/microsoft/windows-rs
 winnow 1.0.4  MIT  https://github.com/winnow-rs/winnow
 writeable 0.6.4  Unicode-3.0  https://github.com/unicode-org/icu4x
 wry 0.57.2  Apache-2.0 OR MIT  https://github.com/tauri-apps/wry
@@ -1017,9 +1016,10 @@ euclid 0.22.14：LICENSE-APACHE
 event-listener 5.4.2：LICENSE-APACHE
 event-listener-strategy 0.5.4：LICENSE-APACHE
 fastrand 2.5.0：LICENSE-APACHE
+filetime 0.2.30：LICENSE-APACHE
 flate2 1.1.11：LICENSE-APACHE
 fnv 1.0.7：LICENSE-APACHE
-form_urlencoded 1.2.2：LICENSE-APACHE
+form_urlencoded 1.2.3：LICENSE-APACHE
 fs4 1.1.0：LICENSE-APACHE
 futf 0.1.5：LICENSE-APACHE
 futures-lite 2.6.1：LICENSE-APACHE
@@ -1032,7 +1032,7 @@ hash32 0.3.1：LICENSE-APACHE
 hashbrown 0.14.5：LICENSE-APACHE
 hashbrown 0.16.1：LICENSE-APACHE
 hashbrown 0.17.1：LICENSE-APACHE
-heapless 0.9.3：LICENSE-APACHE
+heapless 0.9.4：LICENSE-APACHE
 html5ever 0.27.0：LICENSE-APACHE
 httparse 1.10.1：LICENSE-APACHE
 hyper-rustls 0.27.10：LICENSE-APACHE
@@ -1109,6 +1109,7 @@ svgtypes 0.16.2：LICENSE-APACHE
 swash 0.2.10：LICENSE-APACHE
 system-configuration 0.7.0：LICENSE-APACHE
 system-configuration-sys 0.6.0：LICENSE-APACHE
+tar 0.4.46：LICENSE-APACHE
 tendril 0.4.3：LICENSE-APACHE
 tray-icon 0.26.1：LICENSE-APACHE
 ttf-parser 0.25.1：LICENSE-APACHE
@@ -1120,7 +1121,7 @@ unicode-properties 0.1.5：LICENSE-APACHE
 unicode-segmentation 1.13.3：LICENSE-APACHE
 unicode-vo 0.1.0：LICENSE-APACHE
 unicode-width 0.2.2：LICENSE-APACHE
-url 2.5.8：LICENSE-APACHE
+url 2.5.9：LICENSE-APACHE
 uuid 1.29.2：LICENSE-APACHE
 waker-fn 1.2.0：LICENSE-APACHE
 weezl 0.1.12：LICENSE-APACHE
@@ -1615,7 +1616,7 @@ md-5 0.11.0：LICENSE-APACHE
 pbkdf2 0.12.2：LICENSE-APACHE
 sha1 0.11.0：LICENSE-APACHE
 sha2 0.10.9：LICENSE-APACHE
-sha2 0.11.0：LICENSE-APACHE
+sha2 0.11.1：LICENSE-APACHE
 --------------------------------------------------------------------------------
 
                               Apache License
@@ -1915,6 +1916,10 @@ DEALINGS IN THE SOFTWARE.
 aho-corasick 1.1.5：COPYING
 byteorder 1.5.0：COPYING
 globset 0.4.21：COPYING
+jiff 1.0.0：COPYING
+jiff-core 1.0.0：COPYING
+jiff-tzdb 1.0.0：COPYING
+jiff-tzdb-platform 1.0.0：COPYING
 memchr 2.8.3：COPYING
 same-file 1.0.6：COPYING
 walkdir 2.5.0：COPYING
@@ -1930,6 +1935,10 @@ aho-corasick 1.1.5：LICENSE-MIT
 byteorder 1.5.0：LICENSE-MIT
 byteorder-lite 0.1.0：LICENSE-MIT
 globset 0.4.21：LICENSE-MIT
+jiff 1.0.0：LICENSE-MIT
+jiff-core 1.0.0：LICENSE-MIT
+jiff-tzdb 1.0.0：LICENSE-MIT
+jiff-tzdb-platform 1.0.0：LICENSE-MIT
 memchr 2.8.3：LICENSE-MIT
 walkdir 2.5.0：LICENSE-MIT
 --------------------------------------------------------------------------------
@@ -1961,6 +1970,10 @@ aho-corasick 1.1.5：UNLICENSE
 byteorder 1.5.0：UNLICENSE
 byteorder-lite 0.1.0：UNLICENSE
 globset 0.4.21：UNLICENSE
+jiff 1.0.0：UNLICENSE
+jiff-core 1.0.0：UNLICENSE
+jiff-tzdb 1.0.0：UNLICENSE
+jiff-tzdb-platform 1.0.0：UNLICENSE
 ksni 0.3.7：UNLICENSE
 memchr 2.8.3：UNLICENSE
 same-file 1.0.6：UNLICENSE
@@ -3570,6 +3583,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 --------------------------------------------------------------------------------
 backtrace 0.3.77：LICENSE-MIT
 cfg-if 1.0.5：LICENSE-MIT
+filetime 0.2.30：LICENSE-MIT
 openssl-probe 0.2.1：LICENSE-MIT
 rustc-demangle 0.1.28：LICENSE-MIT
 scoped-tls 1.0.1：LICENSE-MIT
@@ -5249,7 +5263,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 --------------------------------------------------------------------------------
-cookie 0.18.2：LICENSE-APACHE
+cookie 0.18.3：LICENSE-APACHE
 --------------------------------------------------------------------------------
 
                               Apache License
@@ -5456,7 +5470,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 --------------------------------------------------------------------------------
-cookie 0.18.2：LICENSE-MIT
+cookie 0.18.3：LICENSE-MIT
 --------------------------------------------------------------------------------
 
 Copyright (c) 2017 Sergio Benitez
@@ -6853,7 +6867,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 data-url 0.3.2：LICENSE-MIT
 idna 1.1.0：LICENSE-MIT
 percent-encoding 2.3.2：LICENSE-MIT
-url 2.5.8：LICENSE-MIT
+url 2.5.9：LICENSE-MIT
 --------------------------------------------------------------------------------
 
 Copyright (c) 2013-2025 The rust-url developers
@@ -9262,7 +9276,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 --------------------------------------------------------------------------------
-form_urlencoded 1.2.2：LICENSE-MIT
+form_urlencoded 1.2.3：LICENSE-MIT
 --------------------------------------------------------------------------------
 
 Copyright (c) 2013-2016 The rust-url developers
@@ -11050,7 +11064,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 --------------------------------------------------------------------------------
-heapless 0.9.3：LICENSE-MIT
+heapless 0.9.4：LICENSE-MIT
 --------------------------------------------------------------------------------
 
 Copyright (c) 2017 Jorge Aparicio
@@ -13767,7 +13781,7 @@ DEALINGS IN THE SOFTWARE.
 --------------------------------------------------------------------------------
 md-5 0.11.0：LICENSE-MIT
 sha1 0.11.0：LICENSE-MIT
-sha2 0.11.0：LICENSE-MIT
+sha2 0.11.1：LICENSE-MIT
 --------------------------------------------------------------------------------
 
 Copyright (c) 2016-2026 The RustCrypto Project Developers
@@ -18188,6 +18202,32 @@ The files under third-party/chromium are licensed as described in
 third-party/chromium/LICENSE.
 
 --------------------------------------------------------------------------------
+ruzstd 0.9.1：LICENSE
+--------------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2019 Moritz Borcherding
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+--------------------------------------------------------------------------------
 ryu 1.0.23：LICENSE-BOOST
 --------------------------------------------------------------------------------
 
@@ -19303,6 +19343,36 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 --------------------------------------------------------------------------------
+tar 0.4.46：LICENSE-MIT
+--------------------------------------------------------------------------------
+
+Copyright (c) The tar-rs Project Contributors
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+--------------------------------------------------------------------------------
 target-features 0.1.6：LICENSE-MIT
 --------------------------------------------------------------------------------
 
@@ -20129,6 +20199,32 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+
+--------------------------------------------------------------------------------
+twox-hash 2.1.5：LICENSE.txt
+--------------------------------------------------------------------------------
+
+The MIT License (MIT)
+
+Copyright (c) 2015 Jake Goulding
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 --------------------------------------------------------------------------------
 typenum 1.20.1：LICENSE
@@ -21204,27 +21300,18 @@ windows-collections 0.3.2：license-apache-2.0
 windows-core 0.58.0：license-apache-2.0
 windows-core 0.62.2：license-apache-2.0
 windows-future 0.3.2：license-apache-2.0
-windows-link 0.1.3：license-apache-2.0
 windows-link 0.2.1：license-apache-2.0
 windows-numerics 0.3.1：license-apache-2.0
-windows-registry 0.4.0：license-apache-2.0
 windows-registry 0.6.1：license-apache-2.0
 windows-result 0.2.0：license-apache-2.0
-windows-result 0.3.4：license-apache-2.0
 windows-result 0.4.1：license-apache-2.0
 windows-strings 0.1.0：license-apache-2.0
-windows-strings 0.3.1：license-apache-2.0
 windows-strings 0.5.1：license-apache-2.0
-windows-sys 0.48.0：license-apache-2.0
 windows-sys 0.61.2：license-apache-2.0
-windows-targets 0.48.5：license-apache-2.0
 windows-targets 0.52.6：license-apache-2.0
-windows-targets 0.53.5：license-apache-2.0
 windows-threading 0.2.1：license-apache-2.0
 windows-version 0.1.7：license-apache-2.0
-windows_x86_64_msvc 0.48.5：license-apache-2.0
 windows_x86_64_msvc 0.52.6：license-apache-2.0
-windows_x86_64_msvc 0.53.1：license-apache-2.0
 --------------------------------------------------------------------------------
 
                                  Apache License
@@ -21436,27 +21523,18 @@ windows-collections 0.3.2：license-mit
 windows-core 0.58.0：license-mit
 windows-core 0.62.2：license-mit
 windows-future 0.3.2：license-mit
-windows-link 0.1.3：license-mit
 windows-link 0.2.1：license-mit
 windows-numerics 0.3.1：license-mit
-windows-registry 0.4.0：license-mit
 windows-registry 0.6.1：license-mit
 windows-result 0.2.0：license-mit
-windows-result 0.3.4：license-mit
 windows-result 0.4.1：license-mit
 windows-strings 0.1.0：license-mit
-windows-strings 0.3.1：license-mit
 windows-strings 0.5.1：license-mit
-windows-sys 0.48.0：license-mit
 windows-sys 0.61.2：license-mit
-windows-targets 0.48.5：license-mit
 windows-targets 0.52.6：license-mit
-windows-targets 0.53.5：license-mit
 windows-threading 0.2.1：license-mit
 windows-version 0.1.7：license-mit
-windows_x86_64_msvc 0.48.5：license-mit
 windows_x86_64_msvc 0.52.6：license-mit
-windows_x86_64_msvc 0.53.1：license-mit
 --------------------------------------------------------------------------------
 
     MIT License

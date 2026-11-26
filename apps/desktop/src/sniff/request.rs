@@ -53,12 +53,11 @@ pub fn headers_for(stream: &Stream, cookies: &[Cookie]) -> Result<Headers, Strin
         .iter()
         .filter(|cookie| same_site || cookie.cross_site)
         .filter_map(|cookie| {
-            let pair = format!("{}={}", cookie.name, cookie.value);
-            let fits = !cookie.name.is_empty() && check_option_header("Cookie", &pair).is_ok();
-            if !fits {
+            let pair = pair(cookie);
+            if pair.is_none() {
                 skipped += 1;
             }
-            fits.then_some(pair)
+            pair
         })
         .collect();
     if !pairs.is_empty() {
@@ -68,6 +67,23 @@ pub fn headers_for(stream: &Stream, cookies: &[Cookie]) -> Result<Headers, Strin
         check_option_header(name, value)?;
     }
     Ok(Headers { headers, skipped })
+}
+
+/// 一条 Cookie 在 Cookie 请求头里的 `名=值`；名为空或不合请求头要求的为 None。
+fn pair(cookie: &Cookie) -> Option<String> {
+    let pair = format!("{}={}", cookie.name, cookie.value);
+    (!cookie.name.is_empty() && check_option_header("Cookie", &pair).is_ok()).then_some(pair)
+}
+
+/// 网页视频解析带的 Cookie 请求头（发往网页的 `cookies`，见 [`cookies_for`](hs_dlx_webview::cookies::cookies_for)）：
+/// 合请求头要求、没有制表符（yt-dlp 的 cookies.txt 以它分列）的；一条都没有时为 None。
+pub fn cookie_header(cookies: &[Cookie]) -> Option<(String, String)> {
+    let pairs: Vec<String> = cookies
+        .iter()
+        .filter_map(pair)
+        .filter(|pair| !pair.contains('\t'))
+        .collect();
+    (!pairs.is_empty()).then(|| ("Cookie".to_owned(), pairs.join("; ")))
 }
 
 /// `a` 与 `b` 同一站点：协议相同、可注册域名（按公共后缀列表）相同；IP 地址与列表里认不出的主机按整个主机比。
@@ -117,6 +133,18 @@ mod tests {
             cookie("", "1", true),
             cookie("bad", "a\u{1}b", true),
         ]
+    }
+
+    /// 网页视频的 Cookie 请求头：不论同站与否都带，没名字的、有控制字符或制表符的不带；一条都没有时没有这个头。
+    #[test]
+    fn the_web_cookie_header_keeps_only_writable_pairs() {
+        let mut all = cookies();
+        all.push(cookie("tab", "a\tb", false));
+        assert_eq!(
+            cookie_header(&all),
+            Some(("Cookie".to_owned(), "sid=1; cdn=1".to_owned()))
+        );
+        assert_eq!(cookie_header(&[cookie("", "1", false)]), None);
     }
 
     #[test]
