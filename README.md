@@ -58,7 +58,8 @@ libtorrent。接下来会加入更多网盘、边下边播，见[路线图](#路
 安装包没有代码签名，第一次打开时：
 
 - **macOS**：提示「已损坏」或「无法验证开发者」时，把应用拖进「应用程序」后执行
-  `xattr -dr com.apple.quarantine /Applications/hs-dlx.app`。
+  `xattr -dr com.apple.quarantine /Applications/hs-dlx.app`。网页视频要从浏览器读登录信息时，要在「系统设置 → 隐私与
+  安全性 → 完全磁盘访问权限」里打开 hs-dlx；没有签名，每次更新后要在那里重新打开一次。
 - **Windows**：SmartScreen 拦下时点「更多信息 → 仍要运行」。
 - **Linux**：`sudo apt install ./hs-dlx_<版本>_amd64.deb`。托盘图标走 StatusNotifierItem，纯 GNOME 要装
   AppIndicator 扩展才显示。
@@ -225,9 +226,11 @@ make package         # 本机平台的安装包
 ## 使用须知
 
 请只下载你有权下载的内容，并遵守所在地的法律与网站的服务条款。hs-dlx 不提供任何资源，也不内置资源搜索。云离线以第三方
-客户端的方式接入（用 PikPak 安卓客户端的公开参数调它的接口），用的是你自己的账号，与这些服务没有关联。
+客户端的方式接入（用 PikPak 安卓客户端的公开参数调它的接口），用的是你自己的账号，与这些服务没有关联。网页视频的解析器
+yt-dlp 在第一次用时从 PyPI 下载，不随安装包分发；用自己的账号（浏览器的登录信息）下载 YouTube 等网站的视频，账号可能被
+暂时或永久封禁。
 
 ## 许可证
 
-[MIT](LICENSE)。安装包里静态链接与随带的第三方软件（含 LGPL-2.1 的 FFmpeg）的声明见
+[MIT](LICENSE)。安装包里静态链接与随带的第三方软件（含 LGPL-2.1 的 FFmpeg、网页视频用的 Python 与 QuickJS-NG）的声明见
 [apps/desktop/LICENSES](apps/desktop/LICENSES)，装好后在设置页的「第三方声明」里也能打开。

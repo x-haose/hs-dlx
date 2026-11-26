@@ -80,6 +80,12 @@ jobs:
       # Windows 的 make 只在 MSYS2 里，而 MSYS2 的 link.exe 会遮住 MSVC 的链接器，所以直接运行与 Makefile 的
       # rs_fmt、rs_clippy、rs_doc、rs_test 相同的命令。每条命令单独一步：PowerShell 里一步跑几条命令时，只有最后一条的
       # 退出码算数
+      # 同 Makefile 里 rs_clippy、rs_doc、rs_test 经 runtime_present 依赖的 py_env：yt-dlp 的测试要项目的 .venv。上面
+      # 「随应用带的运行时」只在缓存没命中时才建它，不能指望
+      - name: Python 环境（Windows）
+        if: runner.os == 'Windows'
+        run: uv sync --locked
+
       - name: 格式（Windows）
         if: runner.os == 'Windows'
         run: cargo fmt --all --check
