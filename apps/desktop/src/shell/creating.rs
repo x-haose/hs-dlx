@@ -1,10 +1,10 @@
 //! 新建：探测链接、开新建视图、新建任务（在 [`crate::tasks::Tasks`] 里）并把结果交回发起它的视图。
 
 use gpui_kit::{AppContext as _, Context, Entity, Window};
-use hs_dlx_app::Draft;
+use hs_dlx_app::{Draft, PageHint};
 use hs_m3u8_core::Url;
 
-use super::{Page, Shell};
+use super::{Page, PageCheck, Shell};
 use crate::links;
 use crate::new_task::{Link, NewTask, NewTaskEvent, Phase};
 use crate::sniff::{SniffEvent, SniffView, Verdict};
@@ -15,7 +15,7 @@ impl Shell {
         let request = match links::request(text) {
             Ok(request) => request,
             Err(reason) => {
-                // 嗅探页与设置页不放粘贴栏（转交来的内容可能在这时到）：关上设置回到原来那一页，是嗅探页时再回任务页，
+                // 嗅探页与设置页不放粘贴栏（转交来的内容可能在这时到）：关上设置露出主体的页，是嗅探页时再回任务页，
                 // 原因才看得见
                 self.close_settings(cx);
                 if matches!(self.page, Page::Sniff(_)) {
@@ -54,6 +54,8 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 粘贴的、转交来的、嗅探页里点的：都是用户要看的，设置开着时关上
+        self.close_settings(cx);
         let (tasks, dock) = (self.tasks.clone(), self.dock.clone());
         let view = cx.new(|cx| NewTask::new(tasks, link, from_sniff, dock, window, cx));
         let subscription = cx.subscribe_in(
@@ -79,7 +81,7 @@ impl Shell {
                         }
                     }
                     NewTaskEvent::Ready => this.focus_new_task(view, window, cx),
-                    NewTaskEvent::MaybePage => this.check_page(view, window, cx),
+                    NewTaskEvent::MaybePage(hint) => this.check_page(view, *hint, window, cx),
                     NewTaskEvent::Sniff(url) => this.open_sniff(url.clone(), window, cx),
                     // 同一个种子不能有两个任务：换到已有的那个，说一声（新建页随之关掉）；新建页在设置后面时不打断设置，
                     // 它上面写着原因
@@ -135,8 +137,8 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // 在设置页后面探测好的不抢焦点（用户在设置里打字）
-        if self.new_task() != Some(view) {
+        // 在设置后面探测好的不抢焦点（用户在设置里打字）
+        if self.settings.is_some() || self.new_task() != Some(view) {
             return;
         }
         let dock = self.dock.read(cx);
@@ -147,17 +149,23 @@ impl Shell {
         }
     }
 
-    /// 新建页 `view` 第一次探测的结果说明地址可能是网页（取到的不是播放列表，或被人机验证拒了）：粘贴来的、地址也不像
-    /// 播放列表的，在后台的网页里打开它，网页引擎
-    /// 认出是网页就换到嗅探页找视频流（见 [`Shell::checked_page`]）；从嗅探页来的流、像播放列表的地址照常显示失败。
-    fn check_page(&mut self, view: &Entity<NewTask>, window: &mut Window, cx: &mut Context<Self>) {
+    /// 新建页 `view` 第一次探测的结果说明地址可能是网页（缘由 `hint`）：粘贴来的、地址也不像播放列表的，在后台的网页
+    /// 里打开它，认出是网页就换到嗅探页找视频流（见 [`Shell::checked_page`]）；从嗅探页来的流、像播放列表的地址照常
+    /// 显示失败。
+    fn check_page(
+        &mut self,
+        view: &Entity<NewTask>,
+        hint: PageHint,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let url = view.read(cx).url().clone();
         let Page::NewTask {
             view: shown,
             from_sniff: false,
             page_check,
             ..
-        } = super::underlying(&mut self.page)
+        } = &mut self.page
         else {
             return;
         };
@@ -175,14 +183,19 @@ impl Shell {
                 }
             },
         );
-        *page_check = Some((sniff.clone(), subscription));
+        *page_check = Some(PageCheck {
+            sniff: sniff.clone(),
+            _subscription: subscription,
+            hint,
+        });
         view.update(cx, |view, cx| view.opening_page(cx));
         // 建不出网页时一开始就有结论
         self.checked_page(&sniff, window, cx);
     }
 
-    /// 后台的网页 `sniff` 有了是不是网页的结论：是网页就换到嗅探页，否则在新建页的失败下面写明。新建页已换走、或用户
-    /// 已改了请求头重新探测的，不再需要它。
+    /// 后台的网页 `sniff` 有了是不是网页的结论：是网页就换到嗅探页，否则在新建页的失败下面写明。被拒（403、503）的
+    /// 要网页也是人机验证页才算：网站拒绝的地址（防盗链的直链、过期的地址）网页引擎打开也是一张 HTML 的错误页，换到
+    /// 嗅探页会丢掉新建页（和它上面改请求头重新探测）。新建页已换走、或用户已改了请求头重新探测的，不再需要它。
     fn checked_page(
         &mut self,
         sniff: &Entity<SniffView>,
@@ -191,22 +204,27 @@ impl Shell {
     ) {
         let Page::NewTask {
             view, page_check, ..
-        } = super::underlying(&mut self.page)
+        } = &mut self.page
         else {
             return;
         };
-        if page_check
+        let Some(hint) = page_check
             .as_ref()
-            .is_none_or(|(checked, _)| checked != sniff)
-        {
+            .filter(|check| check.sniff == *sniff)
+            .map(|check| check.hint)
+        else {
             return;
-        }
+        };
         if !view.read(cx).is_opening_page() {
             *page_check = None;
             return;
         }
-        let note = match sniff.read(cx).verdict() {
+        let sniff_now = sniff.read(cx);
+        let note = match sniff_now.verdict() {
             Verdict::Pending => return,
+            Verdict::Page if hint == PageHint::Refused && !sniff_now.challenge() => {
+                Some("网页引擎打开它也被拒了，不是人机验证".to_owned())
+            }
             Verdict::Page => None,
             Verdict::NotPage(Some(kind)) => Some(format!("网页引擎打开它是 {kind}，不是网页")),
             Verdict::NotPage(None) => Some("网页引擎打开它也不是网页".to_owned()),
@@ -315,7 +333,7 @@ impl Shell {
                 cx.notify();
             },
         );
-        self.sniff = Some((view.clone(), subscription));
-        self.show_under(Page::Sniff(view), cx);
+        self.sniff = Some((view, subscription));
+        self.show_sniff(cx);
     }
 }

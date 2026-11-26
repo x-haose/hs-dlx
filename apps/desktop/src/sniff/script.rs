@@ -15,9 +15,9 @@ use crate::links::http_url;
 /// - 播放列表：fetch 与 XHR 的响应类型是 HLS 播放列表（`application/vnd.apple.mpegurl` 之类）的，与地址路径以
 ///   `.m3u8` 结尾的请求（含资源加载记录与 video、source 元素上的），每个地址只报一次。
 /// - 文档类型：顶层框架在文档建出时报一次 `document.contentType`，正文就绪（DOMContentLoaded）时再报一次正文是否以
-///   `#EXTM3U` 开头（按网页类型发来的播放列表）。
-/// - 人机验证：顶层框架每秒看一次是不是整页的人机验证（Cloudflare 的验证页，页面里有它的 `_cf_chl_opt`），变了才报。
-///   页面里嵌的验证框（登录框旁隐形的 reCAPTCHA 之类）不算：不该为它把网页弹出来。
+///   `#EXTM3U` 开头（按网页类型发来的播放列表）、是不是整页的人机验证。人机验证只认 Cloudflare 的验证页（页面脚本
+///   定义了它的 `_cf_chl_opt`）；过了验证即换成新文档，新文档再报一次。页面里嵌的验证框（登录框旁隐形的 reCAPTCHA
+///   之类）不算：不该为它把网页弹出来。
 /// - 发回 JSON（见 [`Report`]）。发送出的任何错都不抛进页面：脚本改写了页面的 fetch 与 XHR，抛出的异常会成为页面
 ///   自己的请求失败。
 pub const SCRIPT: &str = r#"
@@ -35,17 +35,14 @@ pub const SCRIPT: &str = r#"
     send({ kind: 'document', type: document.contentType });
     var content = function () {
       var text = document.body ? document.body.textContent : '';
-      send({ kind: 'content', playlist: /^\s*#EXTM3U/.test(text.slice(0, 64)) });
+      send({
+        kind: 'content',
+        playlist: /^\s*#EXTM3U/.test(text.slice(0, 64)),
+        challenge: typeof window._cf_chl_opt !== 'undefined'
+      });
     };
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', content);
     else content();
-    var challenged = null;
-    setInterval(function () {
-      var now = typeof window._cf_chl_opt !== 'undefined';
-      if (now === challenged) return;
-      challenged = now;
-      send({ kind: 'challenge', active: now });
-    }, 1000);
   }
   var playlist = /^\s*(application\/(vnd\.apple\.mpegurl|x-mpegurl)|audio\/(x-)?mpegurl)\s*(;|$)/i;
   var named = function (raw) {
@@ -109,10 +106,8 @@ pub enum Report {
     Stream { url: Url, agent: String },
     /// 顶层文档的类型（MIME，如 `text/html`）
     Document { content_type: String },
-    /// 顶层文档的正文就绪：`playlist` 为正文以 `#EXTM3U` 开头
-    Content { playlist: bool },
-    /// 顶层是不是整页的人机验证（`active`），变了才报
-    Challenge { active: bool },
+    /// 顶层文档的正文就绪：`playlist` 为正文以 `#EXTM3U` 开头，`challenge` 为这一页是整页的人机验证
+    Content { playlist: bool, challenge: bool },
 }
 
 /// 消息的原样内容，未校验。
@@ -129,9 +124,7 @@ enum Raw {
     },
     Content {
         playlist: bool,
-    },
-    Challenge {
-        active: bool,
+        challenge: bool,
     },
 }
 
@@ -148,8 +141,13 @@ pub fn parse(message: &str) -> Option<Report> {
         Raw::Document { content_type } => Report::Document {
             content_type: clip(&content_type),
         },
-        Raw::Content { playlist } => Report::Content { playlist },
-        Raw::Challenge { active } => Report::Challenge { active },
+        Raw::Content {
+            playlist,
+            challenge,
+        } => Report::Content {
+            playlist,
+            challenge,
+        },
     })
 }
 
@@ -183,13 +181,13 @@ mod tests {
             })
         );
         assert_eq!(
-            parse(r#"{"kind":"content","playlist":true}"#),
-            Some(Report::Content { playlist: true })
+            parse(r#"{"kind":"content","playlist":true,"challenge":false}"#),
+            Some(Report::Content {
+                playlist: true,
+                challenge: false
+            })
         );
-        assert_eq!(
-            parse(r#"{"kind":"challenge","active":true}"#),
-            Some(Report::Challenge { active: true })
-        );
+        assert_eq!(parse(r#"{"kind":"content","playlist":true}"#), None);
         // 不是 http(s)、认不出的种类、太长的都不要
         assert_eq!(
             parse(r#"{"kind":"stream","url":"javascript:alert(1)","agent":""}"#),

@@ -7,7 +7,7 @@ use gpui_kit::{
 };
 use hs_dlx_app::web::{AudioCodec, Choice, Container, VideoCodec, no_choice_reason};
 use hs_dlx_app::ytdlp::{ExtractError, Live};
-use hs_dlx_app::{Failure, FailureKind, Resolved, WebState};
+use hs_dlx_app::{Failure, FailureKind, PageHint, Resolved, WebState};
 
 use super::{NewTask, NewTaskEvent, Probing};
 use crate::dial;
@@ -147,7 +147,7 @@ impl NewTask {
             message: "地址回的是网页，不是视频流或文件".to_owned(),
         });
         if first {
-            cx.emit(NewTaskEvent::MaybePage);
+            cx.emit(NewTaskEvent::MaybePage(PageHint::NotAPlaylist));
         }
         cx.notify();
     }

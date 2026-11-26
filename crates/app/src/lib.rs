@@ -22,7 +22,7 @@ pub mod web;
 
 pub use diagnosis::{Check, CheckItem, CheckLevel};
 pub use error::Error;
-pub use failure::{Failure, FailureKind, maybe_a_page};
+pub use failure::{Failure, FailureKind, PageHint, page_hint};
 /// PikPak 的接口（登录、进度阶段、接口地址等界面要用的类型）。
 pub use hs_dlx_cloud::pikpak;
 pub use hs_dlx_ytdlp as ytdlp;
@@ -42,7 +42,7 @@ pub use task::{
 };
 pub use torrent::{
     MetadataProgress, SavedTorrent, SeedEnd, TorrentFile, TorrentInfo, TorrentNetwork,
-    TorrentPhase, TorrentProgress, torrent_from_file,
+    TorrentPhase, TorrentProgress,
 };
 pub use update::{
     INSTALLED_BEFORE_RESTART, Package, Release, Restart, UpdateFeed, Version,

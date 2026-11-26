@@ -894,12 +894,7 @@ impl Service {
     pub fn fetch_metadata(&self, uri: String) -> Result<MetadataFetch, Error> {
         let id = hs_dlx_torrent::magnet_id(&uri)
             .map_err(|error| Error::Torrent(format!("加不进磁力链接：{error}")))?;
-        let taken = self
-            .shared
-            .write(|tx| store::task_with_torrent(tx, &id.to_string()))?;
-        if let Some(existing) = taken {
-            return Err(Error::TorrentTaken(existing));
-        }
+        torrent_free(&self.shared, id.as_str())?;
         let engine = self.shared.bt_engine()?;
         let (progress, receiver) = watch::channel(MetadataProgress::default());
         let probe_dir = self.shared.bt.probe_dir().to_path_buf();
@@ -917,6 +912,28 @@ impl Service {
                 task: AbortOnDropHandle::new(handle),
                 slot,
             },
+        })
+    }
+
+    /// 读种子文件（bencode 写的内容 `torrent`）：结果为续传数据（供新建任务，[`DraftKind::Torrent`]）与其中的种子信息。
+    /// 不是种子文件时报 [`Error::InvalidInput`]，这个种子已在任务里（不论在下、做种还是停着）时报
+    /// [`Error::TorrentTaken`]。返回的句柄在任何执行器上都可等待。
+    pub fn open_torrent_file(
+        &self,
+        torrent: Vec<u8>,
+    ) -> JoinHandle<Result<(Vec<u8>, TorrentInfo), Error>> {
+        let shared = self.shared.clone();
+        self.runtime().spawn(async move {
+            // 大种子有几 MB，在阻塞线程上解析
+            let (resume, info) = tokio::task::spawn_blocking(move || {
+                let resume = torrent::torrent_from_file(&torrent)?;
+                let info = TorrentInfo::of(&resume)?;
+                Ok::<_, Error>((resume, info))
+            })
+            .await
+            .expect("解析种子文件不会 panic，运行时关闭时本任务也一起丢弃")?;
+            torrent_free(&shared, &info.info_hash)?;
+            Ok((resume, info))
         })
     }
 
@@ -2459,6 +2476,14 @@ impl Shared {
             }
             shared.announce(id, ending, leftovers, guard, saved);
         });
+    }
+}
+
+/// 种子 `info_hash`（[`hs_dlx_torrent::TorrentId`] 的写法）不在任何任务里；在时报 [`Error::TorrentTaken`]。
+fn torrent_free(shared: &Shared, info_hash: &str) -> Result<(), Error> {
+    match shared.write(|tx| store::task_with_torrent(tx, info_hash))? {
+        Some(existing) => Err(Error::TorrentTaken(existing)),
+        None => Ok(()),
     }
 }
 

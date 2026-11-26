@@ -10,7 +10,7 @@ use gpui_kit::{
     StatefulInteractiveElement as _, Styled as _, canvas, div, px,
 };
 
-use super::{Page, Shell};
+use super::Shell;
 use crate::tasks::Tasks;
 use crate::ui::{self, TITLE_HEIGHT};
 use crate::{format, ring, theme};
@@ -115,7 +115,7 @@ impl Shell {
 
     /// 设置的按钮：齿轮，设置页开着时发光。
     fn settings_button(&self, cx: &Context<Self>) -> impl IntoElement {
-        let on = matches!(self.page, Page::Settings { .. });
+        let on = self.settings.is_some();
         div()
             .id("settings")
             .size(px(SETTINGS))

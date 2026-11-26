@@ -414,7 +414,8 @@ fn torrent_drafts_are_checked() {
         );
     }
     assert!(matches!(
-        hs_dlx_app::torrent_from_file(b"not bencode"),
+        rt.block_on(service.open_torrent_file(b"not bencode".to_vec()))
+            .unwrap(),
         Err(Error::InvalidInput(_))
     ));
     assert!(service.tasks().unwrap().is_empty());
@@ -814,8 +815,10 @@ fn public_trackers_go_to_bare_magnet_links_and_never_to_private_torrents() {
         },
     );
     own.point_to(&private_seeder);
-    let resume = hs_dlx_app::torrent_from_file(&torrent).unwrap();
-    let info = TorrentInfo::of(&resume).unwrap();
+    let (resume, info) = rt
+        .block_on(service.open_torrent_file(torrent.clone()))
+        .unwrap()
+        .unwrap();
     assert!(info.private);
     let all = info.files.iter().map(|file| file.index).collect();
     let file = dir.join("private.torrent");
@@ -835,6 +838,11 @@ fn public_trackers_go_to_bare_magnet_links_and_never_to_private_torrents() {
         !public.announced(&private_id),
         "私有种子的信息哈希通告给了公共 tracker"
     );
+    // 再打开同一个种子文件：读出时即说出占着它的任务
+    assert!(matches!(
+        rt.block_on(service.open_torrent_file(torrent)).unwrap(),
+        Err(Error::TorrentTaken(at)) if at == task.id
+    ));
     drop(service);
     drop(seeder);
     drop(private_seeder);

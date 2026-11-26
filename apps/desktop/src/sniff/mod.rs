@@ -359,15 +359,20 @@ impl SniffView {
                     self.add(Found::new(url, frame, top, agent), cx);
                     false
                 }
-                Some(Report::Document { content_type }) => self.judge.document(&content_type),
-                Some(Report::Content { playlist }) => self.judge.content(playlist),
-                // 验证页藏在后台时用户不知道要先过验证：变成验证页即把网页显示出来
-                Some(Report::Challenge { active }) => {
-                    self.challenge = active;
-                    if active && !self.page_shown {
+                Some(Report::Document { content_type }) => {
+                    self.challenge = false;
+                    self.judge.document(&content_type)
+                }
+                // 验证页藏在后台时用户不知道要先过验证：是验证页即把网页显示出来
+                Some(Report::Content {
+                    playlist,
+                    challenge,
+                }) => {
+                    self.challenge = challenge;
+                    if challenge && !self.page_shown {
                         self.show_page(true, cx);
                     }
-                    false
+                    self.judge.content(playlist)
                 }
                 None => return,
             },
@@ -457,6 +462,11 @@ impl SniffView {
     /// 网页显示着：外面这时让出任务列表的位置。
     pub fn page_shown(&self) -> bool {
         self.page_shown
+    }
+
+    /// 网页此刻是整页的人机验证（见 [`script::SCRIPT`]）。
+    pub fn challenge(&self) -> bool {
+        self.challenge
     }
 
     fn webview(&self) -> Option<&Entity<WebView>> {

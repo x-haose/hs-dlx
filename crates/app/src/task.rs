@@ -62,7 +62,7 @@ pub enum DraftKind {
     },
     /// BT：[`Draft::url`] 为磁力链接或种子文件的 `file:` 地址，没有请求头
     Torrent {
-        /// 种子的续传数据：种子文件转成的（[`crate::torrent_from_file`]）或磁力链接取到的
+        /// 种子的续传数据：种子文件转成的（[`crate::Service::open_torrent_file`]）或磁力链接取到的
         /// （[`crate::Service::fetch_metadata`]）
         resume: Vec<u8>,
         /// 要下的文件（[`crate::TorrentFile::index`]），至少一个

@@ -99,7 +99,11 @@ impl Shell {
         ui::list_item(("task", id.0 as u64), on)
             .when(dim, |s| s.opacity(0.5))
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| this.select(id, cx)))
+            // 设置开着时点的：关上设置、看点的这一项
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.close_settings(cx);
+                this.select(id, cx);
+            }))
             .child(
                 div()
                     .relative()
@@ -181,7 +185,10 @@ fn sniff_item(
     ui::list_item("sniff", on)
         .when(dim, |item| item.opacity(0.5))
         .cursor_pointer()
-        .on_click(cx.listener(|this, _, _, cx| this.show_sniff(cx)))
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.close_settings(cx);
+            this.show_sniff(cx);
+        }))
         .child(ui::rings(ORB, 3., 10.))
         .child(two_lines(
             title.unwrap_or_else(|| "网页里的视频流".to_owned()),

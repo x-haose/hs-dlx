@@ -148,9 +148,8 @@ pub(crate) fn place(resume: &[u8], root: &str, wanted: &[i32]) -> Result<Vec<u8>
         .map_err(|error| Error::InvalidInput(format!("定不下种子的根名与要下的文件：{error}")))
 }
 
-/// 种子文件（bencode 写的内容）转成续传数据，供新建任务（[`crate::DraftKind::Torrent`]）；不是种子文件时报
-/// [`Error::InvalidInput`]。
-pub fn torrent_from_file(torrent: &[u8]) -> Result<Vec<u8>, Error> {
+/// 种子文件（bencode 写的内容）转成续传数据；不是种子文件时报 [`Error::InvalidInput`]。
+pub(crate) fn torrent_from_file(torrent: &[u8]) -> Result<Vec<u8>, Error> {
     hs_dlx_torrent::resume_from_torrent_file(torrent)
         .map_err(|error| Error::InvalidInput(format!("不是种子文件：{error}")))
 }
