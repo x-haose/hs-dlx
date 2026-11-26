@@ -79,6 +79,8 @@ pub struct Installed {
     pub version: String,
     /// 上一个 yt-dlp 版本（更新前的，留着可换回，见 [`Components::rollback`]）；没有时为 None
     pub previous: Option<String>,
+    /// 换回上一个版本时换下的那个：用户嫌它有问题，自动更新不再装它；没换回过、或之后又装过时为 None
+    pub skipped: Option<String>,
     pub driver: PathBuf,
 }
 
@@ -125,6 +127,9 @@ struct State {
     yt_dlp: String,
     /// 上一个版本；没有时为 None
     previous: Option<String>,
+    /// 见 [`Installed::skipped`]；没有这一项（之前的版本写的）时为 None
+    #[serde(default)]
+    skipped: Option<String>,
     /// 装 yt-dlp 时用的 Python 的 ABI（[`Bundle::python_abi`]）：依赖里有按它编译的扩展模块，它变了要重装
     python: String,
 }
@@ -191,7 +196,8 @@ impl Components {
         if state.python != self.bundle.python_abi {
             return Ok(None);
         }
-        let installed = self.installed_as(&state.yt_dlp, state.previous.clone());
+        let installed =
+            self.installed_as(&state.yt_dlp, state.previous.clone(), state.skipped.clone());
         let present = [&installed.python, &installed.quickjs, &installed.site]
             .iter()
             .all(|path| path.exists());
@@ -257,7 +263,7 @@ impl Components {
         let Ok(Some(state)) = self.state() else {
             return false;
         };
-        let installed = self.installed_as(&state.yt_dlp, state.previous);
+        let installed = self.installed_as(&state.yt_dlp, state.previous, state.skipped);
         state.python == self.bundle.python_abi
             && installed.site.is_dir()
             && !(installed.python.is_file() && installed.quickjs.is_file())
@@ -281,7 +287,8 @@ impl Components {
         self.installed()?.ok_or(Error::NotInstalled)
     }
 
-    /// 换回上一个 yt-dlp（更新后新版出了问题时）：不联网，自检过了才换，换后上一个是刚才在用的。没有上一个（没更新过，
+    /// 换回上一个 yt-dlp（更新后新版出了问题时）：不联网，自检过了才换，换后上一个是刚才在用的，它也记为跳过的（见
+    /// [`Installed::skipped`]）。没有上一个（没更新过，
     /// 或它的目录没了）时报 [`Error::NoPrevious`]，没装时报 [`Error::NotInstalled`]。
     pub async fn rollback(&self, cancel: &CancellationToken) -> Result<Installed, Error> {
         let _busy = self.busy.lock().await;
@@ -292,7 +299,11 @@ impl Components {
     async fn switch_back(&self, cancel: &CancellationToken) -> Result<Installed, Error> {
         let current = self.installed()?.ok_or(Error::NotInstalled)?;
         let previous = current.previous.clone().ok_or(Error::NoPrevious)?;
-        let back = self.installed_as(&previous, Some(current.version.clone()));
+        let back = self.installed_as(
+            &previous,
+            Some(current.version.clone()),
+            Some(current.version.clone()),
+        );
         if !back.site.is_dir() {
             return Err(Error::NoPrevious);
         }
@@ -309,7 +320,12 @@ impl Components {
                 "要换回的是 {previous}，那个目录里装的是 {found}"
             )));
         }
-        self.write_state(&previous, Some(current.version)).await?;
+        self.write_state(
+            &previous,
+            Some(current.version.clone()),
+            Some(current.version),
+        )
+        .await?;
         Ok(back)
     }
 
@@ -502,13 +518,19 @@ impl Components {
         latest_of(&body, channel)
     }
 
-    fn installed_as(&self, version: &str, previous: Option<String>) -> Installed {
+    fn installed_as(
+        &self,
+        version: &str,
+        previous: Option<String>,
+        skipped: Option<String>,
+    ) -> Installed {
         Installed {
             python: executable(&self.root, "python", &self.bundle.python),
             quickjs: executable(&self.root, "quickjs", &self.bundle.quickjs),
             site: self.root.join(format!("yt-dlp-{version}")),
             version: version.to_owned(),
             previous,
+            skipped,
             driver: self.driver_path(),
         }
     }
@@ -544,11 +566,17 @@ impl Components {
         Ok(())
     }
 
-    /// 记下当前（`yt_dlp`）与上一个 yt-dlp 版本：先写临时文件、落盘再改名。
-    async fn write_state(&self, yt_dlp: &str, previous: Option<String>) -> Result<(), Error> {
+    /// 记下当前（`yt_dlp`）、上一个与跳过的 yt-dlp 版本：先写临时文件、落盘再改名。
+    async fn write_state(
+        &self,
+        yt_dlp: &str,
+        previous: Option<String>,
+        skipped: Option<String>,
+    ) -> Result<(), Error> {
         let state = State {
             yt_dlp: yt_dlp.to_owned(),
             previous,
+            skipped,
             python: self.bundle.python_abi.clone(),
         };
         write_atomically(
@@ -877,11 +905,12 @@ impl Components {
             Ok(Some(state)) => Some(state.yt_dlp),
             Ok(None) | Err(_) => None,
         };
-        self.write_state(version, previous.clone()).await?;
+        // 装上了就不再跳过什么：要么是用户自己选的版本，要么是自动更新装的、比跳过的那个新的
+        self.write_state(version, previous.clone(), None).await?;
         for path in &paths {
             remove(path).await?;
         }
-        Ok(self.installed_as(version, previous))
+        Ok(self.installed_as(version, previous, None))
     }
 
     /// PyPI 上 `name` 的 `version` 这一版。

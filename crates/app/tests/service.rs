@@ -172,6 +172,7 @@ fn service(store: &Path) -> (Service, mpsc::UnboundedReceiver<Event>) {
             root: std::env::temp_dir().join("hs-dlx-no-web"),
             bundle: None,
             sources: hs_dlx_app::ytdlp::Sources::official(),
+            update_every: None,
         },
     )
     .unwrap()

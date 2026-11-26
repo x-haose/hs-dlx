@@ -26,6 +26,8 @@ use tokio::runtime::Runtime;
 
 /// Blender 基金会的 Big Buck Bunny（CC BY 3.0），约 10 分钟。
 const YOUTUBE: &str = "https://www.youtube.com/watch?v=aqz-KE-bpKQ";
+/// 解不出 YouTube 现在的播放器的 JavaScript 挑战的 yt-dlp 版本：YouTube 再换播放器、它又解得出时换成那时解不出的。
+const OUTDATED: &str = "2026.10.26";
 /// B 站上存在多年的公开视频。
 const BILIBILI: &str = "https://www.bilibili.com/video/BV1GJ411x7h7";
 /// 在中国大陆直连被掐断的网站。
@@ -73,6 +75,7 @@ impl Rig {
                 root: dir.join("components"),
                 bundle: Some(bundle()),
                 sources: Sources::official(),
+                update_every: Some(WebConfig::UPDATE_EVERY),
             },
         )
         .unwrap();
@@ -329,6 +332,21 @@ fn youtube_downloads_pauses_resumes_and_plays() {
         best.video_codec,
         Some(VideoCodec::Av1 | VideoCodec::Vp9)
     ));
+}
+
+/// yt-dlp 旧到解不出 YouTube 的 JavaScript 挑战：解析时自动换上渠道上最新的、再解析一次，出得了画质。
+#[test]
+#[ignore = "要联网，由 make acceptance 跑"]
+fn an_outdated_yt_dlp_is_updated_when_youtube_changes_its_player() {
+    let rig = Rig::new("outdated");
+    let latest = rig.install();
+    let outdated = rig.web_changed(|service| service.update_web(OUTDATED.to_owned()).unwrap());
+    assert_eq!(outdated, OUTDATED);
+    let resolved = rig.resolve(YOUTUBE);
+    println!("换上 {latest} 后：{} 档", resolved.choices.len());
+    assert!(!resolved.choices.is_empty());
+    assert_eq!(resolved.freshness, None);
+    assert_eq!(*rig.service.web_state().borrow(), WebState::Ready(latest));
 }
 
 /// B 站：直连解析、下载最低的一档，下完能播放。

@@ -896,13 +896,23 @@ fn signals(signals: &[Signal]) -> Div {
                     })
                     .child(SharedString::from(signal.text.clone())),
             )
-            .child(ui::num(
+            .child(
                 div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
                     .mt(px(2.))
-                    .text_size(px(11.))
-                    .text_color(theme::faint())
-                    .child(when),
-            ))
+                    .child(ui::num(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::faint())
+                            .child(when),
+                    ))
+                    // 警告与出错的给「复制」：报告问题时要完整的原文
+                    .when(level.is_some(), |line| {
+                        line.child(ui::copy_link(("copy-signal", index), signal.text.clone()))
+                    }),
+            )
     });
     div()
         .flex()

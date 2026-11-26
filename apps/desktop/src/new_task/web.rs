@@ -167,7 +167,10 @@ impl NewTask {
         if resolved.choices.is_empty() {
             self.probing = Probing::Failed(Failure {
                 kind: FailureKind::Unsupported,
-                message: format!("没有能下的格式：{}", no_choice_reason(&resolved.info)),
+                message: format!(
+                    "没有能下的格式：{}",
+                    no_choice_reason(&resolved.info, resolved.freshness.as_ref())
+                ),
             });
             return;
         }

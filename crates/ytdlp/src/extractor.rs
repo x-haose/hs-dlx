@@ -849,6 +849,7 @@ mod tests {
             has_drm: false,
             entries: None,
             warnings: Vec::new(),
+            challenge_failed: false,
             site_cookies: vec![cookie("SID")],
         };
         let request = Request {

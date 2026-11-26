@@ -134,6 +134,7 @@ fn service_with(
             root: std::env::temp_dir().join("hs-dlx-no-web"),
             bundle: None,
             sources: hs_dlx_app::ytdlp::Sources::official(),
+            update_every: None,
         },
     )
     .unwrap()

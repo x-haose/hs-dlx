@@ -56,6 +56,7 @@ fn installed(name: &str) -> (Installed, PathBuf) {
             site,
             version: "dev".to_owned(),
             previous: None,
+            skipped: None,
             driver: Path::new(env!("CARGO_MANIFEST_DIR")).join("src/driver.py"),
         },
         cache,

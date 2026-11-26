@@ -217,9 +217,43 @@ pub fn choices(info: &Info, preference: Preference) -> Vec<Choice> {
     found
 }
 
-/// [`choices`] 为空时的原因：有的格式有 DRM 时说 DRM；有这一版下不了的协议时列出；都不是时为 yt-dlp 给出的格式里没有
-/// 视频也没有音频（如只有预览图），带上 yt-dlp 的警告（网站不给的原因多写在里面，如要登录、要验证不是机器人）。
-pub fn no_choice_reason(info: &Info) -> String {
+/// 解不出 JavaScript 挑战（[`Info::challenge_failed`]）、没有能下的格式时，换新的 yt-dlp 为什么没换成。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Freshness {
+    /// 在用的已是渠道上最新的（查过，或刚换上最新的仍解不出）
+    Latest,
+    /// 渠道上最新的是用户换回时换下的（见 [`hs_dlx_ytdlp::Installed::skipped`]）：不自动装它
+    Skipped(String),
+    /// 查不了或没换成：原因
+    Unknown(String),
+}
+
+/// [`choices`] 为空时的原因：解不出 JavaScript 挑战时按换新的 yt-dlp 的结果 `freshness` 说怎么办；有的格式有 DRM 时说
+/// DRM；有这一版下不了的协议时列出；都不是时为 yt-dlp 给出的格式里没有视频也没有音频（如只有预览图）。解不出挑战与最后
+/// 一种带上 yt-dlp 的警告（网站不给的原因多写在里面，如要登录、要验证不是机器人）。
+pub fn no_choice_reason(info: &Info, freshness: Option<&Freshness>) -> String {
+    let warnings = |said: &str| {
+        if info.warnings.is_empty() {
+            said.to_owned()
+        } else {
+            format!("{said}。yt-dlp 的警告：{}", info.warnings.join("；"))
+        }
+    };
+    if info.challenge_failed {
+        let unsolved = "yt-dlp 解不出网站播放器的 JavaScript 挑战，拿不到视频地址";
+        return warnings(&match freshness {
+            Some(Freshness::Latest) => format!(
+                "{unsolved}；在用的已是最新的 yt-dlp，多为网站刚换了播放器、yt-dlp 还没跟上：可在设置「网页视频」里换到每日构建（修复最先到那里），或过一阵再试"
+            ),
+            Some(Freshness::Skipped(version)) => format!(
+                "{unsolved}；有新版 {version}，它是之前换回时换下的，没有自动装：到设置「网页视频」里更新到它再试"
+            ),
+            Some(Freshness::Unknown(why)) => format!(
+                "{unsolved}；换新的 yt-dlp 没成（{why}）：到设置「网页视频」里查新版、更新后再试"
+            ),
+            None => format!("{unsolved}：到设置「网页视频」里查新版、更新后再试"),
+        });
+    }
     if info.has_drm {
         return "有的格式有 DRM，其余的协议不支持".to_owned();
     }
@@ -234,12 +268,7 @@ pub fn no_choice_reason(info: &Info) -> String {
     if !unsupported.is_empty() {
         return unsupported.into_iter().collect::<Vec<_>>().join("；");
     }
-    let none = "yt-dlp 给出的格式里没有视频也没有音频（如只有预览图）";
-    if info.warnings.is_empty() {
-        none.to_owned()
-    } else {
-        format!("{none}。yt-dlp 的警告：{}", info.warnings.join("；"))
-    }
+    warnings("yt-dlp 给出的格式里没有视频也没有音频（如只有预览图）")
 }
 
 /// 合并收不收 `format` 下到的文件：合并只收 MP4（含 M4A）、Matroska（含 WebM）、TS 与裸 AAC、MP3。HLS 与 DASH 下到的
@@ -435,11 +464,13 @@ mod tests {
             has_drm: false,
             entries: None,
             warnings: Vec::new(),
+            challenge_failed: false,
             site_cookies: Vec::new(),
         }
     }
 
-    /// 只有预览图（没有视频也没有音频）时说明这一点并带上 yt-dlp 的警告；有 RTMP 的说 RTMP；有 DRM 的说 DRM。
+    /// 只有预览图（没有视频也没有音频）时说明这一点并带上 yt-dlp 的警告；解不出 JavaScript 挑战时叫人更新 yt-dlp；有 RTMP
+    /// 的说 RTMP；有 DRM 的说 DRM。
     #[test]
     fn the_reason_for_no_choice_names_what_was_missing() {
         let mut storyboard = format("sb0", Some("none"), Some("none"), Some(45), 0.0);
@@ -448,12 +479,12 @@ mod tests {
         let mut images = info(vec![storyboard]);
         assert!(choices(&images, Preference::Compatible).is_empty());
         assert_eq!(
-            no_choice_reason(&images),
+            no_choice_reason(&images, None),
             "yt-dlp 给出的格式里没有视频也没有音频（如只有预览图）"
         );
         images.warnings = vec!["Only images are available for download".to_owned()];
         assert_eq!(
-            no_choice_reason(&images),
+            no_choice_reason(&images, None),
             "yt-dlp 给出的格式里没有视频也没有音频（如只有预览图）。yt-dlp 的警告：Only images are available for download"
         );
 
@@ -461,12 +492,32 @@ mod tests {
         rtmp.protocol = Protocol::Other("rtmp".to_owned());
         let streamed = info(vec![rtmp]);
         assert!(choices(&streamed, Preference::Compatible).is_empty());
-        assert_eq!(no_choice_reason(&streamed), "RTMP 这一版还不支持");
+        assert_eq!(no_choice_reason(&streamed, None), "RTMP 这一版还不支持");
+
+        let mut unsolved = info(Vec::new());
+        unsolved.challenge_failed = true;
+        unsolved.warnings = vec!["n challenge solving failed".to_owned()];
+        let latest = no_choice_reason(&unsolved, Some(&Freshness::Latest));
+        assert!(latest.contains("在用的已是最新的 yt-dlp"), "{latest}");
+        assert!(
+            latest.ends_with("yt-dlp 的警告：n challenge solving failed"),
+            "{latest}"
+        );
+        let skipped = no_choice_reason(
+            &unsolved,
+            Some(&Freshness::Skipped("2026.11.23".to_owned())),
+        );
+        assert!(skipped.contains("有新版 2026.11.23"), "{skipped}");
+        let unknown = no_choice_reason(
+            &unsolved,
+            Some(&Freshness::Unknown("连不上 PyPI".to_owned())),
+        );
+        assert!(unknown.contains("（连不上 PyPI）"), "{unknown}");
 
         let mut locked = info(Vec::new());
         locked.has_drm = true;
         assert_eq!(
-            no_choice_reason(&locked),
+            no_choice_reason(&locked, None),
             "有的格式有 DRM，其余的协议不支持"
         );
     }

@@ -297,6 +297,8 @@ struct Shared {
     bt: Bt,
     /// 取公共 tracker 列表的任务（BT 会话建起时开始，取到为止）；关闭时取消
     public_fetch: Mutex<Option<AbortOnDropHandle<()>>>,
+    /// 定期把 yt-dlp 换成新版的任务（见 [`web::keep_web_current`]，启动时开始）；关闭时取消
+    web_updates: Mutex<Option<AbortOnDropHandle<()>>>,
     /// 看着 BT 代理的任务与它看着的地址（BT 会话已建、设了代理时有，见 `Shared::watch_torrent_proxy`）；改了代理或
     /// 关闭时取消
     proxy_probe: Mutex<Option<(Url, AbortOnDropHandle<()>)>>,
@@ -374,6 +376,7 @@ impl Service {
             Engine::new(max_requests)
         };
         let (events, receiver) = mpsc::unbounded_channel();
+        let update_every = web.update_every;
         let web = web::Web::new(web, engine.clone());
         let shared = Arc::new(Shared {
             engine,
@@ -390,6 +393,7 @@ impl Service {
                 settings.torrent_proxy.clone(),
             ),
             public_fetch: Mutex::new(None),
+            web_updates: Mutex::new(None),
             proxy_probe: Mutex::new(None),
             proxy_changed: Arc::new(Notify::new()),
             runtime: runtime.handle().clone(),
@@ -413,6 +417,11 @@ impl Service {
                 .tracker
                 .spawn(async move { shared.web.sweep().await });
             service.shared.unpack_bundled_on_start();
+            if let Some(every) = update_every {
+                let updating = web::keep_web_current(Arc::downgrade(&service.shared), every);
+                *lock(&service.shared.web_updates) =
+                    Some(AbortOnDropHandle::new(service.runtime().spawn(updating)));
+            }
             let shared = service.shared.clone();
             service.shared.tracker.spawn(async move {
                 for work_dir in finished_web {
@@ -499,8 +508,9 @@ impl Service {
         }
         // 安装中的网页视频组件：已下的组件包留着下次续传
         self.shared.web.cancel_install();
-        // 取公共 tracker 列表、探 BT 代理的不改存储，不用等
+        // 取公共 tracker 列表、探 BT 代理、查新的 yt-dlp 的不改存储，不用等（在做的 yt-dlp 更新随上面的取消停下）
         drop(lock(&self.shared.public_fetch).take());
+        drop(lock(&self.shared.web_updates).take());
         drop(lock(&self.shared.proxy_probe).take());
         let tracker = &self.shared.tracker;
         tracker.close();

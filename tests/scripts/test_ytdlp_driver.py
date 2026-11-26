@@ -480,6 +480,23 @@ def test_lone_surrogates_and_nan_still_make_valid_json() -> None:
     assert json.loads(line)["duration"] is None
 
 
+@pytest.mark.parametrize(
+    ("warning", "failed"),
+    [
+        ("[youtube] x: n challenge solving failed: Some formats may be missing.", True),
+        ("[youtube] x: Signature solving failed: Some formats may be missing.", True),
+        ("[youtube] x: Some web client https formats have been skipped", False),
+    ],
+)
+def test_a_challenge_yt_dlp_could_not_solve_is_flagged(warning: str, *, failed: bool) -> None:
+    class Jar:
+        def get_cookie_header(self, url: str) -> str | None:
+            return url if not url else None
+
+    info = driver.trimmed({"id": "x"}, Jar(), [warning], driver.HlsExtrasSeen())
+    assert info["challenge_failed"] is failed
+
+
 def test_yt_dlp_downloads_a_format_itself_with_progress(
     site: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -2,21 +2,21 @@
 //! 进程里做（见 [`hs_dlx_ytdlp::Extractor`]）。
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use hs_dlx_ytdlp::{
     Browser, Bundle, Channel, Components, CookieSource, ExtractError, Extractor, Info,
     InstallProgress, Request, Sources, Stage,
 };
-use hs_m3u8_core::{CancellationToken, Engine, Url};
+use hs_m3u8_core::{CancellationToken, Engine, Proxy, Url};
 use tokio::sync::watch;
 use tokio_util::task::AbortOnDropHandle;
 
 use super::{Service, lock};
 use crate::Error;
 use crate::store;
-use crate::web::{Choice, Preference, choices};
+use crate::web::{Choice, Freshness, Preference, choices};
 
 /// 一次解析最多多久：YouTube 第一次要下播放器、解 JavaScript 挑战，慢的网络与代理下约半分钟。
 const EXTRACT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -29,6 +29,13 @@ pub struct WebConfig {
     /// 随应用带的 Python 与 QuickJS-NG；应用不发布的平台为 None，网页视频用不了
     pub bundle: Option<Bundle>,
     pub sources: Sources,
+    /// 多久查一次有没有新的 yt-dlp、有就换上（跳过换回时换下的那一版）；服务启动后先查一次，None 为不自动查
+    pub update_every: Option<Duration>,
+}
+
+impl WebConfig {
+    /// 应用用的 [`WebConfig::update_every`]：网站换了播放器、改了页面后旧版很快就解析不了，yt-dlp 跟着几天内发版。
+    pub const UPDATE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 }
 
 /// 网页视频的组件现在怎样。
@@ -58,6 +65,18 @@ pub struct Resolved {
     pub info: Info,
     /// 见 [`crate::web::choices`]；没有能下的格式时为空
     pub choices: Vec<Choice>,
+    /// 解不出 JavaScript 挑战（[`Info::challenge_failed`]）时换新的 yt-dlp 为什么没换成（换成了的已用新的重新解析过）；
+    /// 别的时候为 None
+    pub freshness: Option<Freshness>,
+}
+
+/// 渠道上有没有该换上的 yt-dlp。
+enum Newer {
+    /// 在用的就是最新的
+    None,
+    /// 最新的是换回时换下的（见 [`hs_dlx_ytdlp::Installed::skipped`]）
+    Skipped(String),
+    Version(String),
 }
 
 pub(super) struct Web {
@@ -187,6 +206,183 @@ impl super::Shared {
             web.state.send_replace(next);
         });
     }
+
+    /// 见 [`Service::update_web`]，经 `proxy`。
+    pub(super) fn start_web_update(
+        self: &Arc<Self>,
+        version: String,
+        proxy: Proxy,
+    ) -> Result<(), Error> {
+        let web = &self.web;
+        let current = web.version().ok_or(Error::WebNotReady)?;
+        let before = web.state.borrow().clone();
+        let cancel = {
+            let mut installing = lock(&web.installing);
+            if installing.is_some() {
+                return Err(Error::WebInstalling);
+            }
+            let cancel = CancellationToken::new();
+            *installing = Some(cancel.clone());
+            cancel
+        };
+        // 一开始就显示在装：到第一个字节之前（查 PyPI、解出随带的）也有好几秒
+        web.state
+            .send_replace(WebState::Installing(InstallProgress {
+                stage: Stage::Preparing,
+                bytes: 0,
+                total: None,
+            }));
+        let shared = self.clone();
+        let _entered = self.runtime.enter();
+        self.tracker.spawn(async move {
+            let web = &shared.web;
+            let components = web.components.as_ref().expect("装好了即有组件");
+            let state = web.state.clone();
+            let updated = components
+                .update(
+                    &proxy,
+                    &version,
+                    &|progress| {
+                        state.send_replace(WebState::Installing(progress));
+                    },
+                    &cancel,
+                )
+                .await;
+            let next = match updated {
+                Ok(installed) => {
+                    let version = installed.version.clone();
+                    *lock(&web.extractor) = Some(Arc::new(Extractor::new(
+                        installed,
+                        web.cache.clone(),
+                        EXTRACT_TIMEOUT,
+                    )));
+                    WebState::Ready(version)
+                }
+                // 取消的不算失败：照原来的
+                Err(hs_dlx_ytdlp::Error::Cancelled) => before,
+                // 没换成：原来的照旧在用
+                Err(error) => WebState::UpdateFailed {
+                    version: current,
+                    reason: format!("更新没成：{error}"),
+                },
+            };
+            *lock(&web.installing) = None;
+            web.state.send_replace(next);
+        });
+        Ok(())
+    }
+
+    /// 经设置里的代理查设置里的渠道上最新的 yt-dlp，与在用的比；组件没装好、读不出设置、查不了时为原因。
+    async fn newer_web(&self) -> Result<Newer, String> {
+        let installed = lock(&self.web.extractor)
+            .as_ref()
+            .map(|extractor| extractor.installed().clone())
+            .ok_or_else(|| Error::WebNotReady.to_string())?;
+        let settings = self.settings().map_err(|error| error.to_string())?;
+        let components = self.web.components.as_ref().expect("装好了即有组件");
+        let latest = components
+            .latest(
+                &settings.proxy,
+                settings.web_channel,
+                &CancellationToken::new(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(if latest == installed.version {
+            Newer::None
+        } else if installed.skipped.as_deref() == Some(latest.as_str()) {
+            Newer::Skipped(latest)
+        } else {
+            Newer::Version(latest)
+        })
+    }
+
+    /// 解不出 JavaScript 挑战时把 yt-dlp 换成渠道上最新的：没在装时查，有该换上的就更新（经设置里的代理）；再等安装做完
+    /// （别处开始的也等），换上了新的时为它的解析进程，否则为原因。
+    async fn bring_web_current(
+        self: &Arc<Self>,
+        using: &Arc<Extractor>,
+    ) -> Result<Arc<Extractor>, Freshness> {
+        let mut state = self.web.state.subscribe();
+        let installing = matches!(*state.borrow_and_update(), WebState::Installing(_));
+        if !installing {
+            let version = match self.newer_web().await {
+                Ok(Newer::Version(version)) => version,
+                Ok(Newer::None) => return Err(Freshness::Latest),
+                Ok(Newer::Skipped(version)) => return Err(Freshness::Skipped(version)),
+                Err(why) => return Err(Freshness::Unknown(format!("查新版没成：{why}"))),
+            };
+            let proxy = self
+                .settings()
+                .map_err(|error| Freshness::Unknown(error.to_string()))?
+                .proxy;
+            match self.start_web_update(version, proxy) {
+                // 别处刚开始装：等它
+                Ok(()) | Err(Error::WebInstalling) => {}
+                Err(error) => return Err(Freshness::Unknown(error.to_string())),
+            }
+        }
+        // 发送端在 Shared 里，持有 self 时不会关
+        let settled = state
+            .wait_for(|state| !matches!(state, WebState::Installing(_)))
+            .await
+            .expect("持有 Shared 时状态的发送端还在")
+            .clone();
+        if let WebState::UpdateFailed { reason, .. } = settled {
+            return Err(Freshness::Unknown(reason));
+        }
+        match lock(&self.web.extractor).clone() {
+            Some(current) if !Arc::ptr_eq(&current, using) => Ok(current),
+            Some(_) | None => Err(Freshness::Unknown("更新没做完".to_owned())),
+        }
+    }
+}
+
+/// 启动后先查一次，之后每隔 `every` 查一次渠道上的 yt-dlp，有该换上的（跳过的除外）就更新；组件没装好或正在装时这一轮
+/// 不查。查不了时状态记为更新没成（带上原因，照旧用在用的），下一轮再查。服务释放时结束。
+pub(super) async fn keep_web_current(shared: Weak<super::Shared>, every: Duration) {
+    loop {
+        {
+            let Some(shared) = shared.upgrade() else {
+                return;
+            };
+            let current = match &*shared.web.state.borrow() {
+                WebState::Ready(version) | WebState::UpdateFailed { version, .. } => {
+                    Some(version.clone())
+                }
+                _ => None,
+            };
+            if let Some(current) = current {
+                let started = match shared.newer_web().await {
+                    Ok(Newer::Version(version)) => shared
+                        .settings()
+                        .and_then(|settings| shared.start_web_update(version, settings.proxy))
+                        .or_else(|error| match error {
+                            // 用户正好在装：这一轮不管
+                            Error::WebInstalling | Error::WebNotReady => Ok(()),
+                            error => Err(error.to_string()),
+                        }),
+                    Ok(Newer::None | Newer::Skipped(_)) => Ok(()),
+                    Err(why) => Err(format!("查新版没成：{why}")),
+                };
+                if let Err(reason) = started {
+                    // 这期间开始了安装的不盖掉它的状态
+                    shared.web.state.send_if_modified(|state| match state {
+                        WebState::Ready(_) | WebState::UpdateFailed { .. } => {
+                            *state = WebState::UpdateFailed {
+                                version: current,
+                                reason: format!("自动{reason}"),
+                            };
+                            true
+                        }
+                        _ => false,
+                    });
+                }
+            }
+        }
+        // 等的时候不持有服务
+        tokio::time::sleep(every).await;
+    }
 }
 
 impl Service {
@@ -237,67 +433,11 @@ impl Service {
     }
 
     /// 把 yt-dlp 换成 `version`（经设置里的代理），进度与结果见 [`Service::web_state`]：装好、自检过了才换上，在用的
-    /// 解析进程随之换成新的；没装成时照旧用原来的版本，状态回到它并带上原因。组件没装好、或正在装时报
-    /// [`Error::WebNotReady`]。
+    /// 解析进程随之换成新的；没装成时照旧用原来的版本，状态回到它并带上原因。组件没装好时报 [`Error::WebNotReady`]，
+    /// 正在装时报 [`Error::WebInstalling`]。
     pub fn update_web(&self, version: String) -> Result<(), Error> {
-        let web = &self.shared.web;
-        let current = web.version().ok_or(Error::WebNotReady)?;
-        let before = web.state.borrow().clone();
         let proxy = self.settings()?.proxy;
-        let cancel = {
-            let mut installing = lock(&web.installing);
-            if installing.is_some() {
-                return Err(Error::WebInstalling);
-            }
-            let cancel = CancellationToken::new();
-            *installing = Some(cancel.clone());
-            cancel
-        };
-        // 一开始就显示在装：到第一个字节之前（查 PyPI、解出随带的）也有好几秒
-        web.state
-            .send_replace(WebState::Installing(InstallProgress {
-                stage: Stage::Preparing,
-                bytes: 0,
-                total: None,
-            }));
-        let shared = self.shared.clone();
-        let _entered = self.runtime().enter();
-        self.shared.tracker.spawn(async move {
-            let web = &shared.web;
-            let components = web.components.as_ref().expect("装好了即有组件");
-            let state = web.state.clone();
-            let updated = components
-                .update(
-                    &proxy,
-                    &version,
-                    &|progress| {
-                        state.send_replace(WebState::Installing(progress));
-                    },
-                    &cancel,
-                )
-                .await;
-            let next = match updated {
-                Ok(installed) => {
-                    let version = installed.version.clone();
-                    *lock(&web.extractor) = Some(Arc::new(Extractor::new(
-                        installed,
-                        web.cache.clone(),
-                        EXTRACT_TIMEOUT,
-                    )));
-                    WebState::Ready(version)
-                }
-                // 取消的不算失败：照原来的
-                Err(hs_dlx_ytdlp::Error::Cancelled) => before,
-                // 没换成：原来的照旧在用
-                Err(error) => WebState::UpdateFailed {
-                    version: current,
-                    reason: format!("更新没成：{error}"),
-                },
-            };
-            *lock(&web.installing) = None;
-            web.state.send_replace(next);
-        });
-        Ok(())
+        self.shared.start_web_update(version, proxy)
     }
 
     /// 换回上一个 yt-dlp 版本（不联网，见 [`Components::rollback`]），结果见 [`Service::web_state`]：自检过了才换，在用
@@ -522,17 +662,48 @@ impl Service {
         };
         let shared = self.shared.clone();
         Ok(AbortOnDropHandle::new(self.runtime().spawn(async move {
-            // 句柄释放时任务被丢弃，解析进程随 Worker 的释放杀掉
-            let info = extractor
-                .extract(&request, &proxy, &CancellationToken::new())
-                .await
-                .inspect_err(|error| {
-                    if let ExtractError::Broken(reason) = error {
-                        shared.web.broken(&extractor, reason.clone());
-                    }
-                })?;
-            let choices = choices(&info, preference);
-            Ok(Resolved { info, choices })
+            // 句柄释放时任务被丢弃，解析进程随 Worker 的释放杀掉；在做的更新是另起的任务，照常做完
+            let extract = |extractor: Arc<Extractor>| {
+                let (shared, request, proxy) = (shared.clone(), request.clone(), proxy.clone());
+                async move {
+                    extractor
+                        .extract(&request, &proxy, &CancellationToken::new())
+                        .await
+                        .inspect_err(|error| {
+                            if let ExtractError::Broken(reason) = error {
+                                shared.web.broken(&extractor, reason.clone());
+                            }
+                        })
+                }
+            };
+            let info = extract(extractor.clone()).await?;
+            let found = choices(&info, preference);
+            // 解不出挑战时列出的格式也多半下不了（要解的参数没解，被限速或拒绝）：先换新的
+            if !info.challenge_failed {
+                return Ok(Resolved {
+                    info,
+                    choices: found,
+                    freshness: None,
+                });
+            }
+            // 解不出 JavaScript 挑战：多为网站换了播放器而这一版 yt-dlp 还不认得，换上新的再解析一次
+            match shared.bring_web_current(&extractor).await {
+                Ok(newer) => {
+                    let info = extract(newer).await?;
+                    let found = choices(&info, preference);
+                    let freshness = info.challenge_failed.then_some(Freshness::Latest);
+                    Ok(Resolved {
+                        info,
+                        choices: found,
+                        freshness,
+                    })
+                }
+                Err(freshness) => Ok(Resolved {
+                    info,
+                    choices: found,
+                    freshness: Some(freshness),
+                }),
+            }
         })))
     }
 }

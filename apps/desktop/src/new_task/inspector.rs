@@ -119,7 +119,8 @@ impl NewTask {
         let needs_login = failure.kind == FailureKind::WebLogin;
         let login = needs_login && !self.from_sniff;
         let again = headers || failure.kind.retry_helps();
-        let mut body = vec![ui::note(failure.message.clone(), true).into_any_element()];
+        let mut body =
+            vec![ui::error_note("copy-failure", failure.message.clone()).into_any_element()];
         if !needs_login {
             body.push(ui::note(format::failure(failure.kind).1, false).into_any_element());
         }
@@ -377,7 +378,7 @@ impl NewTask {
         cx: &mut Context<Self>,
     ) -> Div {
         let body = [
-            ui::note(failure.message.clone(), true).into_any_element(),
+            ui::error_note("copy-failure", failure.message.clone()).into_any_element(),
             ui::note(format::failure(failure.kind).1, false).into_any_element(),
         ];
         let mut foot = self.cloud_offer(cx);

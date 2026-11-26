@@ -177,6 +177,7 @@ fn main() {
                             root: path.with_file_name("components"),
                             bundle: bundle(),
                             sources: hs_dlx_app::ytdlp::Sources::official(),
+                            update_every: Some(hs_dlx_app::WebConfig::UPDATE_EVERY),
                         },
                     )
                         .map_err(|error| Failure::new("启动失败", error.to_string()))?;

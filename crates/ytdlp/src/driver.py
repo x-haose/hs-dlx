@@ -202,7 +202,8 @@ def trimmed(info: Mapping[str, object], jar: CookieJar, warnings: list[str], see
 
     `extractor`（解析器）、`id`、`title`、`webpage_url`、`duration`（秒）、`thumbnail`、`live_status`、`uploader`、
     `formats`（见 `format_of`；只有一个格式、没有格式列表时为它本身）、`has_drm`（有格式因 DRM 被滤掉）、`entries`
-    （播放列表或分成几段的视频的条目，不是时为 null）、`warnings`（yt-dlp 的警告）。
+    （播放列表或分成几段的视频的条目，不是时为 null）、`warnings`（yt-dlp 的警告）、`challenge_failed`（警告里说解不出
+    JavaScript 挑战，见 `CHALLENGE_FAILED`）。
     """
     shared = (text(info.get("id")) or "") in seen.videos
     listed = [fmt for fmt in map(mapping, items(info.get("formats"))) if fmt is not None]
@@ -225,6 +226,7 @@ def trimmed(info: Mapping[str, object], jar: CookieJar, warnings: list[str], see
         "has_drm": bool(info.get("_has_drm")),
         "entries": entries,
         "warnings": [clean(warning) for warning in warnings],
+        "challenge_failed": any(mark in warning for warning in warnings for mark in CHALLENGE_FAILED),
     }
 
 
@@ -498,6 +500,8 @@ CURL_OVER_PROXY = " over proxy "
 # 读浏览器 Cookie 时 yt-dlp 的警告里，说明整罐加密的 Cookie 都解不开的（没拿到钥匙）；别的警告（某一条解不开、
 # 数据库版本较新）不影响其余的，缺的若正是要用的，网站照样回要登录
 KEYLESS = ("no key found",)
+# yt-dlp 解不出 YouTube 播放器的 JavaScript 挑战时警告里的字样（n 参数与签名两种）：解不出的格式拿不到地址
+CHALLENGE_FAILED = ("n challenge solving failed", "Signature solving failed")
 # yt-dlp 的 cookies 模块里向 macOS 钥匙串要密码的函数
 KEYCHAIN_FUNCTION = "_get_mac_keyring_password"
 # 读 Linux 密钥环出错时 yt-dlp 报的错误里的字样

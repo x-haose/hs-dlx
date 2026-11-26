@@ -88,6 +88,7 @@ fn with_events(dir: &Path, root: PathBuf) -> (Service, mpsc::UnboundedReceiver<E
             root,
             bundle: Some(bundle()),
             sources: Sources::official(),
+            update_every: None,
         },
     )
     .unwrap();

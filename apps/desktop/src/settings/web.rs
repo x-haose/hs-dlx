@@ -227,7 +227,9 @@ impl SettingsView {
         };
         row(
             "组件",
-            Some("要下载 yt-dlp，约 11 MB；Python 与 QuickJS-NG 随应用带"),
+            Some(
+                "要下载 yt-dlp，约 11 MB，之后有新版时自动更新（换回上一版后不再自动装换下的那一版）；Python 与 QuickJS-NG 随应用带",
+            ),
             div()
                 .flex()
                 .flex_col()
