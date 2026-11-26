@@ -1,8 +1,8 @@
 //! 新建任务：带着请求头认出地址是什么（或用嗅探页已探测好的结果）。是播放列表时，舞台上每档清晰度画成一个同心环
 //! （越粗码率越高，引线连到右侧的标签），点环或用方向键选中，再在检查面板里选音轨、输出、保存位置与请求头；是文件时
 //! 舞台上是写着大小的表盘，检查面板里选保存位置与请求头。磁力链接先连节点取种子信息（种子文件直接读），之后舞台上是
-//! 写着所选大小的表盘，检查面板里勾要下的文件、选保存位置。探测被拒时可改请求头重新探测；取到的是网页或不是播放列表时
-//! 外面可以在网页引擎里打开它看是不是网页（见 [`NewTask::opening_page`]）；请求经哪个代理写在检查面板里。舞台底部是
+//! 写着所选大小的表盘，检查面板里勾要下的文件、选保存位置。探测被拒时可改请求头重新探测；结果说明地址可能是网页（取到的
+//! 不是播放列表，或被人机验证拒了，见 [`hs_dlx_app::maybe_a_page`]）时外面可以在网页引擎里打开它看是不是网页（见 [`NewTask::opening_page`]）；请求经哪个代理写在检查面板里。舞台底部是
 //! 外面给的粘贴栏。
 
 mod figure;
@@ -23,7 +23,7 @@ use gpui_kit::{
 };
 use hs_dlx_app::{
     Draft, DraftKind, Expected, Failure, FailureKind, MetadataFetch, MetadataProgress, OutputKind,
-    Service, TaskId, TorrentInfo, file_name, not_a_playlist, task_title, torrent_from_file,
+    Service, TaskId, TorrentInfo, file_name, maybe_a_page, task_title, torrent_from_file,
 };
 use hs_m3u8_core::hls::{AudioChoice, Preference, VariantChoice};
 use hs_m3u8_core::{FileInfo, Probe, Resource, Source, Url};
@@ -64,8 +64,9 @@ pub enum NewTaskEvent {
     FolderChanged(PathBuf),
     /// 探测完成，可以开始：由外面决定要不要把键盘焦点给它（[`NewTask::focus`]）
     Ready,
-    /// 第一次探测（不是改了请求头重新探测）取到的是网页或不是播放列表：由外面决定要不要看它是不是网页
-    NotAPlaylist,
+    /// 第一次探测（不是改了请求头重新探测）的结果说明地址可能是网页（见 [`hs_dlx_app::maybe_a_page`]）：由外面决定要不要
+    /// 在网页引擎里看它是不是网页
+    MaybePage,
     /// 用户要在网页里找视频流（失败页上的按钮）
     Sniff(Url),
     /// 磁力链接的种子已在这个任务里：由外面换到它
@@ -91,7 +92,7 @@ impl Phase {
     }
 }
 
-/// 第一次探测取到的不是播放列表后，外面在网页引擎里看它是不是网页（见 [`NewTask::opening_page`]）。
+/// 第一次探测的结果说明地址可能是网页后，外面在网页引擎里看它是不是网页（见 [`NewTask::opening_page`]）。
 #[derive(Clone, PartialEq, Eq)]
 enum PageCheck {
     /// 没在看：探测没失败、不是这种失败，或用户已改请求头重新探测
@@ -210,7 +211,7 @@ pub struct NewTask {
     probing: Probing,
     /// 这次探测开始的时刻：探测中的表盘写探测了多久
     since: Instant,
-    /// 取到的不是播放列表后，外面看它是不是网页看到哪一步
+    /// 地址可能是网页时，外面看它是不是网页看到哪一步
     page_check: PageCheck,
     /// 从嗅探页来的流：失败页上不再给「在网页里找视频流」
     from_sniff: bool,
@@ -463,7 +464,7 @@ impl NewTask {
         self.since = Instant::now();
         self.animate(cx);
         self._probe = cx.spawn(async move |this, cx| {
-            let (probing, not_page) = match handle.await {
+            let (probing, maybe_page) = match handle.await {
                 Ok(Ok(Resource::Playlist(probe))) => (Probing::Ready(probe), false),
                 Ok(Ok(Resource::File(info))) => (Probing::File(Box::new(info)), false),
                 // 网页：交给 yt-dlp 解析（见 web.rs），没有专门的解析器时再在网页引擎里看
@@ -471,7 +472,7 @@ impl NewTask {
                     let _closed = this.update(cx, |this, cx| this.resolve_page(first, cx));
                     return;
                 }
-                Ok(Err(error)) => (Probing::Failed(Failure::of(&error)), not_a_playlist(&error)),
+                Ok(Err(error)) => (Probing::Failed(Failure::of(&error)), maybe_a_page(&error)),
                 Err(join) => (
                     Probing::Failed(Failure {
                         kind: FailureKind::Other,
@@ -486,8 +487,8 @@ impl NewTask {
                 this.probed(probing);
                 if ready {
                     cx.emit(NewTaskEvent::Ready);
-                } else if first && not_page {
-                    cx.emit(NewTaskEvent::NotAPlaylist);
+                } else if first && maybe_page {
+                    cx.emit(NewTaskEvent::MaybePage);
                 }
                 cx.notify();
             });

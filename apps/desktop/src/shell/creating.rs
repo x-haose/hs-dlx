@@ -79,7 +79,7 @@ impl Shell {
                         }
                     }
                     NewTaskEvent::Ready => this.focus_new_task(view, window, cx),
-                    NewTaskEvent::NotAPlaylist => this.check_page(view, window, cx),
+                    NewTaskEvent::MaybePage => this.check_page(view, window, cx),
                     NewTaskEvent::Sniff(url) => this.open_sniff(url.clone(), window, cx),
                     // 同一个种子不能有两个任务：换到已有的那个，说一声（新建页随之关掉）；新建页在设置后面时不打断设置，
                     // 它上面写着原因
@@ -147,7 +147,8 @@ impl Shell {
         }
     }
 
-    /// 新建页 `view` 第一次探测取到的不是播放列表：粘贴来的、地址也不像播放列表的，在后台的网页里打开它，网页引擎
+    /// 新建页 `view` 第一次探测的结果说明地址可能是网页（取到的不是播放列表，或被人机验证拒了）：粘贴来的、地址也不像
+    /// 播放列表的，在后台的网页里打开它，网页引擎
     /// 认出是网页就换到嗅探页找视频流（见 [`Shell::checked_page`]）；从嗅探页来的流、像播放列表的地址照常显示失败。
     fn check_page(&mut self, view: &Entity<NewTask>, window: &mut Window, cx: &mut Context<Self>) {
         let url = view.read(cx).url().clone();

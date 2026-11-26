@@ -147,7 +147,7 @@ impl NewTask {
             message: "地址回的是网页，不是视频流或文件".to_owned(),
         });
         if first {
-            cx.emit(NewTaskEvent::NotAPlaylist);
+            cx.emit(NewTaskEvent::MaybePage);
         }
         cx.notify();
     }

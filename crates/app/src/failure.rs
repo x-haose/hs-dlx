@@ -33,13 +33,18 @@ impl Failure {
     }
 }
 
-/// 探测或下载取到的不是播放列表（没有 `#EXTM3U`）：网页、视频文件之类。是哪一层（来源本身，还是主播放列表里的变体）
-/// 取到的看错误里的地址。
-pub fn not_a_playlist(error: &CoreError) -> bool {
-    matches!(
-        error,
-        CoreError::Playlist { cause, .. } if **cause == hs_m3u8_core::hls::Malformed::NotAPlaylist
-    )
+/// 探测的错误说明地址可能是网页，值得在网页引擎里打开看看：取到的不是播放列表（没有 `#EXTM3U`：网页、视频文件之类），
+/// 或被拒（403、503：网站的人机验证，如 Cloudflare 的验证页，对不是浏览器发的请求常这样回）。是哪一层（来源本身，还
+/// 是主播放列表里的变体）的看错误里的地址。
+pub fn maybe_a_page(error: &CoreError) -> bool {
+    match error {
+        CoreError::Playlist { cause, .. } => **cause == hs_m3u8_core::hls::Malformed::NotAPlaylist,
+        CoreError::Http {
+            kind: hs_m3u8_core::HttpErrorKind::Status(403 | 503),
+            ..
+        } => true,
+        _ => false,
+    }
 }
 
 /// 失败的种类：调用方据此决定怎么提示、能不能重试、该不该先改请求头或换输出。
@@ -501,19 +506,22 @@ mod tests {
         }
     }
 
+    /// 不是播放列表、被拒（403、503）的可能是网页；空的播放列表、别的状态不是。
     #[test]
-    fn a_page_is_not_a_playlist() {
+    fn pages_and_refusals_may_be_pages() {
         let playlist = |cause| CoreError::Playlist {
             url: Box::new(Url::parse("https://a.example/watch").unwrap()),
             cause: Box::new(cause),
         };
-        assert!(not_a_playlist(&playlist(
+        assert!(maybe_a_page(&playlist(
             hs_m3u8_core::hls::Malformed::NotAPlaylist
         )));
-        assert!(!not_a_playlist(&playlist(
+        assert!(!maybe_a_page(&playlist(
             hs_m3u8_core::hls::Malformed::Empty
         )));
-        assert!(!not_a_playlist(&http(HttpErrorKind::Status(403))));
+        assert!(maybe_a_page(&http(HttpErrorKind::Status(403))));
+        assert!(maybe_a_page(&http(HttpErrorKind::Status(503))));
+        assert!(!maybe_a_page(&http(HttpErrorKind::Status(404))));
     }
 
     /// 分片里包着的 403、直播刷新一直 403 都按状态码；其余按种类。

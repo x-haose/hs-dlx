@@ -22,7 +22,7 @@ pub mod web;
 
 pub use diagnosis::{Check, CheckItem, CheckLevel};
 pub use error::Error;
-pub use failure::{Failure, FailureKind, not_a_playlist};
+pub use failure::{Failure, FailureKind, maybe_a_page};
 /// PikPak 的接口（登录、进度阶段、接口地址等界面要用的类型）。
 pub use hs_dlx_cloud::pikpak;
 pub use hs_dlx_ytdlp as ytdlp;
