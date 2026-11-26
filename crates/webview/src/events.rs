@@ -11,8 +11,9 @@ pub enum Event {
     LoadFailed(String),
     /// 网页进程退出或卡死了，刷新才回来
     ProcessGone,
-    /// 顶层收到了 HTTP 响应：地址与状态码（重定向之后的那个），在它成为文档、页面脚本跑之前报。macOS 上对没成为
-    /// 文档的响应（转为下载、被新的导航取代）也报，按地址认领。只有 macOS、Linux 报
+    /// 顶层收到了 HTTP 响应：地址与状态码（重定向之后的那个），在页面脚本跑之前报：macOS 上在决定怎么处理响应时（早于
+    /// wry 报开始显示；没成为文档的响应，如转为下载、被新的导航取代，也报），Linux 上在提交时（与 wry 报开始显示同一次
+    /// 回调、在它之后）。按地址认领。只有 macOS、Linux 报
     Responded { url: String, status: u16 },
     /// 顶层文档加载完：网页引擎给的它的 HTTP 状态码。只有 Windows 报（WebView2 到加载完才给状态码；旧的运行时没有
     /// `ICoreWebView2NavigationCompletedEventArgs2`，不报）

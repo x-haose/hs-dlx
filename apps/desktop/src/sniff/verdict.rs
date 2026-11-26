@@ -25,7 +25,7 @@ pub enum Verdict {
 }
 
 /// 判断到哪一步。网页类型的文档要正文就绪（或加载完）且知道了它的 HTTP 状态码才定论。状态码有三个来处：网页引擎在
-/// 响应到时报（macOS、Linux，带地址：与开始显示的地址是同一文档时归给它，两者谁先到都行；没成为文档的响应不会被别的
+/// 页面脚本跑之前报（macOS、Linux，带地址：与开始显示的地址是同一文档时归给它，两者谁先到都行；没成为文档的响应不会被别的
 /// 文档领走），页面在文档建出时从导航记录读（Chromium），网页引擎在加载完时报（Windows）；有前面的就不用后面的。整页
 /// 的人机验证不等状态码（它本身多为 403、503，不论状态码都是网页）。
 #[derive(Debug)]
@@ -37,7 +37,7 @@ pub(super) struct Judge {
     content: Option<bool>,
     /// 网页引擎报来、还没有文档认领的响应：地址与状态码
     pending: Option<(String, u16)>,
-    /// 开始显示了、还没报类型的文档的地址
+    /// 开始显示了、还没报类型、也还没认领到状态码的文档的地址（每个文档只认领一次）
     shown: Option<String>,
     /// 开始显示的文档认领到的网页引擎的状态码，等它报类型时归给它
     committed: Option<u16>,
@@ -70,6 +70,7 @@ impl Judge {
             .as_deref()
             .is_some_and(|shown| same_document(shown, &url))
         {
+            self.shown = None;
             self.committed = Some(status);
         } else {
             self.pending = Some((url, status));
@@ -83,7 +84,7 @@ impl Judge {
             .take()
             .filter(|(responded, _)| same_document(responded, url))
             .map(|(_, status)| status);
-        self.shown = Some(url.to_owned());
+        self.shown = self.committed.is_none().then(|| url.to_owned());
     }
 
     /// 顶层文档建出时报了类型与页面读到的状态码 `status`：网页类型等正文就绪再定，别的即不是网页。有了结论时为 true
@@ -183,6 +184,14 @@ mod tests {
 
     const A: &str = "https://a.example/v";
 
+    /// 网页引擎报了 `A` 的响应、开始显示它，它还没报类型。
+    fn shown_before_document(status: u16) -> Judge {
+        let mut judge = Judge::new();
+        judge.responded(A.into(), status);
+        judge.started(A);
+        judge
+    }
+
     /// 网页引擎报了 `A` 的响应、开始显示它、它报了网页类型。
     fn shown(status: u16) -> Judge {
         let mut judge = Judge::new();
@@ -236,6 +245,13 @@ mod tests {
         judge.document("text/html", None);
         assert!(judge.content(false, false));
         assert_eq!(judge.verdict(), &Verdict::Refused(403));
+
+        // 认领过的文档不被同一地址的下一次响应（刷新）改掉
+        let mut judge = shown_before_document(200);
+        judge.responded(A.into(), 503);
+        judge.document("text/html", None);
+        assert!(judge.content(false, false));
+        assert_eq!(judge.verdict(), &Verdict::Page);
 
         // 显示的地址带账号口令、响应的没有，片段不同：同一个文档
         let mut judge = Judge::new();

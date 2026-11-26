@@ -79,7 +79,8 @@ libtorrent。接下来会加入更多网盘、边下边播，见[路线图](#路
 
 - 粘贴 YouTube、B 站等网站的视频页地址：经 [yt-dlp](https://github.com/yt-dlp/yt-dlp) 解析出几档画质，选一档下载。
   视频与音频分开下再合成一个文件（MP4，编码放不进时改 MKV），能暂停、续传；每次开始都重新解析，下载地址过期也接得上。
-- 只有 yt-dlp 有专门解析器的网站交给它；别的网页到内置网页里找视频流。
+- 只有 yt-dlp 有专门解析器的网站交给它；别的网页到内置网页里找视频流（yt-dlp 还没装时先提示安装，也可以直接改到
+  内置网页里找）。
 - yt-dlp 第一次用时下载（约 11 MB），之后在后台保持最新，可换回上一个版本或改用每日构建；画质可选兼容优先（H.264 +
   AAC）或画质优先。
 - 要登录才能看的：在内置网页里登录后解析，或在设置里选你常用的浏览器、解析时读它的登录信息（macOS 上要给「完全磁盘
@@ -127,7 +128,8 @@ libtorrent。接下来会加入更多网盘、边下边播，见[路线图](#路
 
 **网络与出错**
 
-- 代理：跟随系统、直连，或只填端口（保存时自动认出 SOCKS5 还是 HTTP）；嗅探页的网页走同一个出口。
+- 代理：跟随系统、直连，或指定代理：一般只填端口（主机默认 127.0.0.1，保存时自动认出 SOCKS5 还是 HTTP），也可以
+  改主机、指定协议，要登录的填用户名与密码；嗅探页的网页走同一个出口。
 - 请求头：新建时可加；遇到 401、403 时改请求头后重试。
 - 失败按种类说明原因与能做的事：改请求头再试、改存本地 HLS、写出已录的、稍后重试。
 
@@ -160,10 +162,10 @@ libtorrent。接下来会加入更多网盘、边下边播，见[路线图](#路
 | 0.6 | **以任务为中心与插件**：一个链接从粘贴起就是一个任务，自己往下走、要处理时停下等，可同时粘贴多个；粘贴任何地址都走同一个入口自动认出；本机 WebSocket 控制接口；插件系统（yt-dlp 是第一个插件） |
 | 0.7 | **浏览器扩展**（接管下载、列出网页里的视频）、兼容 aria2 的 JSON-RPC；**批量下载**（多行粘贴、导入列表、地址模板、播放列表与频道整批下）；下载队列、全局限速、计划任务、按类型分目录 |
 | 0.8 | **边下边播与远程**：边下边播；手机等设备用浏览器控制、观看、传到手机；无界面运行（NAS、Docker） |
-| 0.9 | **视频深度**：DASH（点播与直播）、多音轨与字幕、MKV、只下一段、直播回看、去广告、HTTP-FLV 直播录制 |
+| 0.9 | **视频深度**：DASH（点播与直播）、多音轨与字幕、HLS 输出 MKV、只下一段、直播回看、去广告、HTTP-FLV 直播录制 |
 | 0.10 | **搜索插件**：插件可以提供视频与磁力搜索，搜到即下或边下边播；搜索插件在独立的仓库，应用本身不带任何资源 |
 
-穿插在各版之间：115、迅雷云离线；英文界面；只下音频。
+穿插在各版之间：115、迅雷云离线；英文界面；HLS 与文件的只下音频（网页视频已能只下音频）。
 
 ## 技术栈与结构
 
@@ -173,6 +175,7 @@ libtorrent。接下来会加入更多网盘、边下边播，见[路线图](#路
 | 嵌入网页 | [wry](https://github.com/tauri-apps/wry)：macOS 用 WKWebView，Windows 用 WebView2，Linux 用 WebKitGTK |
 | 下载引擎 | [hs-m3u8](https://github.com/x-haose/hs-m3u8) 的核心库（Rust、tokio）；BT 为静态链接的 [libtorrent](https://libtorrent.org) |
 | 合并 MP4 | 静态链接的精简 FFmpeg，只做转封装，不需要另装 |
+| 网页视频 | [yt-dlp](https://github.com/yt-dlp/yt-dlp)：第一次用时下载；它要的 Python（python-build-standalone）与 JavaScript 运行时（QuickJS-NG）随应用带着 |
 | 存储 | SQLite（随应用编译） |
 | 打包 | cargo-packager：dmg、NSIS、deb |
 
@@ -187,6 +190,7 @@ flowchart TD
     core["hs-m3u8-core<br/>HLS 与文件的引擎"]
     torrent["crates/torrent<br/>libtorrent 的绑定"]
     cloud["crates/cloud<br/>网盘（PikPak）的接口"]
+    ytdlp["crates/ytdlp<br/>yt-dlp 组件与解析"]
     desktop --> app
     desktop --> webview
     desktop --> relay
@@ -195,6 +199,7 @@ flowchart TD
     app --> core
     app --> torrent
     app --> cloud
+    app --> ytdlp
     cloud --> core
 ```
 
@@ -209,6 +214,7 @@ WebKitGTK 4.1、GTK 3、xkbcommon 与 fontconfig 的开发包。
 ```sh
 make ffmpeg          # 编译静态链接的精简 FFmpeg（只需一次）
 make libtorrent      # 编译 BT 引擎用的 libtorrent 与 OpenSSL（只需一次，要 CMake、Ninja、Perl）
+make runtime         # 备好随应用带的 Python 与 QuickJS-NG（只需一次）
 cargo run -p hs-dlx  # 运行
 make check           # 全部检查
 make package         # 本机平台的安装包
