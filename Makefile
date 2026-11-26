@@ -46,16 +46,20 @@ icons: py_env
 # 桌面应用的安装包（配置见 apps/desktop/Cargo.toml 的 package.metadata.packager），放在 target/release。各平台的
 # 格式与 .github/workflows/desktop.yml 的矩阵一致：Linux 只打 deb，不打 AppImage（它带上打包机器的 WebKitGTK，在别的
 # 发行版上网页起不来）。cargo-packager 在哪个平台上都能打 .app 与 NSIS，所以格式要按平台指定
+# macOS 上设了 HS_DLX_SIGN_IDENTITY（签名身份）时签名，另设了 HS_DLX_NOTARY_PROFILE（notarytool 存进钥匙串的凭据名）时
+# 公证并钉上票据，见 scripts/macos_sign.py：.app 在打 dmg 之前（packager 的 before-each-package-command），dmg 在打完之后
 ifeq ($(OS),Windows_NT)
 PACKAGE_FORMATS := nsis
 else ifeq ($(shell uname -s),Darwin)
 PACKAGE_FORMATS := app,dmg
+PACKAGE_SIGN := uv run --no-project python -I scripts/macos_sign.py dmg target/release
 else
 PACKAGE_FORMATS := deb
 endif
 package: ffmpeg_present libtorrent_present runtime_present
 	@cargo packager --version >/dev/null 2>&1 || { echo "缺少 cargo-packager，版本见 .github/workflows/desktop.yml"; exit 1; }
 	cd apps/desktop && cargo packager --release --formats $(PACKAGE_FORMATS)
+	$(PACKAGE_SIGN)
 
 rs_clippy: ffmpeg_present libtorrent_present runtime_present
 	cargo clippy --workspace --all-targets -- -D warnings
