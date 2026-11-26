@@ -108,7 +108,7 @@ pub enum ExtractError {
     /// 网站说视频不可用：私密、删了、未开播等
     #[error("{0}")]
     Unavailable(String),
-    /// yt-dlp 列着用 DRM 加密视频的网站：下载不了，没向网站发请求
+    /// 视频用 DRM 加密，下载不了：yt-dlp 列着用 DRM 的网站（不向网站发请求即报），或解析出的格式全是 DRM 的
     #[error("{0}")]
     Drm(String),
     /// 组件正在换（[`Extractor::wait_idle`] 之后）：换好后用新的再试

@@ -1,8 +1,9 @@
 //! 网页里的视频流：网页在后台加载、不显示，主体列出找到的视频流，每条在后台探测好（几档清晰度、时长或直播），用户
 //! 挑一条下载。要登录、认证或手动点播放时可以打开网页（左边网页、右边列表），弄完收起。
 //!
-//! 页面的地址、加载、标题与故障由网页引擎报；脚本发回的只有找到的流、顶层文档的类型与正文是否为播放列表，按不可信
-//! 数据校验、限量（见 [`script`]、[`inbox`]）。打开的地址是不是网页按第一个顶层文档定论（见 [`verdict`]）。网页要开
+//! 页面的地址、加载、标题、故障与顶层文档的 HTTP 状态码由网页引擎报；脚本发回的只有找到的流与顶层文档的情况（类型、
+//! 页面读到的状态码、正文是否为播放列表、是不是整页的人机验证），按不可信数据校验、限量（见 [`script`]、[`inbox`]）。
+//! 打开的地址是不是网页按第一个顶层文档定论（见 [`verdict`]）。网页要开
 //! 的新窗口与要下载的文件都不放行，列出来由用户决定。网页里的视频与音频只在网页显示着时放。找不到流时，打开的地址
 //! 可以当作播放列表交回新建页（缺请求头时源站回了网页）。
 
@@ -189,7 +190,10 @@ impl SniffView {
                 inbox.offer(match event {
                     hs_dlx_webview::Event::LoadFailed(reason) => Engine::LoadFailed(reason),
                     hs_dlx_webview::Event::ProcessGone => Engine::Crashed,
-                    hs_dlx_webview::Event::Responded(status) => Engine::Responded(status),
+                    hs_dlx_webview::Event::Responded { url, status } => {
+                        Engine::Responded { url, status }
+                    }
+                    hs_dlx_webview::Event::Completed(status) => Engine::Completed(status),
                 });
             }
         };
@@ -335,6 +339,7 @@ impl SniffView {
                 self.download = None;
                 self.failure = None;
                 self.checking = None;
+                self.judge.started(&url);
                 self.load.shown = Some(url.clone());
                 self.load.finished = false;
                 self.navigated = Some(url);
@@ -354,10 +359,11 @@ impl SniffView {
                 self.failure = Some(reason.clone());
                 self.judge.fail(reason)
             }
-            Engine::Responded(status) => {
-                self.judge.responded(status);
+            Engine::Responded { url, status } => {
+                self.judge.responded(url, status);
                 false
             }
+            Engine::Completed(status) => self.judge.completed(status),
             Engine::Crashed => {
                 let reason = "网页进程意外退出了".to_owned();
                 self.failure = Some(reason.clone());
@@ -370,21 +376,23 @@ impl SniffView {
                     self.add(Found::new(url, frame, top, agent), cx);
                     false
                 }
-                Some(Report::Document { content_type }) => {
+                Some(Report::Document {
+                    content_type,
+                    status,
+                }) => {
                     self.challenge = false;
-                    self.judge.document(&content_type)
+                    self.judge.document(&content_type, status)
                 }
                 // 验证页藏在后台时用户不知道要先过验证：是验证页即把网页显示出来
                 Some(Report::Content {
                     playlist,
                     challenge,
-                    status,
                 }) => {
                     self.challenge = challenge;
                     if challenge && !self.page_shown {
                         self.show_page(true, cx);
                     }
-                    self.judge.content(playlist, challenge, status)
+                    self.judge.content(playlist, challenge)
                 }
                 None => return,
             },

@@ -210,6 +210,9 @@ impl Shell {
             Verdict::Pending => return,
             Verdict::Page => None,
             Verdict::Refused(status) => Some(format!("网页引擎打开它回 HTTP {status}")),
+            Verdict::Unknown => {
+                Some("网页引擎没报出它的 HTTP 状态码，判断不了是不是网页".to_owned())
+            }
             Verdict::NotPage(Some(kind)) => Some(format!("网页引擎打开它是 {kind}，不是网页")),
             Verdict::NotPage(None) => Some("网页引擎打开它也不是网页".to_owned()),
             Verdict::Playlist => Some("网页引擎打开它是 HLS 播放列表，不是网页".to_owned()),

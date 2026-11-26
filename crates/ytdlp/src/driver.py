@@ -15,7 +15,7 @@
     "profile": 读它的这个用户资料（目录的绝对路径）或 null（浏览器没有用户资料之分时）, "site": 网页的可注册域名
     （交回哪些 Cookie，见 `site_cookies`）}`；
     `generic` 为假时不发请求即按 `claim` 回：列着用 DRM 加密的网站回 `drm`，没有专门解析器的回 `unsupported`；
-    视频没有格式时照网站说的原因（要登录、人机验证、限流、地区限制、不可用）回错误
+    视频没有格式时照网站说的原因（要登录、人机验证、限流、地区限制、不可用、DRM 加密）回错误
   - 回应 `{"id": 同请求, "ok": 结果}` 或 `{"id": 同请求, "error": {"kind": 种类, "message": 说明}}`，种类见
     `classify`；从浏览器读 Cookie 没成时种类为 `cookies`，另有 `reason`（见 `browser_cookies`）。读完 Cookie（含从
     浏览器读）、开始解析网页时先回一行 `{"id": 同请求, "stage": "resolving"}`：应用从这时起算解析的时限（读浏览器的
@@ -443,11 +443,11 @@ def in_chain(root: BaseException, test: Callable[[BaseException], bool]) -> bool
 def said(message: str) -> str:
     """网站自己说的不能播的原因的种类：DRM 加密、限流、要登录（含人机验证）、其余为不可用。
 
-    DRM 按 yt-dlp 自己的两种说法认：视频的格式全是 DRM 的（「This video is DRM protected」）、网站列着用 DRM 的
-    （「known to use DRM protection」）。
+    DRM 只认 yt-dlp 自己的两句：视频的格式全是 DRM 的（「This video is DRM protected」）、网站列着用 DRM 的
+    （「known to use DRM protection」）；「unavailable in your region or is DRM protected」这类说不准的不算。
     """
     lowered = message.lower()
-    if "drm protected" in lowered or "drm protection" in lowered:
+    if "this video is drm protected" in lowered or "known to use drm protection" in lowered:
         return "drm"
     if any(word in lowered for word in ("rate-limited", "try again later", "too many requests")):
         return "rate_limited"

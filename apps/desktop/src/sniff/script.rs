@@ -14,12 +14,11 @@ use crate::links::http_url;
 ///   并实测后去掉这一限制。
 /// - 播放列表：fetch 与 XHR 的响应类型是 HLS 播放列表（`application/vnd.apple.mpegurl` 之类）的，与地址路径以
 ///   `.m3u8` 结尾的请求（含资源加载记录与 video、source 元素上的），每个地址只报一次。
-/// - 文档类型：顶层框架在文档建出时报一次 `document.contentType`，正文就绪（DOMContentLoaded）时再报一次正文是否以
+/// - 文档类型：顶层框架在文档建出时（页面脚本跑之前）报一次 `document.contentType` 与从导航记录读到的 HTTP 状态码
+///   （`responseStatus`：Chromium（WebView2）有，WebKit 没有，为 null），正文就绪（DOMContentLoaded）时再报一次正文是否以
 ///   `#EXTM3U` 开头（按网页类型发来的播放列表）、是不是整页的人机验证。人机验证只认 Cloudflare 的验证页（页面脚本
 ///   定义了它的 `_cf_chl_opt`）；过了验证即换成新文档，新文档再报一次。页面里嵌的验证框（登录框旁隐形的 reCAPTCHA
-///   之类）不算：不该为它把网页弹出来。正文就绪时一并报文档建出时（页面脚本跑之前）从导航记录读到的 HTTP 状态码
-///   （`responseStatus`）：Chromium（WebView2）有，WebKit 没有，为 null（那里由网页引擎报，见
-///   [`hs_dlx_webview::Event::Responded`]）。
+///   之类）不算：不该为它把网页弹出来。
 /// - 发回 JSON（见 [`Report`]）。发送出的任何错都不抛进页面：脚本改写了页面的 fetch 与 XHR，抛出的异常会成为页面
 ///   自己的请求失败。
 pub const SCRIPT: &str = r#"
@@ -30,23 +29,25 @@ pub const SCRIPT: &str = r#"
   var webkit = handlers && handlers.ipc;
   if (!webkit && window !== window.top) return;
   var channel = webkit || window.ipc;
+  // 页面脚本跑起来之后可能换掉这两个：先拿到原来的
+  var post = channel.postMessage.bind(channel);
+  var stringify = JSON.stringify;
   var send = function (message) {
-    try { channel.postMessage(JSON.stringify(message)); } catch (e) {}
+    try { post(stringify(message)); } catch (e) {}
   };
   if (window === window.top) {
-    send({ kind: 'document', type: document.contentType });
     var status = null;
     try {
       var navigation = performance.getEntriesByType('navigation')[0];
       if (navigation && navigation.responseStatus > 0) status = navigation.responseStatus;
     } catch (e) {}
+    send({ kind: 'document', type: document.contentType, status: status });
     var content = function () {
       var text = document.body ? document.body.textContent : '';
       send({
         kind: 'content',
         playlist: /^\s*#EXTM3U/.test(text.slice(0, 64)),
-        challenge: typeof window._cf_chl_opt !== 'undefined',
-        status: status
+        challenge: typeof window._cf_chl_opt !== 'undefined'
       });
     };
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', content);
@@ -112,15 +113,21 @@ pub const MAX_TEXT: usize = 300;
 pub enum Report {
     /// 找到一个播放列表的地址；`agent` 为网页的 User-Agent
     Stream { url: Url, agent: String },
-    /// 顶层文档的类型（MIME，如 `text/html`）
-    Document { content_type: String },
-    /// 顶层文档的正文就绪：`playlist` 为正文以 `#EXTM3U` 开头，`challenge` 为这一页是整页的人机验证，`status` 为页面
-    /// 读到的 HTTP 状态码（读不到时为 None）
-    Content {
-        playlist: bool,
-        challenge: bool,
+    /// 顶层文档建出：类型（MIME，如 `text/html`）与页面读到的 HTTP 状态码（读不到时为 None）
+    Document {
+        content_type: String,
         status: Option<u16>,
     },
+    /// 顶层文档的正文就绪：`playlist` 为正文以 `#EXTM3U` 开头，`challenge` 为这一页是整页的人机验证
+    Content { playlist: bool, challenge: bool },
+}
+
+/// 消息 `body` 是报顶层文档的类型或正文的（定论要用，见 [`Report::Document`]、[`Report::Content`]）。
+pub fn reports_page(body: &str) -> bool {
+    matches!(
+        parse(body),
+        Some(Report::Document { .. } | Report::Content { .. })
+    )
 }
 
 /// 消息的原样内容，未校验。
@@ -134,11 +141,11 @@ enum Raw {
     Document {
         #[serde(rename = "type")]
         content_type: String,
+        status: Option<u16>,
     },
     Content {
         playlist: bool,
         challenge: bool,
-        status: Option<u16>,
     },
 }
 
@@ -152,17 +159,19 @@ pub fn parse(message: &str) -> Option<Report> {
             url: http_url(&url)?,
             agent: clip(&agent),
         },
-        Raw::Document { content_type } => Report::Document {
+        Raw::Document {
+            content_type,
+            status,
+        } => Report::Document {
             content_type: clip(&content_type),
+            status,
         },
         Raw::Content {
             playlist,
             challenge,
-            status,
         } => Report::Content {
             playlist,
             challenge,
-            status,
         },
     })
 }
@@ -191,25 +200,24 @@ mod tests {
             })
         );
         assert_eq!(
-            parse(r#"{"kind":"document","type":"text/html"}"#),
+            parse(r#"{"kind":"document","type":"text/html","status":null}"#),
             Some(Report::Document {
-                content_type: "text/html".into()
-            })
-        );
-        assert_eq!(
-            parse(r#"{"kind":"content","playlist":true,"challenge":false,"status":null}"#),
-            Some(Report::Content {
-                playlist: true,
-                challenge: false,
+                content_type: "text/html".into(),
                 status: None
             })
         );
         assert_eq!(
-            parse(r#"{"kind":"content","playlist":false,"challenge":false,"status":403}"#),
-            Some(Report::Content {
-                playlist: false,
-                challenge: false,
+            parse(r#"{"kind":"document","type":"text/html","status":403}"#),
+            Some(Report::Document {
+                content_type: "text/html".into(),
                 status: Some(403)
+            })
+        );
+        assert_eq!(
+            parse(r#"{"kind":"content","playlist":true,"challenge":false}"#),
+            Some(Report::Content {
+                playlist: true,
+                challenge: false
             })
         );
         assert_eq!(parse(r#"{"kind":"content","playlist":true}"#), None);
@@ -225,7 +233,7 @@ mod tests {
             r#"{{"kind":"document","type":"{}\u0007"}}"#,
             "长".repeat(400)
         );
-        let Some(Report::Document { content_type }) = parse(&long) else {
+        let Some(Report::Document { content_type, .. }) = parse(&long) else {
             panic!("文档类型消息应认得");
         };
         assert_eq!(content_type.chars().count(), MAX_TEXT);

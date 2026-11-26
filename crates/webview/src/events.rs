@@ -1,4 +1,4 @@
-//! wry 不报的网页引擎事件：顶层导航失败、网页进程退出、顶层文档的 HTTP 状态码（macOS、Linux）。wry 的页面加载事件不分成败（打不开
+//! wry 不报的网页引擎事件：顶层导航失败、网页进程退出、顶层文档的 HTTP 状态码。wry 的页面加载事件不分成败（打不开
 //! 时 WebView2 显示自带的错误页，照样报开始与完成），也不给状态码，这里直接接各平台网页引擎的事件。
 
 use std::rc::Rc;
@@ -11,9 +11,12 @@ pub enum Event {
     LoadFailed(String),
     /// 网页进程退出或卡死了，刷新才回来
     ProcessGone,
-    /// 顶层文档收到了 HTTP 响应：状态码（重定向之后的那个），在这个文档建出、页面脚本跑之前报。只有 macOS、Linux
-    /// 报：WebView2 要到加载完才给状态码，那里由页面自己从导航记录里读
-    Responded(u16),
+    /// 顶层收到了 HTTP 响应：地址与状态码（重定向之后的那个），在它成为文档、页面脚本跑之前报。macOS 上对没成为
+    /// 文档的响应（转为下载、被新的导航取代）也报，按地址认领。只有 macOS、Linux 报
+    Responded { url: String, status: u16 },
+    /// 顶层文档加载完：网页引擎给的它的 HTTP 状态码。只有 Windows 报（WebView2 到加载完才给状态码；旧的运行时没有
+    /// `ICoreWebView2NavigationCompletedEventArgs2`，不报）
+    Completed(u16),
 }
 
 /// 收到事件时调的。
@@ -44,7 +47,7 @@ pub(crate) fn before_build<'a>(
     builder
 }
 
-/// 建好网页之后：WebView2 接导航完成（看是否成功）与进程故障。
+/// 建好网页之后：WebView2 接导航完成（看是否成功、报状态码）与进程故障。
 #[cfg(target_os = "windows")]
 pub(crate) fn after_build(webview: &wry::WebView, report: &Report) -> wry::Result<Hooks> {
     use webview2_com::Microsoft::Web::WebView2::Win32::{
@@ -70,30 +73,40 @@ pub(crate) fn after_build(webview: &wry::WebView, report: &Report) -> wry::Resul
             let mut success = BOOL::default();
             // SAFETY: 引擎在界面线程上回调，参数在回调期间有效；出参指向本地变量。
             unsafe { args.IsSuccess(&mut success) }?;
-            if success.as_bool() {
-                return Ok(());
-            }
-            let mut status = COREWEBVIEW2_WEB_ERROR_STATUS::default();
-            // SAFETY: 同上。
-            unsafe { args.WebErrorStatus(&mut status) }?;
-            // 被别的导航取代（换页、下载）不算没打开
-            if status == COREWEBVIEW2_WEB_ERROR_STATUS_OPERATION_CANCELED {
-                return Ok(());
-            }
-            // 拿到了 HTTP 响应的（4xx、5xx：要登录、人机验证、地区限制的页面照样显示了）不算没打开；状态码为 0 即没
-            // 拿到响应。旧的 WebView2 运行时没有这个接口，照没成报
-            if let Ok(args) = args.cast::<ICoreWebView2NavigationCompletedEventArgs2>() {
-                let mut code = 0;
+            if !success.as_bool() {
+                let mut status = COREWEBVIEW2_WEB_ERROR_STATUS::default();
                 // SAFETY: 同上。
-                unsafe { args.HttpStatusCode(&mut code) }?;
-                if code > 0 {
+                unsafe { args.WebErrorStatus(&mut status) }?;
+                // 被别的导航取代（换页、下载）：既不是没打开，它的状态码也不属于显示着的文档
+                if status == COREWEBVIEW2_WEB_ERROR_STATUS_OPERATION_CANCELED {
                     return Ok(());
                 }
             }
-            report(Event::LoadFailed(format!(
-                "网页引擎报导航没成（WebErrorStatus {}）",
-                status.0
-            )));
+            // 拿到了 HTTP 响应时为状态码，为 0 即没拿到响应。旧的 WebView2 运行时没有这个接口
+            let code = match args.cast::<ICoreWebView2NavigationCompletedEventArgs2>() {
+                Ok(args) => {
+                    let mut code = 0;
+                    // SAFETY: 同上。
+                    unsafe { args.HttpStatusCode(&mut code) }?;
+                    u16::try_from(code).ok().filter(|code| *code > 0)
+                }
+                Err(_) => None,
+            };
+            match code {
+                Some(code) => report(Event::Completed(code)),
+                // 拿到了 HTTP 响应的（4xx、5xx：要登录、人机验证、地区限制的页面照样显示了）不算没打开；没成而报不出
+                // 状态码的（没拿到响应，或旧的运行时）照没成报
+                None if !success.as_bool() => {
+                    let mut status = COREWEBVIEW2_WEB_ERROR_STATUS::default();
+                    // SAFETY: 同上。
+                    unsafe { args.WebErrorStatus(&mut status) }?;
+                    report(Event::LoadFailed(format!(
+                        "网页引擎报导航没成（WebErrorStatus {}）",
+                        status.0
+                    )));
+                }
+                None => {}
+            }
             Ok(())
         }))
     };
@@ -142,13 +155,20 @@ pub(crate) fn after_build(webview: &wry::WebView, report: &Report) -> wry::Resul
         if event != LoadEvent::Committed {
             return;
         }
-        // 不是 HTTP 的（file:、data:）状态码为 0
-        let code = view
+        let Some(response) = view
             .main_resource()
             .and_then(|resource| resource.response())
-            .map(|response| response.status_code());
-        if let Some(Ok(code @ 1..)) = code.map(u16::try_from) {
-            responded(Event::Responded(code));
+        else {
+            return;
+        };
+        // 不是 HTTP 的（file:、data:）状态码为 0
+        if let (Ok(status @ 1..), Some(url)) =
+            (u16::try_from(response.status_code()), response.uri())
+        {
+            responded(Event::Responded {
+                url: url.to_string(),
+                status,
+            });
         }
     });
     let failed = report.clone();
@@ -246,9 +266,13 @@ pub(crate) mod mac {
                 let answer = unsafe { response.response() };
                 if main
                     && let Ok(http) = answer.downcast::<NSHTTPURLResponse>()
-                    && let Ok(code) = u16::try_from(http.statusCode())
+                    && let Ok(status) = u16::try_from(http.statusCode())
+                    && let Some(url) = http.URL().and_then(|url| url.absoluteString())
                 {
-                    (self.ivars().report)(Event::Responded(code));
+                    (self.ivars().report)(Event::Responded {
+                        url: url.to_string(),
+                        status,
+                    });
                 }
                 let inner = &self.ivars().inner;
                 if inner.respondsToSelector(sel!(webView:decidePolicyForNavigationResponse:decisionHandler:)) {
