@@ -61,14 +61,24 @@ enum Page {
         from_sniff: bool,
         page_check: Option<(Entity<SniffView>, Subscription)>,
     },
-    /// 设置页：视图与对它的订阅，离开时一起释放
+    /// 设置页：视图与对它的订阅，离开时一起释放；`back` 为打开设置时换下的那一页，原样留着（新建页照常探测），关上设置
+    /// 时回到它
     Settings {
         view: Entity<SettingsView>,
         _subscription: Subscription,
+        back: Box<Page>,
     },
     /// 网页里的视频流：只经 [`Shell::show_sniff`] 换上，视图即 [`Shell::sniff`] 里的；网页显示着时占满主体，不显示任务
     /// 列表
     Sniff(Entity<SniffView>),
+}
+
+/// 显示着的这一页 `page`；设置页开着时为它后面的那一页（新建页在后面照常探测，它引起的换页落在这一页上）。
+fn underlying(page: &mut Page) -> &mut Page {
+    match page {
+        Page::Settings { back, .. } => back,
+        page => page,
+    }
 }
 
 /// 主窗口的视图：任务状态在 [`Tasks`] 里，这里是这个窗口自己的（选中哪个任务、显示哪一页、粘贴栏、嗅探页）。
@@ -326,9 +336,27 @@ impl Shell {
     /// 打开设置页；已开着时关上。
     fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.page, Page::Settings { .. }) {
-            self.show(Page::Task, cx);
+            self.close_settings(cx);
         } else {
             self.open_settings(window, cx);
+        }
+    }
+
+    /// 换到 `page`；设置页开着时不打断它，换掉它后面的那一页（关上设置即看到）。用于不是用户点出来的换页（后台的结论）。
+    fn show_under(&mut self, page: Page, cx: &mut Context<Self>) {
+        match &mut self.page {
+            Page::Settings { back, .. } => **back = page,
+            _ => self.show(page, cx),
+        }
+    }
+
+    /// 关上设置页，回到打开它时换下的那一页；不在设置页时什么也不做。
+    pub(super) fn close_settings(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.page, Page::Settings { .. }) {
+            return;
+        }
+        if let Page::Settings { back, .. } = std::mem::replace(&mut self.page, Page::Task) {
+            self.show(*back, cx);
         }
     }
 
@@ -349,14 +377,20 @@ impl Shell {
         let view = cx.new(|cx| SettingsView::new(tasks, updates, home, settings, window, cx));
         let subscription = cx.subscribe(&view, |this: &mut Self, _, event: &SettingsEvent, cx| {
             match event {
-                SettingsEvent::Dismissed => this.show(Page::Task, cx),
+                SettingsEvent::Dismissed => this.close_settings(cx),
             }
             cx.notify();
         });
+        let back = Box::new(std::mem::replace(&mut self.page, Page::Task));
+        // 换下的是嗅探页时告诉它不在屏幕上了（show 只看换下的这一页，这时已是任务页）
+        if let Page::Sniff(sniff) = &*back {
+            sniff.update(cx, |sniff, cx| sniff.set_on_screen(false, cx));
+        }
         self.show(
             Page::Settings {
                 view,
                 _subscription: subscription,
+                back,
             },
             cx,
         );

@@ -15,8 +15,10 @@ impl Shell {
         let request = match links::request(text) {
             Ok(request) => request,
             Err(reason) => {
-                // 嗅探页与设置页不放粘贴栏（转交来的内容可能在这时到）：回任务页，原因才看得见
-                if matches!(self.page, Page::Sniff(_) | Page::Settings { .. }) {
+                // 嗅探页与设置页不放粘贴栏（转交来的内容可能在这时到）：关上设置回到原来那一页，是嗅探页时再回任务页，
+                // 原因才看得见
+                self.close_settings(cx);
+                if matches!(self.page, Page::Sniff(_)) {
                     self.show(Page::Task, cx);
                 }
                 self.dock.update(cx, |dock, cx| dock.refuse(reason, cx));
@@ -120,6 +122,10 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 在设置页后面探测好的不抢焦点（用户在设置里打字）
+        if self.new_task() != Some(view) {
+            return;
+        }
         let dock = self.dock.read(cx);
         let typing = dock.typing(window, cx);
         let same = links::target(&dock.text(cx)).is_some_and(|url| &url == view.read(cx).url());
@@ -137,7 +143,7 @@ impl Shell {
             from_sniff: false,
             page_check,
             ..
-        } = &mut self.page
+        } = super::underlying(&mut self.page)
         else {
             return;
         };
@@ -171,7 +177,7 @@ impl Shell {
     ) {
         let Page::NewTask {
             view, page_check, ..
-        } = &mut self.page
+        } = super::underlying(&mut self.page)
         else {
             return;
         };
@@ -295,7 +301,7 @@ impl Shell {
                 cx.notify();
             },
         );
-        self.sniff = Some((view, subscription));
-        self.show_sniff(cx);
+        self.sniff = Some((view.clone(), subscription));
+        self.show_under(Page::Sniff(view), cx);
     }
 }
