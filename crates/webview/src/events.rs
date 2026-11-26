@@ -23,11 +23,12 @@ pub enum Event {
 /// 收到事件时调的。
 pub(crate) type Report = Rc<dyn Fn(Event)>;
 
-/// 接着网页引擎事件的东西，与网页同生命周期（macOS 上为包着 wry 导航代理的那一层，网页只弱引用它）。
-#[cfg(target_os = "macos")]
-pub(crate) type Hooks = objc2::rc::Retained<mac::ResponseWatch>;
-#[cfg(not(target_os = "macos"))]
-pub(crate) type Hooks = ();
+/// 接着网页引擎事件的东西，与网页同生命周期。
+pub(crate) struct Hooks {
+    /// 包着 wry 导航代理的那一层：网页只弱引用它
+    #[cfg(target_os = "macos")]
+    _watch: objc2::rc::Retained<mac::ResponseWatch>,
+}
 
 /// 建网页之前：macOS 上网页进程退出只能在建之前登记。
 #[cfg(target_os = "macos")]
@@ -138,7 +139,7 @@ pub(crate) fn after_build(webview: &wry::WebView, report: &Report) -> wry::Resul
     };
     // SAFETY: 同 add_NavigationCompleted。
     unsafe { core.add_ProcessFailed(&crashed, &mut token) }.map_err(failed)?;
-    Ok(())
+    Ok(Hooks {})
 }
 
 /// 建好网页之后：WebKitGTK 接主资源加载失败、提交（取状态码）与网页进程退出。
@@ -185,7 +186,7 @@ pub(crate) fn after_build(webview: &wry::WebView, report: &Report) -> wry::Resul
     });
     let crashed = report.clone();
     view.connect_web_process_terminated(move |_, _| crashed(Event::ProcessGone));
-    Ok(())
+    Ok(Hooks {})
 }
 
 /// 建好网页之后：在 wry 的导航代理外面包一层，顶层文档的响应到时报状态码，别的都照转给 wry（见 [`mac::ResponseWatch`]）。
@@ -202,7 +203,7 @@ pub(crate) fn after_build(webview: &wry::WebView, report: &Report) -> wry::Resul
     let watch = mac::ResponseWatch::new(inner, report.clone(), mtm);
     // SAFETY: 在界面线程上设；网页只弱引用代理，`watch` 由调用方与网页一起持有，它又持有 wry 的代理（wry 自己也持有）。
     unsafe { view.setNavigationDelegate(Some(ProtocolObject::from_ref(&*watch))) };
-    Ok(watch)
+    Ok(Hooks { _watch: watch })
 }
 
 #[cfg(target_os = "macos")]
