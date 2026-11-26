@@ -145,6 +145,8 @@ pub struct SettingsView {
     web: web::WebSettings,
     /// 看着网页视频组件的状态
     _web: Task<()>,
+    /// 看着后台查新的 yt-dlp 的结果
+    _web_auto_check: Task<()>,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
@@ -220,6 +222,7 @@ impl SettingsView {
         });
         let mode = mode_of(&proxy);
         let web_states = tasks.read(cx).service().web_state();
+        let web_auto = tasks.read(cx).service().web_auto_check();
         let web = web::WebSettings {
             state: web_states.borrow().clone(),
             channel: settings.web_channel,
@@ -236,8 +239,10 @@ impl SettingsView {
             checking: None,
             previous: tasks.read(cx).service().web_previous(),
             error: None,
+            auto_check: web_auto.borrow().clone(),
         };
         let web_watch = Self::watch_web(cx, web_states);
+        let web_auto_watch = Self::watch_web_auto_check(cx, web_auto);
         SettingsView {
             tasks,
             home,
@@ -269,6 +274,7 @@ impl SettingsView {
             scroll: ScrollHandle::new(),
             web,
             _web: web_watch,
+            _web_auto_check: web_auto_watch,
         }
     }
 

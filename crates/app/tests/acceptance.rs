@@ -28,6 +28,8 @@ use tokio::runtime::Runtime;
 const YOUTUBE: &str = "https://www.youtube.com/watch?v=aqz-KE-bpKQ";
 /// 解不出 YouTube 现在的播放器的 JavaScript 挑战的 yt-dlp 版本：YouTube 再换播放器、它又解得出时换成那时解不出的。
 const OUTDATED: &str = "2026.10.26";
+/// 比 [`OUTDATED`] 更早的一版：先换到它再换到 [`OUTDATED`]，上一个就不是最新的，解析时换新要真的下载安装
+const OLDER: &str = "2026.10.21";
 /// B 站上存在多年的公开视频。
 const BILIBILI: &str = "https://www.bilibili.com/video/BV1GJ411x7h7";
 /// 在中国大陆直连被掐断的网站。
@@ -44,7 +46,8 @@ const BIG_BUCK_BUNNY: &str = "magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d870
 
 /// 装组件、解析、下载各自最多等多久。
 const INSTALL: Duration = Duration::from_secs(10 * 60);
-const RESOLVE: Duration = Duration::from_secs(3 * 60);
+/// 解析：含解不出 JavaScript 挑战时换新的 yt-dlp（下载安装）与再解析一次
+const RESOLVE: Duration = Duration::from_secs(10 * 60);
 const DOWNLOAD: Duration = Duration::from_secs(30 * 60);
 const LOGIN: Duration = Duration::from_secs(10 * 60);
 
@@ -117,7 +120,7 @@ impl Rig {
                 state.changed().await.unwrap();
                 match state.borrow_and_update().clone() {
                     WebState::Ready(version) => return version,
-                    WebState::Installing(_) => {}
+                    WebState::Installing(_) | WebState::Updating { .. } => {}
                     other => panic!("组件没装好：{other:?}"),
                 }
             }
@@ -334,19 +337,24 @@ fn youtube_downloads_pauses_resumes_and_plays() {
     ));
 }
 
-/// yt-dlp 旧到解不出 YouTube 的 JavaScript 挑战：解析时自动换上渠道上最新的、再解析一次，出得了画质。
+/// yt-dlp 旧到解不出 YouTube 的 JavaScript 挑战：解析时自动下载、换上渠道上最新的，再解析一次，出得了画质；换下的成了
+/// 上一个。
 #[test]
 #[ignore = "要联网，由 make acceptance 跑"]
 fn an_outdated_yt_dlp_is_updated_when_youtube_changes_its_player() {
     let rig = Rig::new("outdated");
     let latest = rig.install();
-    let outdated = rig.web_changed(|service| service.update_web(OUTDATED.to_owned()).unwrap());
-    assert_eq!(outdated, OUTDATED);
+    for version in [OLDER, OUTDATED] {
+        let changed = rig.web_changed(|service| service.update_web(version.to_owned()).unwrap());
+        assert_eq!(changed, version);
+    }
+    assert_eq!(rig.service.web_previous().as_deref(), Some(OLDER));
     let resolved = rig.resolve(YOUTUBE);
     println!("换上 {latest} 后：{} 档", resolved.choices.len());
     assert!(!resolved.choices.is_empty());
     assert_eq!(resolved.freshness, None);
     assert_eq!(*rig.service.web_state().borrow(), WebState::Ready(latest));
+    assert_eq!(rig.service.web_previous().as_deref(), Some(OUTDATED));
 }
 
 /// B 站：直连解析、下载最低的一档，下完能播放。

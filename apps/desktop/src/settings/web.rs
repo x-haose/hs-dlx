@@ -35,6 +35,8 @@ pub(super) struct WebSettings {
     pub previous: Option<String>,
     /// 最近一次操作没成的原因
     pub error: Option<String>,
+    /// 后台最近一次查新版没成的原因（见 [`hs_dlx_app::Service::web_auto_check`]）
+    pub auto_check: Option<String>,
 }
 
 impl SettingsView {
@@ -51,6 +53,25 @@ impl SettingsView {
                     this.web.previous = this.tasks.read(cx).service().web_previous();
                     // 换了版本，查到的不再作数
                     this.web.latest = None;
+                    cx.notify();
+                });
+                if open.is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// 看着后台查新的 yt-dlp 的结果，变了即重画。
+    pub(super) fn watch_web_auto_check(
+        cx: &mut Context<Self>,
+        mut checks: tokio::sync::watch::Receiver<Option<String>>,
+    ) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            while checks.changed().await.is_ok() {
+                let check = checks.borrow_and_update().clone();
+                let open = this.update(cx, |this, cx| {
+                    this.web.auto_check = check;
                     cx.notify();
                 });
                 if open.is_err() {
@@ -173,6 +194,29 @@ impl SettingsView {
                             }),
                         )),
                 ),
+            // 在用的照常能解析：只显示在换到哪一步，取消即照旧用它
+            WebState::Updating { version, progress } => div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(ui::steps(format::web_install_steps(progress)))
+                .child(
+                    line.child(
+                        ui::field(format!(
+                            "yt-dlp {version} · 在换新版：{}",
+                            format::web_install(progress)
+                        ))
+                        .flex_1(),
+                    )
+                    .child(ui::button(
+                        "web-cancel-install",
+                        "取消",
+                        Tone::Ghost,
+                        cx.listener(|this, _, _, cx| {
+                            this.tasks.read(cx).service().cancel_web_install();
+                        }),
+                    )),
+                ),
             WebState::Broken(_) => line.child(ui::field("运行不了").flex_1()).child(ui::button(
                 "web-install",
                 "重装",
@@ -225,6 +269,11 @@ impl SettingsView {
             (_, Some(Err(reason))) => Some(format!("没查成：{reason}")),
             _ => None,
         };
+        let auto_check = self
+            .web
+            .auto_check
+            .as_ref()
+            .map(|reason| format!("自动查新版没成：{reason}"));
         row(
             "组件",
             Some(
@@ -236,6 +285,7 @@ impl SettingsView {
                 .gap(px(12.))
                 .child(state)
                 .children(failed.map(ui::error_text))
+                .children(auto_check.map(ui::error_text))
                 .children(self.web.error.clone().map(ui::error_text)),
         )
     }

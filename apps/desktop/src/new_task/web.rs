@@ -30,11 +30,14 @@ impl WebChoice {
 }
 
 impl NewTask {
-    /// 地址回的是网页：组件装好了就解析，没装（或没装成）时等用户装，平台没有组件时照原来的去网页引擎里看。
+    /// 地址回的是网页：组件装好了就解析（正在换版本时照旧用在用的），没装（或没装成）时等用户装，平台没有组件时照原来的
+    /// 去网页引擎里看。
     pub(super) fn resolve_page(&mut self, first: bool, cx: &mut Context<Self>) {
         let state = self.service.web_state().borrow().clone();
         match state {
-            WebState::Ready(_) | WebState::UpdateFailed { .. } => self.resolve(first, cx),
+            WebState::Ready(_) | WebState::UpdateFailed { .. } | WebState::Updating { .. } => {
+                self.resolve(first, cx);
+            }
             WebState::Unavailable => self.not_resolvable(first, cx),
             WebState::Missing
             | WebState::Installing(_)
@@ -60,7 +63,12 @@ impl NewTask {
                     if !matches!(this.probing, Probing::NeedsWeb(_)) {
                         return false;
                     }
-                    if matches!(state, WebState::Ready(_) | WebState::UpdateFailed { .. }) {
+                    if matches!(
+                        state,
+                        WebState::Ready(_)
+                            | WebState::UpdateFailed { .. }
+                            | WebState::Updating { .. }
+                    ) {
                         this.resolve(first, cx);
                         return false;
                     }
@@ -234,6 +242,7 @@ impl NewTask {
             WebState::Missing
             | WebState::Ready(_)
             | WebState::UpdateFailed { .. }
+            | WebState::Updating { .. }
             | WebState::Unavailable => {}
         }
         if !matches!(state, WebState::Installing(_)) {

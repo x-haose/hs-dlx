@@ -13,7 +13,9 @@ use std::path::Path;
 
 pub use crate::browser::{Browser, CookieSource, Denied, Profile};
 pub use crate::bundle::{Bundle, Bundled};
-pub use crate::components::{Channel, Components, InstallProgress, Installed, Sources, Stage};
+pub use crate::components::{
+    Channel, Components, InstallProgress, Installed, Sources, Stage, is_newer,
+};
 pub use crate::extractor::{Cookie, ExtractError, Extractor, Request, WORKERS};
 pub use crate::info::{Entry, Format, FormatKey, Info, Live, Protocol, Size, Track};
 

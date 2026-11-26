@@ -79,7 +79,8 @@ pub struct Installed {
     pub version: String,
     /// 上一个 yt-dlp 版本（更新前的，留着可换回，见 [`Components::rollback`]）；没有时为 None
     pub previous: Option<String>,
-    /// 换回上一个版本时换下的那个：用户嫌它有问题，自动更新不再装它；没换回过、或之后又装过时为 None
+    /// 用户换回上一个版本时换下的那个：嫌它有问题，自动更新不再装它；没换回过、或之后换成过别的版本时为 None（重装同一
+    /// 版本时照旧）
     pub skipped: Option<String>,
     pub driver: PathBuf,
 }
@@ -288,22 +289,24 @@ impl Components {
     }
 
     /// 换回上一个 yt-dlp（更新后新版出了问题时）：不联网，自检过了才换，换后上一个是刚才在用的，它也记为跳过的（见
-    /// [`Installed::skipped`]）。没有上一个（没更新过，
-    /// 或它的目录没了）时报 [`Error::NoPrevious`]，没装时报 [`Error::NotInstalled`]。
+    /// [`Installed::skipped`]）。没有上一个（没更新过，或它的目录没了）时报 [`Error::NoPrevious`]，没装时报
+    /// [`Error::NotInstalled`]。
     pub async fn rollback(&self, cancel: &CancellationToken) -> Result<Installed, Error> {
         let _busy = self.busy.lock().await;
-        self.switch_back(cancel).await
+        self.switch_back(cancel, true).await
     }
 
-    /// [`Components::rollback`] 拿到锁之后的部分。
-    async fn switch_back(&self, cancel: &CancellationToken) -> Result<Installed, Error> {
+    /// [`Components::rollback`] 拿到锁之后的部分；`skip` 时把换下的记为跳过的（用户换回），否则不再跳过什么（更新到的
+    /// 正好是上一个）。
+    async fn switch_back(
+        &self,
+        cancel: &CancellationToken,
+        skip: bool,
+    ) -> Result<Installed, Error> {
         let current = self.installed()?.ok_or(Error::NotInstalled)?;
         let previous = current.previous.clone().ok_or(Error::NoPrevious)?;
-        let back = self.installed_as(
-            &previous,
-            Some(current.version.clone()),
-            Some(current.version.clone()),
-        );
+        let skipped = skip.then(|| current.version.clone());
+        let back = self.installed_as(&previous, Some(current.version.clone()), skipped.clone());
         if !back.site.is_dir() {
             return Err(Error::NoPrevious);
         }
@@ -320,12 +323,8 @@ impl Components {
                 "要换回的是 {previous}，那个目录里装的是 {found}"
             )));
         }
-        self.write_state(
-            &previous,
-            Some(current.version.clone()),
-            Some(current.version),
-        )
-        .await?;
+        self.write_state(&previous, Some(current.version), skipped)
+            .await?;
         Ok(back)
     }
 
@@ -487,7 +486,7 @@ impl Components {
         if current.previous.as_deref() == Some(version)
             && self.root.join(format!("yt-dlp-{version}")).is_dir()
         {
-            match self.switch_back(cancel).await {
+            match self.switch_back(cancel, false).await {
                 Err(Error::SelfTest(broken)) => {
                     self.prepare().await?;
                     return self
@@ -898,19 +897,25 @@ impl Components {
         }
         let target = self.root.join(format!("yt-dlp-{version}"));
         self.replace_dir(&staging, &target).await?;
-        // 重装同一版本时上一个照旧；Python 的 ABI 变了时上一个是按旧的装的（带按 ABI 编译的扩展模块），不再算
-        let previous = match self.state() {
-            Ok(Some(state)) if state.python != self.bundle.python_abi => None,
-            Ok(Some(state)) if state.yt_dlp == version => state.previous,
-            Ok(Some(state)) => Some(state.yt_dlp),
-            Ok(None) | Err(_) => None,
+        // 重装同一版本时上一个与跳过的照旧；Python 的 ABI 变了时上一个是按旧的装的（带按 ABI 编译的扩展模块），不再算。
+        // 换成别的版本时不再跳过什么：用户选的，或自动更新装的、比跳过的新的
+        let (previous, skipped) = match self.state() {
+            Ok(Some(state))
+                if state.yt_dlp == version && state.python != self.bundle.python_abi =>
+            {
+                (None, state.skipped)
+            }
+            Ok(Some(state)) if state.yt_dlp == version => (state.previous, state.skipped),
+            Ok(Some(state)) if state.python != self.bundle.python_abi => (None, None),
+            Ok(Some(state)) => (Some(state.yt_dlp), None),
+            Ok(None) | Err(_) => (None, None),
         };
-        // 装上了就不再跳过什么：要么是用户自己选的版本，要么是自动更新装的、比跳过的那个新的
-        self.write_state(version, previous.clone(), None).await?;
+        self.write_state(version, previous.clone(), skipped.clone())
+            .await?;
         for path in &paths {
             remove(path).await?;
         }
-        Ok(self.installed_as(version, previous, None))
+        Ok(self.installed_as(version, previous, skipped))
     }
 
     /// PyPI 上 `name` 的 `version` 这一版。
@@ -1204,6 +1209,29 @@ fn write_atomically_blocking(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     std::fs::rename(&temporary, path).map_err(|error| Error::disk(path, &error))
 }
 
+/// yt-dlp 的版本 `candidate` 是否比 `than` 新，按 PEP 440 比 yt-dlp 用到的写法：发布号（`2026.11.23`、每日构建的
+/// `2026.11.16.232655`，短的补 0 再比），同一发布号下 `.devN` 更旧。有一个认不出时为 false：不把认不出的版本当新的自动装。
+pub fn is_newer(candidate: &str, than: &str) -> bool {
+    match (version_key(candidate), version_key(than)) {
+        (Some(candidate), Some(than)) => candidate > than,
+        _ => false,
+    }
+}
+
+/// [`is_newer`] 比较用的键：补 0 到 6 段的发布号，与预发布的次序（正式版为 `u64::MAX`，比任何 `.devN` 大）；超过 6 段或
+/// 有一段不是数字时为 None。
+fn version_key(version: &str) -> Option<([u64; 6], u64)> {
+    let (release, dev) = match version.split_once(".dev") {
+        Some((release, dev)) => (release, dev.parse().ok()?),
+        None => (version, u64::MAX),
+    };
+    let mut parts = [0; 6];
+    for (index, part) in release.split('.').enumerate() {
+        *parts.get_mut(index)? = part.parse().ok()?;
+    }
+    Some((parts, dev))
+}
+
 /// PyPI 的 JSON 接口回的 `body` 里 `channel` 上最新的版本：稳定版为 `info.version`；每日构建为上传最晚的 `.dev` 版本
 /// （没有比稳定版新的时为稳定版）。
 fn latest_of(body: &[u8], channel: Channel) -> Result<String, Error> {
@@ -1256,6 +1284,20 @@ fn latest_of(body: &[u8], channel: Channel) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 发布号逐段按数比（短的补 0），同一发布号下预发布更旧；认不出的不算新。
+    #[test]
+    fn versions_compare_by_release_then_prerelease() {
+        assert!(is_newer("2026.11.23", "2026.10.26"));
+        assert!(is_newer("2026.11.3", "2026.10.26"));
+        assert!(!is_newer("2026.10.26", "2026.11.23"));
+        assert!(!is_newer("2026.11.23", "2026.11.23"));
+        assert!(is_newer("2026.11.16.232655.dev0", "2026.11.16"));
+        assert!(is_newer("2026.11.16.232655", "2026.11.16.232655.dev0"));
+        assert!(!is_newer("2026.11.16", "2026.11.16.232655.dev0"));
+        assert!(!is_newer("2026.11.23rc1", "2026.10.26"));
+        assert!(!is_newer("2026.11.23", "latest"));
+    }
 
     #[test]
     fn pip_installs_offline_into_the_target() {

@@ -1,6 +1,6 @@
 //! 网页视频（yt-dlp 解析出的）的画质选项：每档清晰度挑一个视频、配一条音轨，另有只要音频的；每一路定下由谁下载。
 
-use hs_dlx_ytdlp::{Format, FormatKey, Info, Protocol, Size, Track};
+use hs_dlx_ytdlp::{Channel, Format, FormatKey, Info, Protocol, Size, Track};
 use hs_m3u8_core::Url;
 
 /// 视频的编码。
@@ -220,8 +220,8 @@ pub fn choices(info: &Info, preference: Preference) -> Vec<Choice> {
 /// 解不出 JavaScript 挑战（[`Info::challenge_failed`]）、没有能下的格式时，换新的 yt-dlp 为什么没换成。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Freshness {
-    /// 在用的已是渠道上最新的（查过，或刚换上最新的仍解不出）
-    Latest,
+    /// 在用的不比渠道 `.0` 上最新的旧（查过，或刚换上最新的仍解不出）
+    Latest(Channel),
     /// 渠道上最新的是用户换回时换下的（见 [`hs_dlx_ytdlp::Installed::skipped`]）：不自动装它
     Skipped(String),
     /// 查不了或没换成：原因
@@ -242,8 +242,11 @@ pub fn no_choice_reason(info: &Info, freshness: Option<&Freshness>) -> String {
     if info.challenge_failed {
         let unsolved = "yt-dlp 解不出网站播放器的 JavaScript 挑战，拿不到视频地址";
         return warnings(&match freshness {
-            Some(Freshness::Latest) => format!(
-                "{unsolved}；在用的已是最新的 yt-dlp，多为网站刚换了播放器、yt-dlp 还没跟上：可在设置「网页视频」里换到每日构建（修复最先到那里），或过一阵再试"
+            Some(Freshness::Latest(Channel::Stable)) => format!(
+                "{unsolved}；在用的已是最新的稳定版 yt-dlp，多为网站刚换了播放器、yt-dlp 还没跟上：可在设置「网页视频」里换到每日构建（修复最先到那里），或过一阵再试"
+            ),
+            Some(Freshness::Latest(Channel::Nightly)) => format!(
+                "{unsolved}；在用的已是最新的每日构建，多为网站刚换了播放器、yt-dlp 还没跟上：过一阵再试（有新构建时会自动换上）"
             ),
             Some(Freshness::Skipped(version)) => format!(
                 "{unsolved}；有新版 {version}，它是之前换回时换下的，没有自动装：到设置「网页视频」里更新到它再试"
@@ -497,8 +500,10 @@ mod tests {
         let mut unsolved = info(Vec::new());
         unsolved.challenge_failed = true;
         unsolved.warnings = vec!["n challenge solving failed".to_owned()];
-        let latest = no_choice_reason(&unsolved, Some(&Freshness::Latest));
-        assert!(latest.contains("在用的已是最新的 yt-dlp"), "{latest}");
+        let latest = no_choice_reason(&unsolved, Some(&Freshness::Latest(Channel::Stable)));
+        assert!(latest.contains("换到每日构建"), "{latest}");
+        let nightly = no_choice_reason(&unsolved, Some(&Freshness::Latest(Channel::Nightly)));
+        assert!(!nightly.contains("换到每日构建"), "{nightly}");
         assert!(
             latest.ends_with("yt-dlp 的警告：n challenge solving failed"),
             "{latest}"

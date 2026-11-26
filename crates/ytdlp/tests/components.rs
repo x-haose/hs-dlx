@@ -530,7 +530,25 @@ async fn updates_switch_only_after_the_new_version_passes() {
         .unwrap();
     assert_eq!(updated.version, "2026.10.26");
     assert_eq!(server.hits("pypi/yt-dlp/2026.10.26/json"), listed);
-    assert_eq!(updated.skipped.as_deref(), Some("2026.11.16.232655.dev0"));
+    // 更新到的正好是上一个：照换回，但不是用户换回的，不再跳过什么
+    assert_eq!(updated.skipped, None);
+    // 用户换回：记下跳过的；之后重装同一版本照旧跳过它，换成别的版本才不再跳过
+    let back = components
+        .rollback(&CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(back.skipped.as_deref(), Some("2026.10.26"));
+    let reinstalled = components
+        .repair(
+            &Proxy::Direct,
+            Channel::Stable,
+            &|_| {},
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reinstalled.version, back.version);
+    assert_eq!(reinstalled.skipped.as_deref(), Some("2026.10.26"));
     // 装上别的版本就不再跳过
     publish(&server, &base, "2026.11.20");
     let newer = components
@@ -543,14 +561,15 @@ async fn updates_switch_only_after_the_new_version_passes() {
         .await
         .unwrap();
     assert_eq!(newer.skipped, None);
+    assert_eq!(newer.previous.as_deref(), Some("2026.11.16.232655.dev0"));
     assert_eq!(components.installed().unwrap(), Some(newer));
     components.sweep().await;
-    assert!(root.join("yt-dlp-2026.10.26").exists(), "上一个留着");
-    assert!(!root.join("yt-dlp-2026.10.21").exists(), "更早的删掉");
     assert!(
-        !root.join("yt-dlp-2026.11.16.232655.dev0").exists(),
-        "更早的删掉"
+        root.join("yt-dlp-2026.11.16.232655.dev0").exists(),
+        "上一个留着"
     );
+    assert!(!root.join("yt-dlp-2026.10.26").exists(), "更早的删掉");
+    assert!(!root.join("yt-dlp-2026.10.21").exists(), "更早的删掉");
 }
 
 /// 换了锁定的 Python（应用升级）：已装的 yt-dlp 不算装好，安装时用新的 Python 重装同一版本，旧的 Python 到清理时
