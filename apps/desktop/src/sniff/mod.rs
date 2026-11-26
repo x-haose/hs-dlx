@@ -167,6 +167,11 @@ impl SniffView {
                     });
                 }
             });
+        // macOS 上报 Safari 的标识（见 hs_dlx_webview::user_agent），网站的人机验证才把它当浏览器
+        let builder = match hs_dlx_webview::user_agent() {
+            Some(agent) => builder.with_user_agent(&agent),
+            None => builder,
+        };
         // 网页的出口进程里共用（见 crate::web_route）；中转连不过去的报来时看是不是打开的地址
         let route = WebRoute::get(cx);
         let relay_failures = cx.subscribe(&route, |this: &mut Self, _, failure, cx| {

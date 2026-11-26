@@ -6,9 +6,11 @@
 //! 照样占满原来的区域），整个移出可见区域时才藏起来。不画它的那一帧它不会自己消失：换掉所在的视图时由使用方调
 //! [`WebView::hide`]。
 
+mod agent;
 pub mod cookies;
 mod failure;
 
+pub use agent::user_agent;
 pub use failure::Failure;
 pub use proxy::{PROXY_FIXED_FOR_PROCESS, WebProxy, custom_proxy_supported};
 #[cfg(target_os = "linux")]

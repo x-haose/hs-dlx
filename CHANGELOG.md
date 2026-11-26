@@ -62,6 +62,8 @@
   IPv4 网络）照样报，写明原因；网络检测里 tracker 连不上时显示真正的原因。取种子信息、下载、做种时已经连上过节点，
   就不再显示 tracker 的报错（连不上的 tracker 不妨碍找节点）。报错只写 tracker 的地址与原因（tracker 回了拒绝的
   原因时为它，HTTP 出错时带状态码），不再带种子的哈希、本机地址与次数
+- 在网页里找视频流时，macOS 上的内置网页按本机 Safari 的写法报 User-Agent（原来缺 Safari 的那一段），Cloudflare
+  等人机验证更少要求手动点「验证您是人类」
 - 打开设置再关上时回到原来那一页，新建页取到一半的种子信息不再随之取消
 - 粘贴的磁力链接的种子已在某个任务里时，直接换到那个任务，不再报「torrent already exists in session」
 - 响应头很大的网站（如 YouTube）不再探测失败、报「http2 error：stream error detected」：HTTP/2 响应头的上限从
