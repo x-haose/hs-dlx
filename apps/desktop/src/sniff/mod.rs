@@ -76,6 +76,8 @@ pub struct SniffView {
     webview: Result<Entity<WebView>, String>,
     /// 网页显示着（左边网页、右边列表）；否则只有列表，网页在后台
     page_shown: bool,
+    /// 网页此刻是整页的人机验证（见 [`script::SCRIPT`]）：要用户在网页里过了验证才找得到流
+    challenge: bool,
     /// 嗅探页正显示着（由外面告诉，见 [`SniffView::set_on_screen`]）
     on_screen: bool,
     address: Entity<InputState>,
@@ -255,6 +257,7 @@ impl SniffView {
             opened: url,
             webview,
             page_shown: false,
+            challenge: false,
             on_screen: false,
             address,
             title: None,
@@ -358,6 +361,14 @@ impl SniffView {
                 }
                 Some(Report::Document { content_type }) => self.judge.document(&content_type),
                 Some(Report::Content { playlist }) => self.judge.content(playlist),
+                // 验证页藏在后台时用户不知道要先过验证：变成验证页即把网页显示出来
+                Some(Report::Challenge { active }) => {
+                    self.challenge = active;
+                    if active && !self.page_shown {
+                        self.show_page(true, cx);
+                    }
+                    false
+                }
                 None => return,
             },
             // 单页应用换页时地址变了而不重新加载，常伴着改标题：顺带读一次地址
