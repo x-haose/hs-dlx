@@ -43,7 +43,7 @@ import sys
 import threading
 import time
 import traceback
-from typing import TYPE_CHECKING, Any, Protocol, TextIO, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TextIO, cast
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sized
@@ -587,21 +587,32 @@ def cookie_failure(error: BaseException) -> dict[str, str]:
     return {"reason": reason, "message": message}
 
 
-def supported(url: str) -> bool:
-    """yt-dlp 有专门的解析器支持 `url`。
+def claim(url: str) -> Literal["dedicated", "drm", "none"]:
+    """yt-dlp 怎么看 `url`，不发请求。
 
-    同 yt-dlp 的挑法，按次序取第一个认得它的启用了的解析器：不是通用解析器，也不是 yt-dlp 自己列着不支持的
-    （extractor/unsupported.py 的那一类，认得即报错）。只有这样的网址交给 yt-dlp 解析，别的由应用自己探测、到网页里
-    找视频流；不发请求。
+    同 yt-dlp 的挑法，按次序取第一个认得它的启用了的解析器：
+    - `dedicated`：专门的解析器（不是通用解析器，也不是 yt-dlp 自己列着不支持的，即 extractor/unsupported.py 那一类，
+      认得即报错）。只有这样的网址交给 yt-dlp 解析。
+    - `drm`：yt-dlp 列着用 DRM 加密的网站（`KnownDRMIE`）：网页里找到的流也是加密的，下载不了。
+    - `none`：其余（通用解析器、列着不支持的盗版站之类）：由应用自己探测、到网页里找视频流。
     """
     extractors = importlib.import_module("yt_dlp.extractor")
-    unsupported = importlib.import_module("yt_dlp.extractor.unsupported").UnsupportedInfoExtractor
+    unsupported = importlib.import_module("yt_dlp.extractor.unsupported")
     for extractor in extractors.gen_extractor_classes():
         if getattr(extractor, "_ENABLED", True) and extractor.suitable(url):
             # 打包的 yt-dlp 给的是懒加载的替身类（lazy_extractors），继承关系要看它代替的真类
             real = getattr(extractor, "real_class", extractor)
-            return real.ie_key() != "Generic" and not issubclass(real, unsupported)
-    return False
+            if issubclass(real, unsupported.KnownDRMIE):
+                return "drm"
+            if real.ie_key() == "Generic" or issubclass(real, unsupported.UnsupportedInfoExtractor):
+                return "none"
+            return "dedicated"
+    return "none"
+
+
+def supported(url: str) -> bool:
+    """yt-dlp 有专门的解析器支持 `url`（见 `claim`）。"""
+    return claim(url) == "dedicated"
 
 
 def extract(
@@ -609,8 +620,12 @@ def extract(
 ) -> Info:
     """解析请求里的网址，返回回应（结果或归了类的失败）；读完 Cookie、开始解析网页时调 `resolving`。"""
     url = text(request.get("url")) or ""
-    if request.get("generic") is not True and not supported(url):
-        return {"error": {"kind": "unsupported", "message": "没有专门认这个网址的解析器"}}
+    if request.get("generic") is not True:
+        claimed = claim(url)
+        if claimed == "drm":
+            return {"error": {"kind": "unavailable", "message": "这个网站的视频用 DRM 加密，下载不了"}}
+        if claimed == "none":
+            return {"error": {"kind": "unsupported", "message": "没有专门认这个网址的解析器"}}
     logger = Logger()
     seen = HlsExtrasSeen()
     options = {**params(request, quickjs, cache, logger), "match_filter": seen}
@@ -855,12 +870,15 @@ def selftest(site: str, quickjs: str) -> None:
     if safe_ext("mp4") != "mp4" or safe_ext("exe") is not None:
         message = "yt-dlp 的扩展名白名单认不出，这一版用不了：要升级应用"
         raise SelfTestError(message)
-    # 判断网址是不是 yt-dlp 支持的（supported）也用着内部名字：同上
+    # 判断网址归哪类（claim）也用着内部名字：同上
     try:
-        supported("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        claims = (claim("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), claim("https://example.com/"))
     except (ImportError, AttributeError) as error:
         message = f"yt-dlp 的解析器分类认不出（{error}），这一版用不了：要升级应用"
         raise SelfTestError(message) from error
+    if claims != ("dedicated", "none"):
+        message = f"yt-dlp 的解析器分类与预期不符（{claims}），这一版用不了：要升级应用"
+        raise SelfTestError(message)
     yt_dlp = importlib.import_module("yt_dlp")
     try:
         runtimes = yt_dlp.YoutubeDL({"quiet": True, "js_runtimes": {"quickjs": {"path": quickjs}}})._js_runtimes

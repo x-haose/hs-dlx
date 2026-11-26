@@ -119,9 +119,19 @@ def test_a_url_left_to_the_page_is_unsupported_without_a_request(url: str, tmp_p
 
 
 def test_only_sites_with_a_dedicated_extractor_are_supported() -> None:
+    assert driver.claim("https://www.youtube.com/watch?v=dQw4w9WgXcQ") == "dedicated"
+    assert driver.claim("https://example.com/page.html") == "none"
+    assert driver.claim("https://jable.tv/videos/x/") == "none"
+    assert driver.claim("https://open.spotify.com/track/x") == "drm"
     assert driver.supported("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-    assert not driver.supported("https://example.com/page.html")
-    assert not driver.supported("https://jable.tv/videos/x/")
+    assert not driver.supported("https://open.spotify.com/track/x")
+
+
+def test_a_drm_site_is_unavailable_without_a_request(tmp_path: Path) -> None:
+    [reply] = serve([{"id": 1, "url": "http://open.spotify.com/track/x", "proxy": "", "cookies": None}], tmp_path)
+    error = driver.mapping(reply["error"]) or {}
+    assert error["kind"] == "unavailable"
+    assert "DRM" in str(error["message"])
 
 
 def test_requirements_take_the_pinned_dependencies_without_mutagen() -> None:

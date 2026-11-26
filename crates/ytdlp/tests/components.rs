@@ -184,13 +184,33 @@ fn publish_with(server: &Server, base: &Url, version: &str, internals: bool) {
             "class _UnsafeExtensionError(Exception):\n    ALLOWED_EXTENSIONS = frozenset({'mp4', 'm4a'})\n"
                 .to_owned(),
         ));
+        // 认 YouTube 的专门解析器在通用解析器之前，同真的 yt-dlp
         files.push((
             "yt_dlp/extractor/__init__.py".to_owned(),
-            "def gen_extractor_classes():\n    return []\n".to_owned(),
+            concat!(
+                "class YoutubeIE:\n",
+                "    @classmethod\n",
+                "    def suitable(cls, url):\n",
+                "        return 'youtube.com/' in url\n",
+                "    @classmethod\n",
+                "    def ie_key(cls):\n",
+                "        return 'Youtube'\n",
+                "class GenericIE:\n",
+                "    @classmethod\n",
+                "    def suitable(cls, url):\n",
+                "        return True\n",
+                "    @classmethod\n",
+                "    def ie_key(cls):\n",
+                "        return 'Generic'\n",
+                "def gen_extractor_classes():\n",
+                "    return [YoutubeIE, GenericIE]\n",
+            )
+            .to_owned(),
         ));
         files.push((
             "yt_dlp/extractor/unsupported.py".to_owned(),
-            "class UnsupportedInfoExtractor:\n    pass\n".to_owned(),
+            "class UnsupportedInfoExtractor:\n    pass\nclass KnownDRMIE(UnsupportedInfoExtractor):\n    pass\n"
+                .to_owned(),
         ));
     }
     let (name, bytes) = wheel("yt_dlp", version, &files);
