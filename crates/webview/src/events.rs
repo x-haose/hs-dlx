@@ -1,4 +1,4 @@
-//! wry 不报的网页引擎事件：顶层导航失败、网页进程退出、顶层文档的 HTTP 状态码。wry 的页面加载事件不分成败（打不开
+//! wry 不报的网页引擎事件：顶层导航失败、网页进程退出、顶层文档的 HTTP 状态码（macOS、Linux）。wry 的页面加载事件不分成败（打不开
 //! 时 WebView2 显示自带的错误页，照样报开始与完成），也不给状态码，这里直接接各平台网页引擎的事件。
 
 use std::rc::Rc;
@@ -11,8 +11,8 @@ pub enum Event {
     LoadFailed(String),
     /// 网页进程退出或卡死了，刷新才回来
     ProcessGone,
-    /// 顶层文档收到了 HTTP 响应：状态码（重定向之后的那个）。macOS、Linux 上在文档显示出来之前报，Windows 上在加载
-    /// 完时报；旧的 WebView2 运行时（没有 `ICoreWebView2NavigationCompletedEventArgs2`）不报
+    /// 顶层文档收到了 HTTP 响应：状态码（重定向之后的那个），在这个文档建出、页面脚本跑之前报。只有 macOS、Linux
+    /// 报：WebView2 要到加载完才给状态码，那里由页面自己从导航记录里读
     Responded(u16),
 }
 
@@ -44,7 +44,7 @@ pub(crate) fn before_build<'a>(
     builder
 }
 
-/// 建好网页之后：WebView2 接导航完成（看是否成功、状态码）与进程故障。
+/// 建好网页之后：WebView2 接导航完成（看是否成功）与进程故障。
 #[cfg(target_os = "windows")]
 pub(crate) fn after_build(webview: &wry::WebView, report: &Report) -> wry::Result<Hooks> {
     use webview2_com::Microsoft::Web::WebView2::Win32::{
@@ -67,19 +67,8 @@ pub(crate) fn after_build(webview: &wry::WebView, report: &Report) -> wry::Resul
             let Some(args) = args else {
                 return Ok(());
             };
-            // 拿到了 HTTP 响应的（4xx、5xx：要登录、人机验证、地区限制的页面照样显示了）报状态码、不算没打开；状态码
-            // 为 0 即没拿到响应。旧的 WebView2 运行时没有这个接口
-            if let Ok(args) = args.cast::<ICoreWebView2NavigationCompletedEventArgs2>() {
-                let mut code = 0;
-                // SAFETY: 引擎在界面线程上回调，参数在回调期间有效；出参指向本地变量。
-                unsafe { args.HttpStatusCode(&mut code) }?;
-                if let Ok(code @ 1..) = u16::try_from(code) {
-                    report(Event::Responded(code));
-                    return Ok(());
-                }
-            }
             let mut success = BOOL::default();
-            // SAFETY: 同上。
+            // SAFETY: 引擎在界面线程上回调，参数在回调期间有效；出参指向本地变量。
             unsafe { args.IsSuccess(&mut success) }?;
             if success.as_bool() {
                 return Ok(());
@@ -90,6 +79,16 @@ pub(crate) fn after_build(webview: &wry::WebView, report: &Report) -> wry::Resul
             // 被别的导航取代（换页、下载）不算没打开
             if status == COREWEBVIEW2_WEB_ERROR_STATUS_OPERATION_CANCELED {
                 return Ok(());
+            }
+            // 拿到了 HTTP 响应的（4xx、5xx：要登录、人机验证、地区限制的页面照样显示了）不算没打开；状态码为 0 即没
+            // 拿到响应。旧的 WebView2 运行时没有这个接口，照没成报
+            if let Ok(args) = args.cast::<ICoreWebView2NavigationCompletedEventArgs2>() {
+                let mut code = 0;
+                // SAFETY: 同上。
+                unsafe { args.HttpStatusCode(&mut code) }?;
+                if code > 0 {
+                    return Ok(());
+                }
             }
             report(Event::LoadFailed(format!(
                 "网页引擎报导航没成（WebErrorStatus {}）",
@@ -203,6 +202,10 @@ pub(crate) mod mac {
         report: Report,
     }
 
+    // SAFETY（这一块里的各个 unsafe）：父类是 NSObject、只在界面线程上用（MainThreadOnly），与 WKWebView 的要求一致；
+    // 各方法的 Rust 签名与选择子在 Objective-C 里的类型一致（respondsToSelector: 收 SEL 回 BOOL，
+    // forwardingTargetForSelector: 收 SEL 回 id，响应决定方法的签名同 objc2-web-kit 里 WKNavigationDelegate 的定义）；
+    // 声明遵守的两个协议只实现了其中的可选方法。
     define_class!(
         /// 包着 wry 导航代理的一层：自己只接「决定怎么处理响应」，记下顶层文档的状态码后交给 wry 决定；别的方法经
         /// Objective-C 的消息转发交给 wry 的代理。WebKit 在设代理时按 `respondsToSelector:` 记下代理实现了哪些方法，

@@ -354,7 +354,10 @@ impl SniffView {
                 self.failure = Some(reason.clone());
                 self.judge.fail(reason)
             }
-            Engine::Responded(status) => self.judge.responded(status),
+            Engine::Responded(status) => {
+                self.judge.responded(status);
+                false
+            }
             Engine::Crashed => {
                 let reason = "网页进程意外退出了".to_owned();
                 self.failure = Some(reason.clone());
@@ -375,12 +378,13 @@ impl SniffView {
                 Some(Report::Content {
                     playlist,
                     challenge,
+                    status,
                 }) => {
                     self.challenge = challenge;
                     if challenge && !self.page_shown {
                         self.show_page(true, cx);
                     }
-                    self.judge.content(playlist, challenge)
+                    self.judge.content(playlist, challenge, status)
                 }
                 None => return,
             },

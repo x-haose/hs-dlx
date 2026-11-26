@@ -157,6 +157,28 @@ async fn only_the_generic_extractor_knowing_a_url_is_unsupported_unless_asked() 
     assert!(matches!(error, ExtractError::Unsupported(_)), "{error}");
 }
 
+/// yt-dlp 列着用 DRM 加密的网站：不发请求即报 DRM（驱动回的种类与这边认的对得上）。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_site_known_to_use_drm_is_refused_without_a_request() {
+    let (installed, cache) = installed("drm");
+    let extractor = Extractor::new(installed, cache, Duration::from_secs(60));
+    let url = Url::parse("http://open.spotify.com/track/x").unwrap();
+    let error = extractor
+        .extract(
+            &Request {
+                url,
+                cookies: Vec::new(),
+                generic: false,
+                browser: None,
+            },
+            &Proxy::Direct,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ExtractError::Drm(_)), "{error}");
+}
+
 /// 找浏览器的数据目录与开发环境里的 yt-dlp 找 Cookie 的地方一致：yt-dlp 升级后改了位置时这里报出。
 #[test]
 fn browser_data_dirs_follow_yt_dlp() {

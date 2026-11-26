@@ -624,6 +624,9 @@ def test_failures_are_classified_by_what_the_site_said_and_where_they_happened()
     assert driver.classify(report_error(limited))[0] == "rate_limited"
     gone = utils.ExtractorError("Private video", expected=True)
     assert driver.classify(report_error(gone))[0] == "unavailable"
+    # 有专门解析器的网站上，格式全是 DRM 的视频
+    drm = utils.ExtractorError("This video is DRM protected", expected=True)
+    assert driver.classify(report_error(drm))[0] == "drm"
     members = utils.ExtractorError("Join this channel to get access to members-only content", expected=True)
     assert driver.classify(report_error(members))[0] == "login"
     # 解析时接口回的错误状态：yt-dlp 包成 expected 的 ExtractorError，按状态归类

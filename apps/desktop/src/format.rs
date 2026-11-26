@@ -189,7 +189,7 @@ pub fn failure(kind: FailureKind) -> (String, &'static str) {
         }
         FailureKind::Unsupported => (
             "不支持".into(),
-            "来源用了不支持的特性（如 DRM 加密），或不是 HLS：下载不了",
+            "来源用了不支持的特性或形式（如 DRM 加密），原因见错误信息",
         ),
         FailureKind::Unrecoverable => ("!".into(), "再试也一样，原因见错误信息"),
         FailureKind::CloudLogin => ("登录".into(), "PikPak 的登录失效了：在设置里重新登录后继续"),

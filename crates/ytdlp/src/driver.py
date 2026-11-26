@@ -307,8 +307,8 @@ def classify(error: BaseException, *, downloading: bool = False) -> tuple[str, s
     重置，证书不受信任不算；直连时多为网站在本地网络被拦）、`proxy`（代理报的错：连不上代理、代理要认证，或代理说它
     连不上网站，如 SOCKS 回 Host unreachable、HTTP 代理建隧道回 502）、`unreachable`（建立连接超时：直连时多为网站在
     本地网络被拦，说明为固定的一句，不带异常原文；拒绝连接、域名解析失败不算）、`network`（其余连不上、超时、TLS；下载时服务器回的错误
-    状态与没下完整）、`disk`（下载时写不了文件）、`unavailable`（网站说视频不可用：私密、删了、未开播等）、`other`（其余，
-    多为网站改了、yt-dlp 要更新）。
+    状态与没下完整）、`disk`（下载时写不了文件）、`unavailable`（网站说视频不可用：私密、删了、未开播等）、`drm`（视频
+    用 DRM 加密，见 `said`）、`other`（其余，多为网站改了、yt-dlp 要更新）。
     网站回的错误状态：429 为限流，407（代理要认证）归 `proxy`；解析时请求网页与接口回的 401 为要登录，403、412 为拦截
     （`blocked`：多为出口 IP 被风控，如 B 站对境外代理回 412；换直连或别的出口、登录后再试），404、410 为不可用；其余
     （5xx 等，与 `downloading` 时直链回的一切状态）算网络：多为一时的或直链过期，再试即重新解析、换新的直链。
@@ -441,8 +441,14 @@ def in_chain(root: BaseException, test: Callable[[BaseException], bool]) -> bool
 
 
 def said(message: str) -> str:
-    """网站自己说的不能播的原因的种类：限流、要登录（含人机验证）、其余为不可用。"""
+    """网站自己说的不能播的原因的种类：DRM 加密、限流、要登录（含人机验证）、其余为不可用。
+
+    DRM 按 yt-dlp 自己的两种说法认：视频的格式全是 DRM 的（「This video is DRM protected」）、网站列着用 DRM 的
+    （「known to use DRM protection」）。
+    """
     lowered = message.lower()
+    if "drm protected" in lowered or "drm protection" in lowered:
+        return "drm"
     if any(word in lowered for word in ("rate-limited", "try again later", "too many requests")):
         return "rate_limited"
     login = ("sign in", "log in", "login", "cookies", "captcha", "not a bot", "members-only", "join this channel")
