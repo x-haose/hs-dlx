@@ -355,7 +355,18 @@ impl Extractor {
         }
         self.idle.lock().expect("锁里不会 panic").push_back(worker);
         match (parsed.ok, parsed.error) {
-            (Some(wire), None) => Ok(wire.into_info()),
+            // QuickJS 不在了（被杀毒软件隔离等）时 yt-dlp 同样报解不出挑战：是组件坏了，要重装，换 yt-dlp 没用
+            (Some(wire), None) => {
+                let info = wire.into_info();
+                let quickjs = &self.installed.quickjs;
+                if info.challenge_failed && !quickjs.is_file() {
+                    return Err(ExtractError::Broken(format!(
+                        "解 JavaScript 挑战用的 QuickJS 不在了：{}",
+                        quickjs.display()
+                    )));
+                }
+                Ok(info)
+            }
             (None, Some(failure)) => {
                 Err(failure.into_error(request.browser.as_ref(), proxy.is_empty()))
             }

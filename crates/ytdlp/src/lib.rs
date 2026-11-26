@@ -73,6 +73,14 @@ impl Error {
         Error::Disk(format!("{}：{error}", path.display()))
     }
 
+    /// 这一版在本机装不上、再装也一样：没有本平台能装的包，pip 装不上下好的包，或装上了运行不了。
+    pub fn version_unusable(&self) -> bool {
+        matches!(
+            self,
+            Error::Unsupported(_) | Error::Pip(_) | Error::SelfTest(_)
+        )
+    }
+
     /// 原样再试可能就好：网络与服务器的临时故障（见核心的 [`hs_m3u8_core::Error::retryable`]），或下到的包对不上（已
     /// 删掉，再试即重新下载）。其余要改设置、腾空间、等新版本或修应用。
     pub fn retryable(&self) -> bool {

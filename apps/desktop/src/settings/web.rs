@@ -3,7 +3,7 @@
 use gpui_kit::{Context, Div, ParentElement as _, Styled as _, Task, div, px};
 use hs_dlx_app::WebState;
 use hs_dlx_app::web::Preference;
-use hs_dlx_app::ytdlp::{Browser, Channel, CookieSource, Profile};
+use hs_dlx_app::ytdlp::{Browser, Channel, CookieSource, InstallProgress, Profile};
 use std::path::PathBuf;
 
 use super::{SettingsView, row};
@@ -178,45 +178,19 @@ impl SettingsView {
                     cx.listener(|this, _, _, cx| this.install_web(cx)),
                 ))
             }
-            WebState::Installing(progress) => div()
-                .flex()
-                .flex_col()
-                .gap(px(8.))
-                .child(ui::steps(format::web_install_steps(progress)))
-                .child(
-                    line.child(ui::field(format::web_install(progress)).flex_1())
-                        .child(ui::button(
-                            "web-cancel-install",
-                            "取消",
-                            Tone::Ghost,
-                            cx.listener(|this, _, _, cx| {
-                                this.tasks.read(cx).service().cancel_web_install();
-                            }),
-                        )),
-                ),
+            WebState::Installing(progress) => {
+                installing(line, format::web_install(progress), progress, cx)
+            }
             // 在用的照常能解析：只显示在换到哪一步，取消即照旧用它
-            WebState::Updating { version, progress } => div()
-                .flex()
-                .flex_col()
-                .gap(px(8.))
-                .child(ui::steps(format::web_install_steps(progress)))
-                .child(
-                    line.child(
-                        ui::field(format!(
-                            "yt-dlp {version} · 在换新版：{}",
-                            format::web_install(progress)
-                        ))
-                        .flex_1(),
-                    )
-                    .child(ui::button(
-                        "web-cancel-install",
-                        "取消",
-                        Tone::Ghost,
-                        cx.listener(|this, _, _, cx| {
-                            this.tasks.read(cx).service().cancel_web_install();
-                        }),
-                    )),
+            WebState::Updating { version, progress } => installing(
+                line,
+                format!(
+                    "yt-dlp {version} · 在换版本：{}",
+                    format::web_install(progress)
                 ),
+                progress,
+                cx,
+            ),
             WebState::Broken(_) => line.child(ui::field("运行不了").flex_1()).child(ui::button(
                 "web-install",
                 "重装",
@@ -316,7 +290,7 @@ impl SettingsView {
                         .child(chip("web-nightly", "每日构建", Channel::Nightly, cx)),
                 )
                 .child(ui::caption(
-                    "稳定版约每月一版；网站改版后的修复先到每日构建",
+                    "稳定版约每月一版；网站改版后的修复先到每日构建。切换渠道后有比在用的更新的版本才换，不换回更旧的",
                 )),
         )
     }
@@ -573,4 +547,26 @@ impl Listing {
             Err(reason) => Listing::Failed(reason),
         }
     }
+}
+
+/// 在装或在换版本的一行：步骤、`label` 与「取消」（取消即照原来的）。
+fn installing(
+    line: Div,
+    label: String,
+    progress: &InstallProgress,
+    cx: &mut Context<SettingsView>,
+) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .child(ui::steps(format::web_install_steps(progress)))
+        .child(line.child(ui::field(label).flex_1()).child(ui::button(
+            "web-cancel-install",
+            "取消",
+            Tone::Ghost,
+            cx.listener(|this, _, _, cx| {
+                this.tasks.read(cx).service().cancel_web_install();
+            }),
+        )))
 }

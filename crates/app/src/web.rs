@@ -220,7 +220,8 @@ pub fn choices(info: &Info, preference: Preference) -> Vec<Choice> {
 /// 解不出 JavaScript 挑战（[`Info::challenge_failed`]）、没有能下的格式时，换新的 yt-dlp 为什么没换成。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Freshness {
-    /// 在用的不比渠道 `.0` 上最新的旧（查过，或刚换上最新的仍解不出）
+    /// 在用的不比渠道上最新的旧（查过，或刚换上最新的仍解不出）；`.0` 为在用的构建出自哪个渠道（见
+    /// [`Channel::of`]），不是设置里的
     Latest(Channel),
     /// 渠道上最新的是用户换回时换下的（见 [`hs_dlx_ytdlp::Installed::skipped`]）：不自动装它
     Skipped(String),

@@ -67,6 +67,17 @@ pub enum Channel {
     Nightly,
 }
 
+impl Channel {
+    /// 版本 `version` 出自哪个渠道：带 `.dev` 的是每日构建。
+    pub fn of(version: &str) -> Channel {
+        if version.contains(".dev") {
+            Channel::Nightly
+        } else {
+            Channel::Stable
+        }
+    }
+}
+
 /// 装好了的组件。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Installed {
@@ -1210,26 +1221,26 @@ fn write_atomically_blocking(path: &Path, bytes: &[u8]) -> Result<(), Error> {
 }
 
 /// yt-dlp 的版本 `candidate` 是否比 `than` 新，按 PEP 440 比 yt-dlp 用到的写法：发布号（`2026.11.23`、每日构建的
-/// `2026.11.16.232655`，短的补 0 再比），同一发布号下 `.devN` 更旧。有一个认不出时为 false：不把认不出的版本当新的自动装。
-pub fn is_newer(candidate: &str, than: &str) -> bool {
-    match (version_key(candidate), version_key(than)) {
-        (Some(candidate), Some(than)) => candidate > than,
-        _ => false,
-    }
+/// `2026.11.16.232655`，短的补 0 再比），同一发布号下 `.devN` 比正式版旧、`.postN` 比正式版新。有一个认不出时为 None。
+pub fn is_newer(candidate: &str, than: &str) -> Option<bool> {
+    Some(version_key(candidate)? > version_key(than)?)
 }
 
-/// [`is_newer`] 比较用的键：补 0 到 6 段的发布号，与预发布的次序（正式版为 `u64::MAX`，比任何 `.devN` 大）；超过 6 段或
-/// 有一段不是数字时为 None。
-fn version_key(version: &str) -> Option<([u64; 6], u64)> {
-    let (release, dev) = match version.split_once(".dev") {
-        Some((release, dev)) => (release, dev.parse().ok()?),
-        None => (version, u64::MAX),
+/// [`is_newer`] 比较用的键：补 0 到 6 段的发布号，与同一发布号下的次序（`.devN` 为 (0, N)、正式版为 (1, 0)、`.postN` 为
+/// (2, N)）；超过 6 段、有一段不是数字或带别的后缀时为 None。
+fn version_key(version: &str) -> Option<([u64; 6], (u8, u64))> {
+    let (release, phase) = if let Some((release, dev)) = version.split_once(".dev") {
+        (release, (0, dev.parse().ok()?))
+    } else if let Some((release, post)) = version.split_once(".post") {
+        (release, (2, post.parse().ok()?))
+    } else {
+        (version, (1, 0))
     };
     let mut parts = [0; 6];
     for (index, part) in release.split('.').enumerate() {
         *parts.get_mut(index)? = part.parse().ok()?;
     }
-    Some((parts, dev))
+    Some((parts, phase))
 }
 
 /// PyPI 的 JSON 接口回的 `body` 里 `channel` 上最新的版本：稳定版为 `info.version`；每日构建为上传最晚的 `.dev` 版本
@@ -1285,18 +1296,26 @@ fn latest_of(body: &[u8], channel: Channel) -> Result<String, Error> {
 mod tests {
     use super::*;
 
-    /// 发布号逐段按数比（短的补 0），同一发布号下预发布更旧；认不出的不算新。
+    /// 发布号逐段按数比（短的补 0），同一发布号下 `.dev` 更旧、`.post` 更新；认不出的说认不出。
     #[test]
-    fn versions_compare_by_release_then_prerelease() {
-        assert!(is_newer("2026.11.23", "2026.10.26"));
-        assert!(is_newer("2026.11.3", "2026.10.26"));
-        assert!(!is_newer("2026.10.26", "2026.11.23"));
-        assert!(!is_newer("2026.11.23", "2026.11.23"));
-        assert!(is_newer("2026.11.16.232655.dev0", "2026.11.16"));
-        assert!(is_newer("2026.11.16.232655", "2026.11.16.232655.dev0"));
-        assert!(!is_newer("2026.11.16", "2026.11.16.232655.dev0"));
-        assert!(!is_newer("2026.11.23rc1", "2026.10.26"));
-        assert!(!is_newer("2026.11.23", "latest"));
+    fn versions_compare_by_release_then_phase() {
+        assert_eq!(is_newer("2026.11.23", "2026.10.26"), Some(true));
+        assert_eq!(is_newer("2026.11.3", "2026.10.26"), Some(true));
+        assert_eq!(is_newer("2026.10.26", "2026.11.23"), Some(false));
+        assert_eq!(is_newer("2026.11.23", "2026.11.23"), Some(false));
+        assert_eq!(is_newer("2026.11.16.232655.dev0", "2026.11.16"), Some(true));
+        assert_eq!(
+            is_newer("2026.11.16.232655", "2026.11.16.232655.dev0"),
+            Some(true)
+        );
+        assert_eq!(
+            is_newer("2026.11.16", "2026.11.16.232655.dev0"),
+            Some(false)
+        );
+        assert_eq!(is_newer("2021.1.15.post1", "2021.1.15"), Some(true));
+        assert_eq!(is_newer("2021.1.24", "2021.1.15.post1"), Some(true));
+        assert_eq!(is_newer("2026.11.23rc1", "2026.10.26"), None);
+        assert_eq!(is_newer("2026.11.23", "latest"), None);
     }
 
     #[test]

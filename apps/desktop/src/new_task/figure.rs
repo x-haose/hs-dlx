@@ -7,7 +7,7 @@ use gpui_kit::{
     MouseButton, ParentElement as _, Pixels, Point, StatefulInteractiveElement as _, Styled,
     canvas, div, px,
 };
-use hs_dlx_app::Failure;
+use hs_dlx_app::{Failure, WebState};
 use hs_m3u8_core::{FileInfo, Probe, VariantInfo};
 
 use super::{NewTask, PageCheck, Probing, TorrentChoice, duration_of};
@@ -155,9 +155,16 @@ impl NewTask {
             Probing::File(info) => file_dial(info).into_any_element(),
             Probing::Torrent(choice) => torrent_dial(choice).into_any_element(),
             Probing::Web(choice) => super::web::web_dial(choice).into_any_element(),
-            Probing::Resolving => self
-                .probing_dial("解析中", "yt-dlp 在解析网页".to_owned(), cx)
-                .into_any_element(),
+            Probing::Resolving => {
+                // 解不出 JavaScript 挑战时解析要等 yt-dlp 换上新版：写出在换到哪一步，免得看着像卡住
+                let line = match &*self.service.web_state().borrow() {
+                    WebState::Updating { progress, .. } => {
+                        format!("在换新的 yt-dlp：{}", format::web_install(progress))
+                    }
+                    _ => "yt-dlp 在解析网页".to_owned(),
+                };
+                self.probing_dial("解析中", line, cx).into_any_element()
+            }
             Probing::NeedsWeb(_) => self
                 .probing_dial("网页视频", "要先装网页视频的组件".to_owned(), cx)
                 .into_any_element(),
