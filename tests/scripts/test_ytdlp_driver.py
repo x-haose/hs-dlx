@@ -103,16 +103,25 @@ def test_a_page_without_a_video_is_unsupported_and_the_next_request_still_runs(s
     assert "ok" in replies[1]
 
 
-def test_a_url_only_the_generic_extractor_knows_is_unsupported_without_a_request(tmp_path: Path) -> None:
-    # 没有服务器：不发请求即回
-    [reply] = serve([{"id": 1, "url": "http://127.0.0.1:9/page.html", "proxy": "", "cookies": None}], tmp_path)
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:9/page.html",
+        # yt-dlp 列着不支持的（KnownPiracyIE）：同样留给网页里找
+        "http://jable.tv/videos/x/",
+    ],
+)
+def test_a_url_left_to_the_page_is_unsupported_without_a_request(url: str, tmp_path: Path) -> None:
+    # 本机没有这样的服务器（jable.tv 走不通的 http）：不发请求即回
+    [reply] = serve([{"id": 1, "url": url, "proxy": "", "cookies": None}], tmp_path)
     error = driver.mapping(reply["error"]) or {}
     assert error["kind"] == "unsupported"
 
 
-def test_a_site_extractor_is_matched_before_the_generic_one() -> None:
-    assert driver.matched("https://www.youtube.com/watch?v=dQw4w9WgXcQ") == "Youtube"
-    assert driver.matched("https://example.com/page.html") == "Generic"
+def test_only_sites_with_a_dedicated_extractor_are_supported() -> None:
+    assert driver.supported("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    assert not driver.supported("https://example.com/page.html")
+    assert not driver.supported("https://jable.tv/videos/x/")
 
 
 def test_requirements_take_the_pinned_dependencies_without_mutagen() -> None:

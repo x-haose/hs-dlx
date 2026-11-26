@@ -14,8 +14,8 @@
     "generic": 只有通用解析器认得时也解析, "browser": 另从这个浏览器读 Cookie（yt-dlp 的浏览器名）或 null,
     "profile": 读它的这个用户资料（目录的绝对路径）或 null（浏览器没有用户资料之分时）, "site": 网页的可注册域名
     （交回哪些 Cookie，见 `site_cookies`）}`；
-    `generic` 为假时只认得通用解析器的网址不发请求，直接回 `unsupported`；视频没有格式时照网站说的原因（要登录、人机
-    验证、限流、地区限制、不可用）回错误
+    `generic` 为假时 yt-dlp 不支持的网址（见 `supported`）不发请求，直接回 `unsupported`；视频没有格式时照网站说的
+    原因（要登录、人机验证、限流、地区限制、不可用）回错误
   - 回应 `{"id": 同请求, "ok": 结果}` 或 `{"id": 同请求, "error": {"kind": 种类, "message": 说明}}`，种类见
     `classify`；从浏览器读 Cookie 没成时种类为 `cookies`，另有 `reason`（见 `browser_cookies`）。读完 Cookie（含从
     浏览器读）、开始解析网页时先回一行 `{"id": 同请求, "stage": "resolving"}`：应用从这时起算解析的时限（读浏览器的
@@ -479,13 +479,13 @@ def params(request: Mapping[str, object], quickjs: str, cache: str, logger: Logg
 
 
 def browser_of(request: Mapping[str, object]) -> tuple[str, str | None] | None:
-    """要从哪个浏览器的哪个用户资料读 Cookie（`cookiesfrombrowser` 的前两项）：请求里的，网址只有通用解析器认得时不读。
+    """要从哪个浏览器的哪个用户资料读 Cookie（`cookiesfrombrowser` 的前两项）。
 
-    通用解析器会顺着网页去请求别的网站，带上浏览器里那些网站的 Cookie 等于替网页发了带登录的跨站请求（浏览器按
-    SameSite 不会带）。
+    为请求里的；网址不是 yt-dlp 支持的（见 `supported`）时不读：通用解析器会顺着网页去请求别的网站，带上浏览器里
+    那些网站的 Cookie 等于替网页发了带登录的跨站请求（浏览器按 SameSite 不会带）。
     """
     browser = text(request.get("browser"))
-    if browser is None or matched(text(request.get("url")) or "") == "Generic":
+    if browser is None or not supported(text(request.get("url")) or ""):
         return None
     return (browser, text(request.get("profile")))
 
@@ -587,13 +587,21 @@ def cookie_failure(error: BaseException) -> dict[str, str]:
     return {"reason": reason, "message": message}
 
 
-def matched(url: str) -> str:
-    """认得 `url` 的解析器：同 yt-dlp 的挑法，按次序取第一个认得的启用了的解析器，通用解析器排在最后。"""
+def supported(url: str) -> bool:
+    """yt-dlp 有专门的解析器支持 `url`。
+
+    同 yt-dlp 的挑法，按次序取第一个认得它的启用了的解析器：不是通用解析器，也不是 yt-dlp 自己列着不支持的
+    （extractor/unsupported.py 的那一类，认得即报错）。只有这样的网址交给 yt-dlp 解析，别的由应用自己探测、到网页里
+    找视频流；不发请求。
+    """
     extractors = importlib.import_module("yt_dlp.extractor")
+    unsupported = importlib.import_module("yt_dlp.extractor.unsupported").UnsupportedInfoExtractor
     for extractor in extractors.gen_extractor_classes():
         if getattr(extractor, "_ENABLED", True) and extractor.suitable(url):
-            return str(extractor.ie_key())
-    return "Generic"
+            # 打包的 yt-dlp 给的是懒加载的替身类（lazy_extractors），继承关系要看它代替的真类
+            real = getattr(extractor, "real_class", extractor)
+            return real.ie_key() != "Generic" and not issubclass(real, unsupported)
+    return False
 
 
 def extract(
@@ -601,7 +609,7 @@ def extract(
 ) -> Info:
     """解析请求里的网址，返回回应（结果或归了类的失败）；读完 Cookie、开始解析网页时调 `resolving`。"""
     url = text(request.get("url")) or ""
-    if request.get("generic") is not True and matched(url) == "Generic":
+    if request.get("generic") is not True and not supported(url):
         return {"error": {"kind": "unsupported", "message": "没有专门认这个网址的解析器"}}
     logger = Logger()
     seen = HlsExtrasSeen()
@@ -833,7 +841,7 @@ class SelfTestError(Exception):
 
 
 def selftest(site: str, quickjs: str) -> None:
-    """导入 yt-dlp 与 yt-dlp-ejs，核对扩展名白名单还在、yt-dlp 认得 `quickjs`，报出 yt-dlp 的版本。
+    """导入 yt-dlp 与 yt-dlp-ejs，核对扩展名白名单与解析器的分类还在、yt-dlp 认得 `quickjs`，报出 yt-dlp 的版本。
 
     yt-dlp-ejs 解 YouTube 的 JavaScript 挑战；`quickjs` 是随应用带的 QuickJS-NG，yt-dlp 认不出或判为不支持时 YouTube
     只少格式、不报错。版本取自安装元数据，按 PEP 440 规范化，与 PyPI 上的写法一致；`yt_dlp.version.__version__` 的写法
@@ -847,6 +855,12 @@ def selftest(site: str, quickjs: str) -> None:
     if safe_ext("mp4") != "mp4" or safe_ext("exe") is not None:
         message = "yt-dlp 的扩展名白名单认不出，这一版用不了：要升级应用"
         raise SelfTestError(message)
+    # 判断网址是不是 yt-dlp 支持的（supported）也用着内部名字：同上
+    try:
+        supported("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    except (ImportError, AttributeError) as error:
+        message = f"yt-dlp 的解析器分类认不出（{error}），这一版用不了：要升级应用"
+        raise SelfTestError(message) from error
     yt_dlp = importlib.import_module("yt_dlp")
     try:
         runtimes = yt_dlp.YoutubeDL({"quiet": True, "js_runtimes": {"quickjs": {"path": quickjs}}})._js_runtimes

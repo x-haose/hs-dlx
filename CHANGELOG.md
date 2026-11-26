@@ -62,6 +62,8 @@
   IPv4 网络）照样报，写明原因；网络检测里 tracker 连不上时显示真正的原因。取种子信息、下载、做种时已经连上过节点，
   就不再显示 tracker 的报错（连不上的 tracker 不妨碍找节点）。报错只写 tracker 的地址与原因（tracker 回了拒绝的
   原因时为它，HTTP 出错时带状态码），不再带种子的哈希、本机地址与次数
+- 只有 yt-dlp 有专门解析器支持的网址才交给它解析，别的（如 yt-dlp 列着不支持的 jable.tv）直接到网页里找视频流，
+  不再报「This website is no longer supported」当成视频没了
 - 粘贴的网页地址被网站的人机验证拦下（403、503，如 Cloudflare）时，自动在内置网页里打开它、换到找视频流，不再停在
   失败页
 - 在网页里找视频流时，macOS 上的内置网页按本机 Safari 的写法报 User-Agent（原来缺 Safari 的那一段），Cloudflare

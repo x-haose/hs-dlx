@@ -167,8 +167,9 @@ fn publish(server: &Server, base: &Url, version: &str) {
     publish_with(server, base, version, true);
 }
 
-/// 同 [`publish`]；`allowlist` 为假时包里没有驱动脚本自检要找的扩展名白名单（像改掉了内部名字的新版）。
-fn publish_with(server: &Server, base: &Url, version: &str, allowlist: bool) {
+/// 同 [`publish`]；`internals` 为假时包里没有驱动脚本自检要找的内部名字（扩展名白名单、解析器的分类），像改掉了内部
+/// 名字的新版。
+fn publish_with(server: &Server, base: &Url, version: &str, internals: bool) {
     let mut files = vec![
         ("yt_dlp/__init__.py".to_owned(), FAKE_YT_DLP.to_owned()),
         (
@@ -176,12 +177,20 @@ fn publish_with(server: &Server, base: &Url, version: &str, allowlist: bool) {
             "__version__ = 'not-the-pypi-spelling'\n".to_owned(),
         ),
     ];
-    if allowlist {
+    if internals {
         files.push(("yt_dlp/utils/__init__.py".to_owned(), String::new()));
         files.push((
             "yt_dlp/utils/_utils.py".to_owned(),
             "class _UnsafeExtensionError(Exception):\n    ALLOWED_EXTENSIONS = frozenset({'mp4', 'm4a'})\n"
                 .to_owned(),
+        ));
+        files.push((
+            "yt_dlp/extractor/__init__.py".to_owned(),
+            "def gen_extractor_classes():\n    return []\n".to_owned(),
+        ));
+        files.push((
+            "yt_dlp/extractor/unsupported.py".to_owned(),
+            "class UnsupportedInfoExtractor:\n    pass\n".to_owned(),
         ));
     }
     let (name, bytes) = wheel("yt_dlp", version, &files);
