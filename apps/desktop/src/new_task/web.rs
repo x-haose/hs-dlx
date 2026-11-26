@@ -5,7 +5,7 @@ use gpui_kit::{
     AnyElement, Context, Div, InteractiveElement as _, IntoElement, ParentElement as _,
     SharedString, StatefulInteractiveElement as _, Styled as _, div, px,
 };
-use hs_dlx_app::web::{AudioCodec, Choice, Container, Route, VideoCodec, route};
+use hs_dlx_app::web::{AudioCodec, Choice, Container, VideoCodec, no_choice_reason};
 use hs_dlx_app::ytdlp::{ExtractError, Live};
 use hs_dlx_app::{Failure, FailureKind, Resolved, WebState};
 
@@ -163,27 +163,11 @@ impl NewTask {
             });
             return;
         }
-        // 没有格式时解析已报错（网站说的原因）；有格式而都下不了的是协议不支持（RTMP 等）或有 DRM
+        // 没有格式时解析已报错（网站说的原因）；有格式而都下不了的原因见 no_choice_reason
         if resolved.choices.is_empty() {
-            let why = if resolved.info.has_drm {
-                "有的格式有 DRM，其余的协议不支持".to_owned()
-            } else {
-                let protocols: Vec<&str> = resolved
-                    .info
-                    .formats
-                    .iter()
-                    .filter_map(|format| match route(format) {
-                        Route::Unsupported(reason) => Some(reason),
-                        Route::Own | Route::YtDlp => None,
-                    })
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
-                protocols.join("；")
-            };
             self.probing = Probing::Failed(Failure {
                 kind: FailureKind::Unsupported,
-                message: format!("没有能下的格式：{why}"),
+                message: format!("没有能下的格式：{}", no_choice_reason(&resolved.info)),
             });
             return;
         }

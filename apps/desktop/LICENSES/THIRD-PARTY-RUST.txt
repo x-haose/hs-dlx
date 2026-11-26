@@ -76,7 +76,7 @@ color_quant 1.1.0  MIT  https://github.com/image-rs/color_quant.git
 concurrent-queue 2.5.0  Apache-2.0 OR MIT  https://github.com/smol-rs/concurrent-queue
 const-oid 0.10.2  Apache-2.0 OR MIT  https://github.com/RustCrypto/formats
 const-random 0.1.18  MIT OR Apache-2.0  https://github.com/tkaitchuck/constrandom
-cookie 0.18.2  MIT OR Apache-2.0  https://github.com/SergioBenitez/cookie-rs
+cookie 0.18.3  MIT OR Apache-2.0  https://github.com/SergioBenitez/cookie-rs
 cookie_store 0.22.1  MIT OR Apache-2.0  https://github.com/pfernie/cookie_store
 core-foundation 0.10.1  MIT OR Apache-2.0  https://github.com/servo/core-foundation-rs
 core-foundation 0.9.4  MIT OR Apache-2.0  https://github.com/servo/core-foundation-rs
@@ -5263,7 +5263,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 --------------------------------------------------------------------------------
-cookie 0.18.2：LICENSE-APACHE
+cookie 0.18.3：LICENSE-APACHE
 --------------------------------------------------------------------------------
 
                               Apache License
@@ -5470,7 +5470,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 --------------------------------------------------------------------------------
-cookie 0.18.2：LICENSE-MIT
+cookie 0.18.3：LICENSE-MIT
 --------------------------------------------------------------------------------
 
 Copyright (c) 2017 Sergio Benitez

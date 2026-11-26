@@ -217,6 +217,31 @@ pub fn choices(info: &Info, preference: Preference) -> Vec<Choice> {
     found
 }
 
+/// [`choices`] 为空时的原因：有的格式有 DRM 时说 DRM；有这一版下不了的协议时列出；都不是时为 yt-dlp 给出的格式里没有
+/// 视频也没有音频（如只有预览图），带上 yt-dlp 的警告（网站不给的原因多写在里面，如要登录、要验证不是机器人）。
+pub fn no_choice_reason(info: &Info) -> String {
+    if info.has_drm {
+        return "有的格式有 DRM，其余的协议不支持".to_owned();
+    }
+    let unsupported: std::collections::BTreeSet<&str> = info
+        .formats
+        .iter()
+        .filter_map(|format| match route(format) {
+            Route::Unsupported(reason) => Some(reason),
+            Route::Own | Route::YtDlp => None,
+        })
+        .collect();
+    if !unsupported.is_empty() {
+        return unsupported.into_iter().collect::<Vec<_>>().join("；");
+    }
+    let none = "yt-dlp 给出的格式里没有视频也没有音频（如只有预览图）";
+    if info.warnings.is_empty() {
+        none.to_owned()
+    } else {
+        format!("{none}。yt-dlp 的警告：{}", info.warnings.join("；"))
+    }
+}
+
 /// 合并收不收 `format` 下到的文件：合并只收 MP4（含 M4A）、Matroska（含 WebM）、TS 与裸 AAC、MP3。HLS 与 DASH 下到的
 /// 是 MP4、TS 或分片接起来的 MP4、WebM；别的按扩展名。
 fn mergeable(format: &Format) -> bool {
@@ -412,6 +437,38 @@ mod tests {
             warnings: Vec::new(),
             site_cookies: Vec::new(),
         }
+    }
+
+    /// 只有预览图（没有视频也没有音频）时说明这一点并带上 yt-dlp 的警告；有 RTMP 的说 RTMP；有 DRM 的说 DRM。
+    #[test]
+    fn the_reason_for_no_choice_names_what_was_missing() {
+        let mut storyboard = format("sb0", Some("none"), Some("none"), Some(45), 0.0);
+        storyboard.protocol = Protocol::Other("mhtml".to_owned());
+        storyboard.ext = Some("mhtml".to_owned());
+        let mut images = info(vec![storyboard]);
+        assert!(choices(&images, Preference::Compatible).is_empty());
+        assert_eq!(
+            no_choice_reason(&images),
+            "yt-dlp 给出的格式里没有视频也没有音频（如只有预览图）"
+        );
+        images.warnings = vec!["Only images are available for download".to_owned()];
+        assert_eq!(
+            no_choice_reason(&images),
+            "yt-dlp 给出的格式里没有视频也没有音频（如只有预览图）。yt-dlp 的警告：Only images are available for download"
+        );
+
+        let mut rtmp = format("r", Some("avc1"), Some("mp4a.40.2"), Some(720), 1.0);
+        rtmp.protocol = Protocol::Other("rtmp".to_owned());
+        let streamed = info(vec![rtmp]);
+        assert!(choices(&streamed, Preference::Compatible).is_empty());
+        assert_eq!(no_choice_reason(&streamed), "RTMP 这一版还不支持");
+
+        let mut locked = info(Vec::new());
+        locked.has_drm = true;
+        assert_eq!(
+            no_choice_reason(&locked),
+            "有的格式有 DRM，其余的协议不支持"
+        );
     }
 
     /// YouTube 式的格式：1080p 有 H.264 与码率更高的 VP9、AV1，音频有 AAC 与 Opus。
