@@ -25,8 +25,9 @@ pub enum Verdict {
 }
 
 /// 判断到哪一步。网页类型的文档要正文就绪（或加载完）且知道了它的 HTTP 状态码才定论。状态码有三个来处：网页引擎在
-/// 响应到时报（macOS、Linux，带地址；开始显示同一地址的文档时认领，没成为文档的响应不会被别的文档领走），页面在文档
-/// 建出时从导航记录读（Chromium），网页引擎在加载完时报（Windows）；前一个有时不用后面的。
+/// 响应到时报（macOS、Linux，带地址：与开始显示的地址是同一文档时归给它，两者谁先到都行；没成为文档的响应不会被别的
+/// 文档领走），页面在文档建出时从导航记录读（Chromium），网页引擎在加载完时报（Windows）；有前面的就不用后面的。整页
+/// 的人机验证不等状态码（它本身多为 403、503，不论状态码都是网页）。
 #[derive(Debug)]
 pub(super) struct Judge {
     verdict: Verdict,
@@ -36,6 +37,8 @@ pub(super) struct Judge {
     content: Option<bool>,
     /// 网页引擎报来、还没有文档认领的响应：地址与状态码
     pending: Option<(String, u16)>,
+    /// 开始显示了、还没报类型的文档的地址
+    shown: Option<String>,
     /// 开始显示的文档认领到的网页引擎的状态码，等它报类型时归给它
     committed: Option<u16>,
     /// 当前顶层文档的状态码
@@ -49,6 +52,7 @@ impl Judge {
             html: false,
             content: None,
             pending: None,
+            shown: None,
             committed: None,
             status: None,
         }
@@ -58,24 +62,34 @@ impl Judge {
         &self.verdict
     }
 
-    /// 网页引擎拿到了顶层的响应：地址 `url` 与状态码 `status`。
+    /// 网页引擎拿到了顶层的响应：地址 `url` 与状态码 `status`。是开始显示了、还没报类型的那个文档的即归给它，否则等
+    /// 开始显示它时认领。
     pub fn responded(&mut self, url: String, status: u16) {
-        self.pending = Some((url, status));
+        if self
+            .shown
+            .as_deref()
+            .is_some_and(|shown| same_document(shown, &url))
+        {
+            self.committed = Some(status);
+        } else {
+            self.pending = Some((url, status));
+        }
     }
 
-    /// 开始显示地址 `url`（导航已提交）：认领同一地址（不计片段）的响应的状态码。
+    /// 开始显示地址 `url`（导航已提交）：认领同一文档的响应的状态码，还没报来的等 [`Judge::responded`]。
     pub fn started(&mut self, url: &str) {
-        let document = |url: &str| url.split('#').next().unwrap_or(url).to_owned();
         self.committed = self
             .pending
             .take()
-            .filter(|(responded, _)| document(responded) == document(url))
+            .filter(|(responded, _)| same_document(responded, url))
             .map(|(_, status)| status);
+        self.shown = Some(url.to_owned());
     }
 
     /// 顶层文档建出时报了类型与页面读到的状态码 `status`：网页类型等正文就绪再定，别的即不是网页。有了结论时为 true
     /// （下同）。
     pub fn document(&mut self, content_type: &str, status: Option<u16>) -> bool {
+        self.shown = None;
         self.status = self.committed.take().or(status);
         self.content = None;
         self.html = PAGE_TYPES
@@ -128,16 +142,16 @@ impl Judge {
         self.decide(Verdict::Broken(reason))
     }
 
-    /// 网页类型的文档：正文与状态码都有了才定。
+    /// 网页类型的文档：正文就绪且是人机验证即定，不是的等状态码。
     fn page(&mut self) -> bool {
-        let (Some(challenge), Some(status)) = (self.content, self.status) else {
-            return false;
-        };
-        self.decide(if (200..300).contains(&status) || challenge {
-            Verdict::Page
-        } else {
-            Verdict::Refused(status)
-        })
+        match (self.content, self.status) {
+            (Some(true), _) => self.decide(Verdict::Page),
+            (Some(false), Some(status)) if (200..300).contains(&status) => {
+                self.decide(Verdict::Page)
+            }
+            (Some(false), Some(status)) => self.decide(Verdict::Refused(status)),
+            (None, _) | (Some(false), None) => false,
+        }
     }
 
     fn decide(&mut self, verdict: Verdict) -> bool {
@@ -147,6 +161,20 @@ impl Judge {
         self.verdict = verdict;
         true
     }
+}
+
+/// 两个地址是同一个文档：不计片段与账号口令（WebKit 给的响应地址去掉了账号口令，显示的地址留着）；解析不了的按原样比。
+fn same_document(a: &str, b: &str) -> bool {
+    let document = |raw: &str| match url::Url::parse(raw) {
+        Ok(mut url) => {
+            url.set_fragment(None);
+            // 没有主机的地址（about:、data:）设不了，本就没有账号口令
+            let _no_host = url.set_username("").and_then(|()| url.set_password(None));
+            url.to_string()
+        }
+        Err(_) => raw.to_owned(),
+    };
+    document(a) == document(b)
 }
 
 #[cfg(test)]
@@ -194,6 +222,27 @@ mod tests {
         assert_eq!(judge.verdict(), &Verdict::Refused(403));
         let mut judge = shown(403);
         assert!(judge.content(false, true));
+        assert_eq!(judge.verdict(), &Verdict::Page);
+        // 人机验证页不等状态码
+        let mut judge = Judge::new();
+        judge.document("text/html", None);
+        assert!(judge.content(false, true));
+        assert_eq!(judge.verdict(), &Verdict::Page);
+
+        // 开始显示先于响应报来（Linux 上 wry 的处理先接上）：同样归给它
+        let mut judge = Judge::new();
+        judge.started(A);
+        judge.responded(A.into(), 403);
+        judge.document("text/html", None);
+        assert!(judge.content(false, false));
+        assert_eq!(judge.verdict(), &Verdict::Refused(403));
+
+        // 显示的地址带账号口令、响应的没有，片段不同：同一个文档
+        let mut judge = Judge::new();
+        judge.responded("https://a.example/v".into(), 200);
+        judge.started("https://user:pw@a.example/v#t=1");
+        judge.document("text/html", None);
+        assert!(judge.content(false, false));
         assert_eq!(judge.verdict(), &Verdict::Page);
 
         // 第一页还没就绪时下一次导航的响应先到：归给下一个文档，不算这一页的

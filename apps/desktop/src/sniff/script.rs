@@ -28,8 +28,10 @@ pub const SCRIPT: &str = r#"
   var handlers = window.webkit && window.webkit.messageHandlers;
   var webkit = handlers && handlers.ipc;
   if (!webkit && window !== window.top) return;
-  var channel = webkit || window.ipc;
-  // 页面脚本跑起来之后可能换掉这两个：先拿到原来的
+  // 页面脚本跑起来之后可能换掉发送的对象与 JSON.stringify：先拿到原来的。WebView2 上 wry 的 window.ipc 每次发时才去
+  // 找 window.chrome.webview，所以直接拿它
+  var webview2 = !webkit && window.chrome && window.chrome.webview;
+  var channel = webkit || webview2 || window.ipc;
   var post = channel.postMessage.bind(channel);
   var stringify = JSON.stringify;
   var send = function (message) {
