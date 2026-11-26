@@ -23,7 +23,7 @@ use gpui_kit::{
 };
 use hs_dlx_app::{
     Draft, DraftKind, Expected, Failure, FailureKind, MetadataFetch, MetadataProgress, OutputKind,
-    Service, TorrentInfo, file_name, not_a_playlist, task_title, torrent_from_file,
+    Service, TaskId, TorrentInfo, file_name, not_a_playlist, task_title, torrent_from_file,
 };
 use hs_m3u8_core::hls::{AudioChoice, Preference, VariantChoice};
 use hs_m3u8_core::{FileInfo, Probe, Resource, Source, Url};
@@ -68,6 +68,8 @@ pub enum NewTaskEvent {
     NotAPlaylist,
     /// 用户要在网页里找视频流（失败页上的按钮）
     Sniff(Url),
+    /// 磁力链接的种子已在这个任务里：由外面换到它
+    Taken(TaskId),
 }
 
 /// 探测进行到哪一步，粘贴栏与任务列表据此显示状态。
@@ -339,6 +341,16 @@ impl NewTask {
                     resume,
                 } = match self.service.fetch_metadata(self.url.to_string()) {
                     Ok(fetch) => fetch,
+                    Err(error @ hs_dlx_app::Error::TorrentTaken(existing)) => {
+                        self.probing = failed(FailureKind::Other, error.to_string());
+                        // 打开新建页时就取：这时外面还没订阅它的事件，下一轮再发
+                        self._probe = cx.spawn(async move |this, cx| {
+                            let _closed =
+                                this.update(cx, |_, cx| cx.emit(NewTaskEvent::Taken(existing)));
+                        });
+                        cx.notify();
+                        return;
+                    }
                     Err(error) => {
                         self.probing = failed(FailureKind::Other, error.to_string());
                         cx.notify();

@@ -81,6 +81,19 @@ impl Shell {
                     NewTaskEvent::Ready => this.focus_new_task(view, window, cx),
                     NewTaskEvent::NotAPlaylist => this.check_page(view, window, cx),
                     NewTaskEvent::Sniff(url) => this.open_sniff(url.clone(), window, cx),
+                    // 同一个种子不能有两个任务：换到已有的那个，说一声（新建页随之关掉）；新建页在设置后面时不打断设置，
+                    // 它上面写着原因
+                    NewTaskEvent::Taken(existing) => {
+                        let title = this
+                            .tasks
+                            .read(cx)
+                            .row(*existing)
+                            .map(|row| row.task.spec.title.clone());
+                        if let Some(title) = title.filter(|_| this.new_task() == Some(view)) {
+                            this.select(*existing, cx);
+                            this.tell(format!("这个种子已在「{title}」里，换到了它"), cx);
+                        }
+                    }
                     // 这个任务照选的存；记成之后新建的默认位置，记不下时提示
                     NewTaskEvent::FolderChanged(folder) => {
                         let saved = this

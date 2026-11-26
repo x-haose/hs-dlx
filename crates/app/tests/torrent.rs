@@ -260,6 +260,11 @@ fn a_magnet_link_downloads_the_chosen_file() {
         matches!(again, Err(Error::TorrentTaken(at)) if at == task.id),
         "{again:?}"
     );
+    // 再取同一个磁力链接的种子信息：说出占着它的任务，不加进会话
+    assert!(matches!(
+        service.fetch_metadata(uri.clone()),
+        Err(Error::TorrentTaken(at)) if at == task.id
+    ));
     rt.block_on(service.forget(task.id)).unwrap().unwrap();
 
     service.close().unwrap();

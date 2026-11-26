@@ -868,6 +868,18 @@ const COLUMNS: &str = "id, kind, title, url, headers, preference, output_kind, m
                        cloud_job, cloud_folder, cloud_root, cloud_user, cloud_before, web_extractor, web_video_id, \
                        web_video, web_audio, web_container, web_path";
 
+/// 种子 `info_hash`（信息哈希的十六进制，小写）所在的 BT 任务；没有时为 None。
+pub fn task_with_torrent(tx: &Transaction<'_>, info_hash: &str) -> Result<Option<TaskId>, Error> {
+    Ok(tx
+        .query_row(
+            "SELECT id FROM task WHERE torrent_info_hash = ?1",
+            [info_hash],
+            |row| row.get(0),
+        )
+        .optional()?
+        .map(TaskId))
+}
+
 /// 新建任务，状态为运行中，任务目录为 `work_dir`（绝对路径；BT 任务没有，为 None），BT 任务的续传数据为 `resume`
 /// （别的任务为 None）；返回分配的编号。输出或任务目录与已有任务的输出或任务目录相同（按 [`naming::path_key`] 比较）
 /// 时报 [`Error::PathTaken`]：共用任务目录时，放弃其中一个会删掉另一个已下的内容；共用输出时，后写出的那个要到写出时
@@ -932,15 +944,8 @@ pub fn insert(
     let (info_hash, root, trusted, seeding) = match &spec.kind {
         Kind::Hls(_) | Kind::File(_) | Kind::Cloud(_) | Kind::Web(_) => (None, None, None, None),
         Kind::Torrent(torrent) => {
-            if let Some(existing) = tx
-                .query_row(
-                    "SELECT id FROM task WHERE torrent_info_hash = ?1",
-                    [&torrent.info_hash],
-                    |row| row.get(0),
-                )
-                .optional()?
-            {
-                return Err(Error::TorrentTaken(TaskId(existing)));
+            if let Some(existing) = task_with_torrent(tx, &torrent.info_hash)? {
+                return Err(Error::TorrentTaken(existing));
             }
             // 新建时的续传数据还没有已有的块；还在下，不做种
             (

@@ -888,9 +888,18 @@ impl Service {
     }
 
     /// 磁力链接 `uri` 取种子信息（连 DHT 与链接里的 tracker、节点找有它的节点），返回取的进度与句柄：句柄的结果为种子的
-    /// 续传数据，供新建任务（[`DraftKind::Torrent`]）；句柄在任何执行器上都可等待，释放它即停止取。不是磁力链接、或这个
-    /// 种子正在下载或取种子信息时报 [`Error::Torrent`]；BT 会话建不出时直接报错。取不到时一直等，由调用方决定何时放弃。
+    /// 续传数据，供新建任务（[`DraftKind::Torrent`]）；句柄在任何执行器上都可等待，释放它即停止取。这个种子已在任务里
+    /// （不论在下、做种还是停着）时报 [`Error::TorrentTaken`]，不是磁力链接、或这个种子正在别处取种子信息时报
+    /// [`Error::Torrent`]；BT 会话建不出时直接报错。取不到时一直等，由调用方决定何时放弃。
     pub fn fetch_metadata(&self, uri: String) -> Result<MetadataFetch, Error> {
+        let id = hs_dlx_torrent::magnet_id(&uri)
+            .map_err(|error| Error::Torrent(format!("加不进磁力链接：{error}")))?;
+        let taken = self
+            .shared
+            .write(|tx| store::task_with_torrent(tx, &id.to_string()))?;
+        if let Some(existing) = taken {
+            return Err(Error::TorrentTaken(existing));
+        }
         let engine = self.shared.bt_engine()?;
         let (progress, receiver) = watch::channel(MetadataProgress::default());
         let probe_dir = self.shared.bt.probe_dir().to_path_buf();
