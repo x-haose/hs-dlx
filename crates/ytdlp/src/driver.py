@@ -14,8 +14,8 @@
     "generic": 只有通用解析器认得时也解析, "browser": 另从这个浏览器读 Cookie（yt-dlp 的浏览器名）或 null,
     "profile": 读它的这个用户资料（目录的绝对路径）或 null（浏览器没有用户资料之分时）, "site": 网页的可注册域名
     （交回哪些 Cookie，见 `site_cookies`）}`；
-    `generic` 为假时 yt-dlp 不支持的网址（见 `supported`）不发请求，直接回 `unsupported`；视频没有格式时照网站说的
-    原因（要登录、人机验证、限流、地区限制、不可用）回错误
+    `generic` 为假时不发请求即按 `claim` 回：列着用 DRM 加密的网站回 `drm`，没有专门解析器的回 `unsupported`；
+    视频没有格式时照网站说的原因（要登录、人机验证、限流、地区限制、不可用）回错误
   - 回应 `{"id": 同请求, "ok": 结果}` 或 `{"id": 同请求, "error": {"kind": 种类, "message": 说明}}`，种类见
     `classify`；从浏览器读 Cookie 没成时种类为 `cookies`，另有 `reason`（见 `browser_cookies`）。读完 Cookie（含从
     浏览器读）、开始解析网页时先回一行 `{"id": 同请求, "stage": "resolving"}`：应用从这时起算解析的时限（读浏览器的
@@ -623,7 +623,7 @@ def extract(
     if request.get("generic") is not True:
         claimed = claim(url)
         if claimed == "drm":
-            return {"error": {"kind": "unavailable", "message": "这个网站的视频用 DRM 加密，下载不了"}}
+            return {"error": {"kind": "drm", "message": "这个网站的视频用 DRM 加密，下载不了"}}
         if claimed == "none":
             return {"error": {"kind": "unsupported", "message": "没有专门认这个网址的解析器"}}
     logger = Logger()

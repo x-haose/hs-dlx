@@ -48,7 +48,6 @@ icons: py_env
 # 发行版上网页起不来）。cargo-packager 在哪个平台上都能打 .app 与 NSIS，所以格式要按平台指定
 # macOS 上设了 HS_DLX_SIGN_IDENTITY（签名身份）时签名、按 HS_DLX_NOTARY_PROFILE（notarytool 存进钥匙串的凭据名）公证
 # 并钉上票据，见 scripts/macos_sign.py：.app 在打 dmg 之前（packager 的 before-each-package-command），dmg 在打完之后
-# （与 .github/workflows/desktop.yml 的打包步骤一致）
 ifeq ($(OS),Windows_NT)
 PACKAGE_FORMATS := nsis
 else ifeq ($(shell uname -s),Darwin)

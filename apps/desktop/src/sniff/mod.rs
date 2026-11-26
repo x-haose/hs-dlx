@@ -183,21 +183,28 @@ impl SniffView {
             .settings()
             .map_err(|error| format!("读不出设置：{error}"))
             .and_then(|settings| route.update(cx, |route, _| route.acquire(&settings.proxy)));
-        let failed = {
+        let engine_events = {
             let inbox = inbox.clone();
-            move |failure| {
-                inbox.offer(match failure {
-                    hs_dlx_webview::Failure::LoadFailed(reason) => Engine::LoadFailed(reason),
-                    hs_dlx_webview::Failure::ProcessGone => Engine::Crashed,
+            move |event| {
+                inbox.offer(match event {
+                    hs_dlx_webview::Event::LoadFailed(reason) => Engine::LoadFailed(reason),
+                    hs_dlx_webview::Event::ProcessGone => Engine::Crashed,
+                    hs_dlx_webview::Event::Responded(status) => Engine::Responded(status),
                 });
             }
         };
         let (lease, proxy_note, webview) = match acquired {
             Ok((lease, note)) => {
-                let webview =
-                    WebView::build(builder, url.as_str(), &lease.proxy, failed, window, cx)
-                        .map(|webview| cx.new(|_| webview))
-                        .map_err(|error| format!("建不出网页：{error}"));
+                let webview = WebView::build(
+                    builder,
+                    url.as_str(),
+                    &lease.proxy,
+                    engine_events,
+                    window,
+                    cx,
+                )
+                .map(|webview| cx.new(|_| webview))
+                .map_err(|error| format!("建不出网页：{error}"));
                 (Some(lease), note, webview)
             }
             Err(reason) => (None, None, Err(reason)),
@@ -347,6 +354,7 @@ impl SniffView {
                 self.failure = Some(reason.clone());
                 self.judge.fail(reason)
             }
+            Engine::Responded(status) => self.judge.responded(status),
             Engine::Crashed => {
                 let reason = "网页进程意外退出了".to_owned();
                 self.failure = Some(reason.clone());
@@ -372,7 +380,7 @@ impl SniffView {
                     if challenge && !self.page_shown {
                         self.show_page(true, cx);
                     }
-                    self.judge.content(playlist)
+                    self.judge.content(playlist, challenge)
                 }
                 None => return,
             },
@@ -462,11 +470,6 @@ impl SniffView {
     /// 网页显示着：外面这时让出任务列表的位置。
     pub fn page_shown(&self) -> bool {
         self.page_shown
-    }
-
-    /// 网页此刻是整页的人机验证（见 [`script::SCRIPT`]）。
-    pub fn challenge(&self) -> bool {
-        self.challenge
     }
 
     fn webview(&self) -> Option<&Entity<WebView>> {

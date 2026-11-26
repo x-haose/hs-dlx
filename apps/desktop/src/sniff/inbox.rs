@@ -16,8 +16,10 @@ pub(super) enum Engine {
     /// 开始显示这个地址（导航已提交）：之前找到的都属于上一个页面
     Started(String),
     Finished(String),
-    /// 顶层导航没成：网页引擎给的原因（见 [`hs_dlx_webview::Failure`]）
+    /// 顶层导航没成：网页引擎给的原因（见 [`hs_dlx_webview::Event`]）
     LoadFailed(String),
+    /// 顶层文档收到了 HTTP 响应：状态码
+    Responded(u16),
     /// 网页进程退出或卡死了
     Crashed,
     /// 脚本发回的消息与发它的框架的地址（网页引擎给的，见 [`hs_dlx_webview::ipc_frame`]）
@@ -37,7 +39,11 @@ impl Engine {
     fn droppable(&self) -> bool {
         !matches!(
             self,
-            Engine::Started(_) | Engine::Finished(_) | Engine::LoadFailed(_) | Engine::Crashed
+            Engine::Started(_)
+                | Engine::Finished(_)
+                | Engine::LoadFailed(_)
+                | Engine::Responded(_)
+                | Engine::Crashed
         )
     }
 }

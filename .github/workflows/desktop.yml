@@ -87,11 +87,6 @@ jobs:
         working-directory: apps/desktop
         run: cargo packager --release --formats ${{ matrix.formats }}
 
-      # 与 Makefile 的 package 相同的打包后一步：设了签名身份时给 dmg 签名、公证并核对，没设时什么也不做
-      - name: dmg 签名（macOS）
-        if: runner.os == 'macOS'
-        run: uv run --no-project --python 3.12 python -I scripts/macos_sign.py dmg target/release
-
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: hs-dlx-${{ runner.os }}-${{ runner.arch }}

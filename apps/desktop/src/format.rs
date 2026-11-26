@@ -187,7 +187,10 @@ pub fn failure(kind: FailureKind) -> (String, &'static str) {
         FailureKind::NothingToWrite => {
             ("空".into(), "没有可写出的已录内容：接着下载或录制后再写出")
         }
-        FailureKind::Unsupported => ("不支持".into(), "来源用了不支持的特性，或不是 HLS"),
+        FailureKind::Unsupported => (
+            "不支持".into(),
+            "来源用了不支持的特性（如 DRM 加密），或不是 HLS：下载不了",
+        ),
         FailureKind::Unrecoverable => ("!".into(), "再试也一样，原因见错误信息"),
         FailureKind::CloudLogin => ("登录".into(), "PikPak 的登录失效了：在设置里重新登录后继续"),
         FailureKind::CloudQuota => (

@@ -4,7 +4,7 @@
   签名（hardened runtime、带时间戳，由里到外：先签包里的每个 Mach-O，再签整个 .app）、公证并钉上票据，dmg 装的即是它；
   这次打包的格式里没有 app 时失败（cargo-packager 会在打 dmg 时重建 .app，签的就不是装进去的那个）。别的格式、别的
   平台什么也不做。
-- `dmg <目录>`：cargo-packager 打完之后调（Makefile 的 package 与 CI 的打包都调）。给 `<目录>` 里最新的 hs-dlx_*.dmg
+- `dmg <目录>`：cargo-packager 打完之后调（Makefile 的 package）。给 `<目录>` 里最新的 hs-dlx_*.dmg
   签名、公证并钉上票据，再核对里面的 .app 与 dmg 本身。
 
 HS_DLX_SIGN_IDENTITY 为 codesign 认的签名身份（钥匙串里证书的名字或其中一段，如 `Developer ID Application`），没设时
@@ -104,10 +104,12 @@ def notarize(path: Path, profile: str) -> None:
         result = json.loads(reply)
     except json.JSONDecodeError:
         fail(f"notarytool 的回应不是 JSON：{reply}")
-    status = result.get("status")
+    status, submission = result.get("status"), result.get("id")
+    if status == "In Progress":
+        # 等到时限还没结论：苹果那边照样在做，还没有日志
+        fail(f"{path.name} 等了 {NOTARY_WAIT} 还没公证完（提交 {submission}），稍后用 notarytool info 查")
     if status != "Accepted":
-        # 等到时限还没结论时 status 为 In Progress，苹果那边照样在做
-        log = said("xcrun", "notarytool", "log", str(result.get("id")), "--keychain-profile", profile)
+        log = said("xcrun", "notarytool", "log", str(submission), "--keychain-profile", profile)
         fail(f"{path.name} 没通过公证（{status}）：{log}")
     run("xcrun", "stapler", "staple", str(path))
 

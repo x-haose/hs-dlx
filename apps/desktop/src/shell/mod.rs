@@ -24,7 +24,7 @@ use gpui_kit::{
     AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _,
     Subscription, Task, Window, div, px,
 };
-use hs_dlx_app::{PageHint, TaskId};
+use hs_dlx_app::TaskId;
 use hs_dlx_instance::Handoff;
 
 use crate::backdrop::{self, Backdrop};
@@ -54,23 +54,16 @@ enum Page {
     Task,
     /// 新建页：视图与对它的订阅（它的事件、它的探测进度推给粘贴栏），离开新建页时一起释放；`from_sniff` 为从嗅探页
     /// 打开的，关掉时回到嗅探页；
-    /// `page_check` 为第一次探测说明地址可能是网页时，在后台打开它、看是不是网页的嗅探视图、对它的订阅与缘由
+    /// `page_check` 为第一次探测说明地址可能是网页时，在后台打开它、看是不是网页的嗅探视图与对它的订阅
     NewTask {
         view: Entity<NewTask>,
         _subscriptions: [Subscription; 2],
         from_sniff: bool,
-        page_check: Option<PageCheck>,
+        page_check: Option<(Entity<SniffView>, Subscription)>,
     },
     /// 网页里的视频流：只经 [`Shell::show_sniff`] 换上，视图即 [`Shell::sniff`] 里的；网页显示着时占满主体，不显示任务
     /// 列表
     Sniff(Entity<SniffView>),
-}
-
-/// 在后台看地址是不是网页：嗅探视图、对它的订阅、为什么要看。
-struct PageCheck {
-    sniff: Entity<SniffView>,
-    _subscription: Subscription,
-    hint: PageHint,
 }
 
 /// 主窗口的视图：任务状态在 [`Tasks`] 里，这里是这个窗口自己的（选中哪个任务、显示哪一页、粘贴栏、嗅探页）。

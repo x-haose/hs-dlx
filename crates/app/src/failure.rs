@@ -33,29 +33,17 @@ impl Failure {
     }
 }
 
-/// 探测的错误说明地址可能是网页、值得在网页引擎里打开看看的缘由。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PageHint {
-    /// 取到的不是播放列表（没有 `#EXTM3U`）：网页、视频文件之类
-    NotAPlaylist,
-    /// 被拒（403、503）：可能是网站的人机验证（如 Cloudflare 的验证页）对不是浏览器发的请求的回应，也可能就是拒绝
-    /// （防盗链的直链、过期的地址）；要网页引擎打开后认出是人机验证页才算网页
-    Refused,
-}
-
-/// 探测的错误 `error` 说明地址可能是网页时为缘由；是哪一层（来源本身，还是主播放列表里的变体）的看错误里的地址。
-pub fn page_hint(error: &CoreError) -> Option<PageHint> {
+/// 探测的错误 `error` 说明地址可能是网页、值得在网页引擎里打开看看：取到的不是播放列表（没有 `#EXTM3U`：网页、视频
+/// 文件之类），或被拒（403、503：网站对不是浏览器发的请求常这样回，如人机验证、按请求特征拦截；也可能就是拒绝，如
+/// 防盗链的地址）。是哪一层（来源本身，还是主播放列表里的变体）的看错误里的地址。
+pub fn maybe_a_page(error: &CoreError) -> bool {
     match error {
-        CoreError::Playlist { cause, .. }
-            if **cause == hs_m3u8_core::hls::Malformed::NotAPlaylist =>
-        {
-            Some(PageHint::NotAPlaylist)
-        }
+        CoreError::Playlist { cause, .. } => **cause == hs_m3u8_core::hls::Malformed::NotAPlaylist,
         CoreError::Http {
             kind: hs_m3u8_core::HttpErrorKind::Status(403 | 503),
             ..
-        } => Some(PageHint::Refused),
-        _ => None,
+        } => true,
+        _ => false,
     }
 }
 
@@ -226,6 +214,7 @@ impl FailureKind {
             ExtractError::Login(_) => FailureKind::WebLogin,
             ExtractError::Geo(_) => FailureKind::WebGeo,
             ExtractError::Unavailable(_) => FailureKind::WebGone,
+            ExtractError::Drm(_) => FailureKind::Unsupported,
             ExtractError::Changed(_) => FailureKind::WebChanged,
             ExtractError::RateLimited(_) => FailureKind::Status(429),
             ExtractError::Blocked(_) => FailureKind::WebBlocked,
@@ -525,23 +514,15 @@ mod tests {
             url: Box::new(Url::parse("https://a.example/watch").unwrap()),
             cause: Box::new(cause),
         };
-        assert_eq!(
-            page_hint(&playlist(hs_m3u8_core::hls::Malformed::NotAPlaylist)),
-            Some(PageHint::NotAPlaylist)
-        );
-        assert_eq!(
-            page_hint(&playlist(hs_m3u8_core::hls::Malformed::Empty)),
-            None
-        );
-        assert_eq!(
-            page_hint(&http(HttpErrorKind::Status(403))),
-            Some(PageHint::Refused)
-        );
-        assert_eq!(
-            page_hint(&http(HttpErrorKind::Status(503))),
-            Some(PageHint::Refused)
-        );
-        assert_eq!(page_hint(&http(HttpErrorKind::Status(404))), None);
+        assert!(maybe_a_page(&playlist(
+            hs_m3u8_core::hls::Malformed::NotAPlaylist
+        )));
+        assert!(!maybe_a_page(&playlist(
+            hs_m3u8_core::hls::Malformed::Empty
+        )));
+        assert!(maybe_a_page(&http(HttpErrorKind::Status(403))));
+        assert!(maybe_a_page(&http(HttpErrorKind::Status(503))));
+        assert!(!maybe_a_page(&http(HttpErrorKind::Status(404))));
     }
 
     /// 分片里包着的 403、直播刷新一直 403 都按状态码；其余按种类。

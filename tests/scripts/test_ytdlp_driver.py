@@ -127,10 +127,10 @@ def test_only_sites_with_a_dedicated_extractor_are_supported() -> None:
     assert not driver.supported("https://open.spotify.com/track/x")
 
 
-def test_a_drm_site_is_unavailable_without_a_request(tmp_path: Path) -> None:
+def test_a_drm_site_is_refused_without_a_request(tmp_path: Path) -> None:
     [reply] = serve([{"id": 1, "url": "http://open.spotify.com/track/x", "proxy": "", "cookies": None}], tmp_path)
     error = driver.mapping(reply["error"]) or {}
-    assert error["kind"] == "unavailable"
+    assert error["kind"] == "drm"
     assert "DRM" in str(error["message"])
 
 

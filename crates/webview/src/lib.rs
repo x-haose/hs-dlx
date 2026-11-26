@@ -8,10 +8,10 @@
 
 mod agent;
 pub mod cookies;
-mod failure;
+mod events;
 
 pub use agent::user_agent;
-pub use failure::Failure;
+pub use events::Event;
 pub use proxy::{PROXY_FIXED_FOR_PROCESS, WebProxy, custom_proxy_supported};
 #[cfg(target_os = "linux")]
 mod linux;
@@ -62,6 +62,8 @@ pub struct WebView {
     /// 持有期间 GPUI 驱动 GTK 的主循环
     #[cfg(target_os = "linux")]
     _gtk: linux::GtkUser,
+    /// 接着网页引擎事件的东西（见 [`events::Hooks`]）：放在网页之后，网页先释放
+    _hooks: events::Hooks,
 }
 
 impl Drop for WebView {
@@ -73,23 +75,23 @@ impl Drop for WebView {
 }
 
 impl WebView {
-    /// 按 `builder`（不带地址）在 `window` 里建网页，做好各平台 wry 要的准备，设好代理 `proxy` 后加载 `url`；网页出了
-    /// wry 不报的故障（见 [`Failure`]）时在界面线程上调 `on_failure`。`proxy` 要是这个平台设得了的
+    /// 按 `builder`（不带地址）在 `window` 里建网页，做好各平台 wry 要的准备，设好代理 `proxy` 后加载 `url`；网页引擎有
+    /// wry 不报的事件（见 [`Event`]）时在界面线程上调 `on_event`。`proxy` 要是这个平台设得了的
     /// （[`custom_proxy_supported`]），否则是调用方的缺陷，中止。Linux 上窗口要跑在 X11（含 XWayland）上，Wayland 窗口
     /// 报错；GTK 在这里初始化，有网页期间由 GPUI 驱动它的主循环。
     pub fn build(
         builder: wry::WebViewBuilder,
         url: &str,
         proxy: &WebProxy,
-        on_failure: impl Fn(Failure) + 'static,
+        on_event: impl Fn(Event) + 'static,
         window: &mut Window,
         cx: &mut App,
     ) -> wry::Result<Self> {
         if let Err(reason) = proxy::supported(proxy) {
             panic!("调用方要先确认网页代理受支持：{reason}");
         }
-        let report: failure::Report = Rc::new(on_failure);
-        let builder = failure::before_build(builder, &report);
+        let report: events::Report = Rc::new(on_event);
+        let builder = events::before_build(builder, &report);
         let builder = proxy::before_build(builder, proxy);
         #[cfg(target_os = "linux")]
         let (webview, gtk) = {
@@ -99,7 +101,7 @@ impl WebView {
         };
         #[cfg(not(target_os = "linux"))]
         let webview = builder.build_as_child(&*window)?;
-        failure::after_build(&webview, &report)?;
+        let hooks = events::after_build(&webview, &report)?;
         proxy::after_build(&webview, proxy);
         webview.load_url(url)?;
         // 第一次布局之前先不占地方
@@ -122,6 +124,7 @@ impl WebView {
             origin,
             #[cfg(target_os = "linux")]
             _gtk: gtk,
+            _hooks: hooks,
         })
     }
 

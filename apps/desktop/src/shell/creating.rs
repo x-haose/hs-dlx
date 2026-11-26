@@ -1,10 +1,10 @@
 //! 新建：探测链接、开新建视图、新建任务（在 [`crate::tasks::Tasks`] 里）并把结果交回发起它的视图。
 
 use gpui_kit::{AppContext as _, Context, Entity, Window};
-use hs_dlx_app::{Draft, PageHint};
+use hs_dlx_app::Draft;
 use hs_m3u8_core::Url;
 
-use super::{Page, PageCheck, Shell};
+use super::{Page, Shell};
 use crate::links;
 use crate::new_task::{Link, NewTask, NewTaskEvent, Phase};
 use crate::sniff::{SniffEvent, SniffView, Verdict};
@@ -81,10 +81,10 @@ impl Shell {
                         }
                     }
                     NewTaskEvent::Ready => this.focus_new_task(view, window, cx),
-                    NewTaskEvent::MaybePage(hint) => this.check_page(view, *hint, window, cx),
+                    NewTaskEvent::MaybePage => this.check_page(view, window, cx),
                     NewTaskEvent::Sniff(url) => this.open_sniff(url.clone(), window, cx),
-                    // 同一个种子不能有两个任务：换到已有的那个，说一声（新建页随之关掉）；新建页在设置后面时不打断设置，
-                    // 它上面写着原因
+                    // 同一个种子不能有两个任务：换到已有的那个，说一声（新建页随之关掉；设置开着时换在设置下面）。新建页
+                    // 已换走的不再管
                     NewTaskEvent::Taken(existing) => {
                         let title = this
                             .tasks
@@ -149,16 +149,9 @@ impl Shell {
         }
     }
 
-    /// 新建页 `view` 第一次探测的结果说明地址可能是网页（缘由 `hint`）：粘贴来的、地址也不像播放列表的，在后台的网页
-    /// 里打开它，认出是网页就换到嗅探页找视频流（见 [`Shell::checked_page`]）；从嗅探页来的流、像播放列表的地址照常
-    /// 显示失败。
-    fn check_page(
-        &mut self,
-        view: &Entity<NewTask>,
-        hint: PageHint,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// 新建页 `view` 第一次探测的结果说明地址可能是网页：粘贴来的、地址也不像播放列表的，在后台的网页里打开它，认出是
+    /// 网页就换到嗅探页找视频流（见 [`Shell::checked_page`]）；从嗅探页来的流、像播放列表的地址照常显示失败。
+    fn check_page(&mut self, view: &Entity<NewTask>, window: &mut Window, cx: &mut Context<Self>) {
         let url = view.read(cx).url().clone();
         let Page::NewTask {
             view: shown,
@@ -183,19 +176,14 @@ impl Shell {
                 }
             },
         );
-        *page_check = Some(PageCheck {
-            sniff: sniff.clone(),
-            _subscription: subscription,
-            hint,
-        });
+        *page_check = Some((sniff.clone(), subscription));
         view.update(cx, |view, cx| view.opening_page(cx));
         // 建不出网页时一开始就有结论
         self.checked_page(&sniff, window, cx);
     }
 
-    /// 后台的网页 `sniff` 有了是不是网页的结论：是网页就换到嗅探页，否则在新建页的失败下面写明。被拒（403、503）的
-    /// 要网页也是人机验证页才算：网站拒绝的地址（防盗链的直链、过期的地址）网页引擎打开也是一张 HTML 的错误页，换到
-    /// 嗅探页会丢掉新建页（和它上面改请求头重新探测）。新建页已换走、或用户已改了请求头重新探测的，不再需要它。
+    /// 后台的网页 `sniff` 有了是不是网页的结论（见 [`Verdict`]）：是网页就换到嗅探页，否则在新建页的失败下面写明（新建页
+    /// 留着，可改请求头重新探测）。新建页已换走、或用户已改了请求头重新探测的，不再需要它。
     fn checked_page(
         &mut self,
         sniff: &Entity<SniffView>,
@@ -208,24 +196,20 @@ impl Shell {
         else {
             return;
         };
-        let Some(hint) = page_check
+        if page_check
             .as_ref()
-            .filter(|check| check.sniff == *sniff)
-            .map(|check| check.hint)
-        else {
+            .is_none_or(|(checked, _)| checked != sniff)
+        {
             return;
-        };
+        }
         if !view.read(cx).is_opening_page() {
             *page_check = None;
             return;
         }
-        let sniff_now = sniff.read(cx);
-        let note = match sniff_now.verdict() {
+        let note = match sniff.read(cx).verdict() {
             Verdict::Pending => return,
-            Verdict::Page if hint == PageHint::Refused && !sniff_now.challenge() => {
-                Some("网页引擎打开它也被拒了，不是人机验证".to_owned())
-            }
             Verdict::Page => None,
+            Verdict::Refused(status) => Some(format!("网页引擎打开它也回 HTTP {status}")),
             Verdict::NotPage(Some(kind)) => Some(format!("网页引擎打开它是 {kind}，不是网页")),
             Verdict::NotPage(None) => Some("网页引擎打开它也不是网页".to_owned()),
             Verdict::Playlist => Some("网页引擎打开它是 HLS 播放列表，不是网页".to_owned()),

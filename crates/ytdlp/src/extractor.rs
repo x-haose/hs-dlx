@@ -108,6 +108,9 @@ pub enum ExtractError {
     /// 网站说视频不可用：私密、删了、未开播等
     #[error("{0}")]
     Unavailable(String),
+    /// yt-dlp 列着用 DRM 加密视频的网站：下载不了，没向网站发请求
+    #[error("{0}")]
+    Drm(String),
     /// 组件正在换（[`Extractor::wait_idle`] 之后）：换好后用新的再试
     #[error("解析组件正在换，换好后再试")]
     Replacing,
@@ -748,6 +751,7 @@ impl Failure {
                 "代理出错（{message}）：先确认代理开着、端口对，要登录的代理在设置里填好用户名与密码；代理没问题时多为它的节点连不上这个网站，换个节点或改直连再试"
             )),
             "unavailable" => ExtractError::Unavailable(message),
+            "drm" => ExtractError::Drm(message),
             "changed" => ExtractError::Changed(message),
             "disk" => ExtractError::Disk(message),
             _ => ExtractError::Other(message),

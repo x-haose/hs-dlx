@@ -2,7 +2,7 @@
 //! （越粗码率越高，引线连到右侧的标签），点环或用方向键选中，再在检查面板里选音轨、输出、保存位置与请求头；是文件时
 //! 舞台上是写着大小的表盘，检查面板里选保存位置与请求头。磁力链接先连节点取种子信息（种子文件直接读），之后舞台上是
 //! 写着所选大小的表盘，检查面板里勾要下的文件、选保存位置。探测被拒时可改请求头重新探测；结果说明地址可能是网页（取到的
-//! 不是播放列表，或被拒，见 [`hs_dlx_app::page_hint`]）时外面可以在网页引擎里打开它看是不是网页（见
+//! 不是播放列表，或被拒，见 [`hs_dlx_app::maybe_a_page`]）时外面可以在网页引擎里打开它看是不是网页（见
 //! [`NewTask::opening_page`]）；请求经哪个代理写在检查面板里。舞台底部是外面给的粘贴栏。
 
 mod figure;
@@ -23,7 +23,7 @@ use gpui_kit::{
 };
 use hs_dlx_app::{
     Draft, DraftKind, Expected, Failure, FailureKind, MetadataFetch, MetadataProgress, OutputKind,
-    PageHint, Service, TaskId, TorrentInfo, file_name, page_hint, task_title,
+    Service, TaskId, TorrentInfo, file_name, maybe_a_page, task_title,
 };
 use hs_m3u8_core::hls::{AudioChoice, Preference, VariantChoice};
 use hs_m3u8_core::{FileInfo, Probe, Resource, Source, Url};
@@ -64,9 +64,9 @@ pub enum NewTaskEvent {
     FolderChanged(PathBuf),
     /// 探测完成，可以开始：由外面决定要不要把键盘焦点给它（[`NewTask::focus`]）
     Ready,
-    /// 第一次探测（不是改了请求头重新探测）的结果说明地址可能是网页，缘由见 [`hs_dlx_app::PageHint`]：由外面决定要不要
+    /// 第一次探测（不是改了请求头重新探测）的结果说明地址可能是网页（见 [`hs_dlx_app::maybe_a_page`]）：由外面决定要不要
     /// 在网页引擎里看它是不是网页
-    MaybePage(PageHint),
+    MaybePage,
     /// 用户要在网页里找视频流（失败页上的按钮）
     Sniff(Url),
     /// 磁力链接或种子文件的种子已在这个任务里：由外面换到它
@@ -92,8 +92,8 @@ impl Phase {
     }
 }
 
-/// 取不到种子信息的结论：失败（[`Probing::Failed`]），与种子已在里面的任务。
-type TorrentStop = (Probing, Option<TaskId>);
+/// 取不到种子信息的结论：失败，与种子已在里面的任务。
+type TorrentStop = (Failure, Option<TaskId>);
 
 /// 第一次探测的结果说明地址可能是网页后，外面在网页引擎里看它是不是网页（见 [`NewTask::opening_page`]）。
 #[derive(Clone, PartialEq, Eq)]
@@ -338,7 +338,7 @@ impl NewTask {
         self.probing = Probing::Metadata(MetadataProgress::default());
         self.since = Instant::now();
         self.animate(cx);
-        let failed = |kind, message: String| Probing::Failed(Failure { kind, message });
+        let failed = |kind, message: String| Failure { kind, message };
         // 取不到的结论：失败，与种子已在里面的任务
         let stop = move |kind, error: hs_dlx_app::Error| {
             let taken = match error {
@@ -357,10 +357,7 @@ impl NewTask {
                     // 打开新建页时就取：结论照样在下一轮交出，这时外面已订阅了它的事件
                     Err(error) => {
                         let stopped = stop(FailureKind::Other, error);
-                        self.finish_torrent(
-                            cx.background_executor().spawn(async { Err(stopped) }),
-                            cx,
-                        );
+                        self.finish_torrent(Task::ready(Err(stopped)), cx);
                         return;
                     }
                 };
@@ -430,7 +427,7 @@ impl NewTask {
                     Probing::Torrent(Box::new(TorrentChoice::new(resume, info))),
                     None,
                 ),
-                Err(stopped) => stopped,
+                Err((failure, taken)) => (Probing::Failed(failure), taken),
             };
             // 视图在取的期间被关掉时不再需要结果
             let _closed = this.update(cx, |this, cx| {
@@ -494,21 +491,21 @@ impl NewTask {
         self.since = Instant::now();
         self.animate(cx);
         self._probe = cx.spawn(async move |this, cx| {
-            let (probing, hint) = match handle.await {
-                Ok(Ok(Resource::Playlist(probe))) => (Probing::Ready(probe), None),
-                Ok(Ok(Resource::File(info))) => (Probing::File(Box::new(info)), None),
+            let (probing, maybe_page) = match handle.await {
+                Ok(Ok(Resource::Playlist(probe))) => (Probing::Ready(probe), false),
+                Ok(Ok(Resource::File(info))) => (Probing::File(Box::new(info)), false),
                 // 网页：交给 yt-dlp 解析（见 web.rs），没有专门的解析器时再在网页引擎里看
                 Ok(Ok(Resource::Page { .. })) => {
                     let _closed = this.update(cx, |this, cx| this.resolve_page(first, cx));
                     return;
                 }
-                Ok(Err(error)) => (Probing::Failed(Failure::of(&error)), page_hint(&error)),
+                Ok(Err(error)) => (Probing::Failed(Failure::of(&error)), maybe_a_page(&error)),
                 Err(join) => (
                     Probing::Failed(Failure {
                         kind: FailureKind::Other,
                         message: format!("探测中途出错：{join}"),
                     }),
-                    None,
+                    false,
                 ),
             };
             // 视图在探测期间被关掉时不再需要结果
@@ -517,8 +514,8 @@ impl NewTask {
                 this.probed(probing);
                 if ready {
                     cx.emit(NewTaskEvent::Ready);
-                } else if let Some(hint) = hint.filter(|_| first) {
-                    cx.emit(NewTaskEvent::MaybePage(hint));
+                } else if first && maybe_page {
+                    cx.emit(NewTaskEvent::MaybePage);
                 }
                 cx.notify();
             });
