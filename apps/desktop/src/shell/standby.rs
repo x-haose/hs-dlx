@@ -8,6 +8,7 @@ use gpui_kit::{
     AnyElement, Context, Div, FontWeight, IntoElement, ParentElement as _, PathBuilder,
     Styled as _, Window, canvas, div, point, px,
 };
+use hs_dlx_scene::Mode;
 use hs_m3u8_core::{Proxy, bare_url};
 
 use super::Shell;
@@ -89,6 +90,7 @@ impl Shell {
         let figure = dial::lit_dial(
             theme::accent(),
             dial::LIGHT_STRENGTH + breath + lift,
+            Mode::Standby,
             figure,
             readout,
         );

@@ -8,6 +8,8 @@ use gpui_kit::{
     canvas, div, px,
 };
 
+use hs_dlx_scene::Mode;
+
 use crate::ring::{self, AREA};
 use crate::{backdrop, theme, ui};
 
@@ -53,13 +55,21 @@ pub enum Big {
     Phrase(String),
 }
 
-/// 表盘：`light` 为背光的颜色（随状态），`figure` 为撑满整块区域的刻度，圆盘压在中间，`center` 放在圆盘里。
-pub fn dial(light: Hsla, figure: AnyElement, center: impl IntoElement) -> Div {
-    lit_dial(light, LIGHT_STRENGTH, figure, center)
+/// 表盘：`light` 为背光的颜色（随状态），`figure` 为撑满整块区域的刻度，圆盘压在中间，`center` 放在圆盘里；`mode`
+/// 为窗口背景的日冕代表的状态。
+pub fn dial(light: Hsla, mode: Mode, figure: AnyElement, center: impl IntoElement) -> Div {
+    lit_dial(light, LIGHT_STRENGTH, mode, figure, center)
 }
 
-/// [`dial`]，背光的强度为 `strength`（0 到 1）。圆心报给窗口背景（[`backdrop::report_disc`]），日冕从圆盘边上放出。
-pub fn lit_dial(light: Hsla, strength: f32, figure: AnyElement, center: impl IntoElement) -> Div {
+/// [`dial`]，背光的强度为 `strength`（0 到 1）。圆心与 `mode` 报给窗口背景（[`backdrop::report_disc`]），日冕从圆盘边上
+/// 放出。
+pub fn lit_dial(
+    light: Hsla,
+    strength: f32,
+    mode: Mode,
+    figure: AnyElement,
+    center: impl IntoElement,
+) -> Div {
     let disc = AREA - 2. * DISC_INSET;
     let place = || {
         div()
@@ -78,12 +88,12 @@ pub fn lit_dial(light: Hsla, strength: f32, figure: AnyElement, center: impl Int
                 .border_color(theme::hairline())
                 .child(
                     canvas(
-                        |bounds, _, cx| {
+                        move |bounds, _, cx| {
                             backdrop::report_disc(
                                 backdrop::Disc {
                                     center: bounds.center(),
                                     radius: DISC_RADIUS,
-                                    strength: 1.,
+                                    mode,
                                 },
                                 cx,
                             );

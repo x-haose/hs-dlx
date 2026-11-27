@@ -146,8 +146,7 @@ impl Shell {
                     let changed = if this.backdrop.stopped() {
                         false
                     } else {
-                        let speed = this.tasks.read(cx).activity(Instant::now()).speed;
-                        match this.backdrop.tick(speed, cx) {
+                        match this.backdrop.tick(cx) {
                             Ok(changed) => changed,
                             Err(backdrop::Stopped(error)) => {
                                 this.tell(format!("动态背景没有启用，界面改用纯色底：{error}"), cx);

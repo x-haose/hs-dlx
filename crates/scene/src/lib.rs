@@ -1,13 +1,17 @@
-//! 窗口的动态背景：日冕与绕圆盘弯曲的网格（着色器见 scene.wgsl），用 wgpu 渲染到屏幕外的纹理，读回成 BGRA 像素交给
-//! 界面显示。界面框架画不了自定义着色器，背景先在这里画成图再交过去。
+//! 窗口的动态背景：日冕（着色器见 scene.wgsl），用 wgpu 渲染到屏幕外的纹理，读回成 BGRA 像素交给界面显示。界面框架画
+//! 不了自定义着色器，背景先在这里画成图再交过去。日冕随任务状态的样子与状态之间的过渡见 [`Mode`] 与 [`Motion`]。
 //!
 //! 一个 [`Renderer`] 持有一个 GPU 设备；[`Renderer::render`] 画一帧并等它读回（阻塞），由调用方放在自己的线程上按需
 //! 调用。
+
+mod corona;
 
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::panic::AssertUnwindSafe;
 use std::time::Duration;
+
+pub use corona::{Corona, Mode, Motion, Target, Theme};
 
 /// 一套光的颜色（各通道线性的 0 到 1）。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -16,36 +20,24 @@ pub struct Palette {
     pub light: [f32; 3],
     /// 越往外越偏向的颜色
     pub deep: [f32; 3],
-    /// 紧贴圆盘边缘的亮环
+    /// 紧贴圆盘边缘的亮环与弧前端的亮点
     pub core: [f32; 3],
 }
 
-/// 一帧最多几块面板。
-pub const MAX_PANELS: usize = 4;
-
-/// 一帧要画成什么样。坐标都是像素，原点在左上。
+/// 一帧要画成什么样。除画面的宽高外，坐标与长度都是逻辑点，原点在左上。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Params {
+    /// 画面的宽高（像素）
     pub width: u32,
     pub height: u32,
-    /// 每个逻辑点几个像素：网格的格距、光漫进面板的深度按逻辑点算
+    /// 每个逻辑点几个像素
     pub scale: f32,
-    /// 光芒在一个循环里走到哪，0 到 1；从 1 回到 0 时画面不跳
-    pub phase: f32,
-    /// 圆盘的中心与半径
-    pub center: [f32; 2],
-    pub radius: f32,
-    /// 日冕与透镜弯曲的强度，0 到 1：0 时只剩平直的网格（页面上没有圆盘时）
-    pub strength: f32,
-    /// 网格从中心向外流过的距离（逻辑点）；按格距取余后使用，持续增大即持续流动
-    pub flow: f32,
-    pub palette: Palette,
-    /// 面板外与面板里的底色（sRGB 编码的 0 到 1）：画面不比它暗
+    pub corona: Corona,
+    /// 底色（sRGB 编码的 0 到 1）：画面不比它暗；面板里也是它
     pub ground: [f32; 3],
-    pub deck: [f32; 3],
-    /// 面板（左、上、右、下，像素）：以 `deck` 为底，光从朝圆盘的那条竖边按指数漫进去
-    pub panels: [Option<[f32; 4]>; MAX_PANELS],
-    /// 面板的圆角半径（逻辑点）
+    /// 面板（左、上、右、下）：光从朝圆盘的那条竖边按指数漫进去，面板里离那条边越远越暗
+    pub panel: Option<[f32; 4]>,
+    /// 面板的圆角半径
     pub panel_radius: f32,
 }
 
@@ -73,14 +65,12 @@ pub enum Error {
     Gpu(String),
 }
 
-/// 网格的格距（逻辑点），与 scene.wgsl 里的 GRID_STEP 相同：流过的距离按它取余。
-pub const GRID_STEP: f32 = 46.0;
 /// 等一帧画完最多多久：驱动卡住时不让调用方的线程一直挂着。
 const FRAME_TIMEOUT: Duration = Duration::from_secs(2);
 /// 输出的格式：与界面要的 BGRA 一致，读回后不必换通道；着色器自己做 sRGB 编码。
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 /// 统一缓冲区里 vec4f 的个数与字节数（见 scene.wgsl 的 Params）。
-const UNIFORM_VECTORS: usize = 8 + MAX_PANELS;
+const UNIFORM_VECTORS: usize = 9;
 const UNIFORM_SIZE: u64 = (UNIFORM_VECTORS * 16) as u64;
 
 /// 渲染背景的 GPU 设备与管线；画面大小变了时重建纹理与读回缓冲区。
@@ -96,11 +86,11 @@ struct Gpu {
     pipeline: wgpu::RenderPipeline,
     uniforms: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    target: Option<Target>,
+    surface: Option<Surface>,
 }
 
 /// 某一大小的渲染目标与读回缓冲区。
-struct Target {
+struct Surface {
     width: u32,
     height: u32,
     /// 读回时每行的字节数：按 GPU 的要求对齐到 256
@@ -205,7 +195,7 @@ impl Renderer {
                 pipeline,
                 uniforms,
                 bind_group,
-                target: None,
+                surface: None,
             }),
         })
     }
@@ -229,16 +219,16 @@ impl Gpu {
             });
         }
         if self
-            .target
+            .surface
             .as_ref()
             .is_none_or(|t| (t.width, t.height) != (params.width, params.height))
         {
-            self.target = Some(self.target_for(params.width, params.height));
+            self.surface = Some(self.surface_for(params.width, params.height));
         }
-        let target = self.target.as_ref().expect("上面刚建好");
+        let surface = self.surface.as_ref().expect("上面刚建好");
         self.queue
             .write_buffer(&self.uniforms, 0, &uniform_bytes(params));
-        let view = target
+        let view = surface
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self
@@ -266,27 +256,27 @@ impl Gpu {
         }
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &target.texture,
+                texture: &surface.texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {
-                buffer: &target.readback,
+                buffer: &surface.readback,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(target.padded_row),
-                    rows_per_image: Some(target.height),
+                    bytes_per_row: Some(surface.padded_row),
+                    rows_per_image: Some(surface.height),
                 },
             },
             wgpu::Extent3d {
-                width: target.width,
-                height: target.height,
+                width: surface.width,
+                height: surface.height,
                 depth_or_array_layers: 1,
             },
         );
         let submission = self.queue.submit([encoder.finish()]);
-        let slice = target.readback.slice(..);
+        let slice = surface.readback.slice(..);
         let (sender, receiver) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
             // 接收端在下面等着，发送失败只会是这个函数已经因超时返回
@@ -304,25 +294,25 @@ impl Gpu {
             .recv_timeout(FRAME_TIMEOUT)
             .map_err(|_| Error::Gpu("读回没有完成".to_owned()))?
             .map_err(|error| Error::Gpu(error.to_string()))?;
-        let row = target.width as usize * 4;
-        let mut bgra = Vec::with_capacity(row * target.height as usize);
+        let row = surface.width as usize * 4;
+        let mut bgra = Vec::with_capacity(row * surface.height as usize);
         {
             let mapped = slice
                 .get_mapped_range()
                 .map_err(|error| Error::Gpu(error.to_string()))?;
-            for line in mapped.chunks(target.padded_row as usize) {
+            for line in mapped.chunks(surface.padded_row as usize) {
                 bgra.extend_from_slice(&line[..row]);
             }
         }
-        target.readback.unmap();
+        surface.readback.unmap();
         Ok(Frame {
-            width: target.width,
-            height: target.height,
+            width: surface.width,
+            height: surface.height,
             bgra,
         })
     }
 
-    fn target_for(&self, width: u32, height: u32) -> Target {
+    fn surface_for(&self, width: u32, height: u32) -> Surface {
         let padded_row = (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
             * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -345,7 +335,7 @@ impl Gpu {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        Target {
+        Surface {
             width,
             height,
             padded_row,
@@ -406,35 +396,44 @@ fn scoped<T>(device: &wgpu::Device, work: impl FnOnce() -> Result<T, Error>) -> 
     }
 }
 
-/// `params` 按 scene.wgsl 的 Params 排成的字节（vec4f 依次排开，本机字节序）。
+/// `params` 按 scene.wgsl 的 Params 排成的字节（vec4f 依次排开，本机字节序）：逻辑点换成像素，0 到 1 的各项限在范围里。
 fn uniform_bytes(params: &Params) -> Vec<u8> {
-    let count = params.panels.iter().flatten().count();
-    let mut vectors: Vec<[f32; 4]> = Vec::with_capacity(UNIFORM_VECTORS);
-    vectors.push([
-        params.width as f32,
-        params.height as f32,
-        params.scale,
-        params.phase.rem_euclid(1.),
-    ]);
-    vectors.push([
-        params.center[0],
-        params.center[1],
-        params.radius,
-        params.flow.rem_euclid(GRID_STEP),
-    ]);
-    let [light, deep, core] = [
-        params.palette.light,
-        params.palette.deep,
-        params.palette.core,
+    let scale = params.scale;
+    let corona = &params.corona;
+    let Palette { light, deep, core } = corona.palette;
+    let ground = params.ground;
+    let panel = params.panel.unwrap_or_default().map(|edge| edge * scale);
+    let vectors: [[f32; 4]; UNIFORM_VECTORS] = [
+        [
+            params.width as f32,
+            params.height as f32,
+            scale,
+            corona.phase.rem_euclid(1.),
+        ],
+        [
+            corona.center[0] * scale,
+            corona.center[1] * scale,
+            corona.radius * scale,
+            corona.strength.clamp(0., 1.),
+        ],
+        [
+            corona.progress.clamp(0., 1.),
+            corona.turn.rem_euclid(1.),
+            corona.reach,
+            corona.bead.clamp(0., 1.),
+        ],
+        [light[0], light[1], light[2], 0.],
+        [deep[0], deep[1], deep[2], 0.],
+        [core[0], core[1], core[2], 0.],
+        [ground[0], ground[1], ground[2], 0.],
+        panel,
+        [
+            f32::from(u8::from(params.panel.is_some())),
+            params.panel_radius * scale,
+            0.,
+            0.,
+        ],
     ];
-    vectors.push([light[0], light[1], light[2], params.strength.clamp(0., 1.)]);
-    for color in [deep, core, params.ground, params.deck] {
-        vectors.push([color[0], color[1], color[2], 0.]);
-    }
-    vectors.push([count as f32, params.panel_radius, 0., 0.]);
-    // 面板挤到前面，着色器只看前 count 块
-    let panels = params.panels.iter().flatten().copied();
-    vectors.extend(panels.chain(std::iter::repeat([0.; 4])).take(MAX_PANELS));
     vectors
         .iter()
         .flatten()

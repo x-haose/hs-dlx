@@ -11,6 +11,7 @@ use gpui_kit::{
 use hs_dlx_app::web::Container;
 use hs_dlx_app::{Check, FailureKind, TaskId};
 use hs_dlx_app::{Status, TorrentPhase};
+use hs_dlx_scene::Mode;
 use hs_m3u8_core::bare_url;
 
 use super::look::{Look, look};
@@ -37,6 +38,31 @@ const SIGNAL_BREATH: Duration = Duration::from_millis(2400);
 pub(super) const MIN_WIDTH: f32 = ring::AREA + GAP + INSPECTOR_MIN_WIDTH;
 /// 任务页的最小高：放得下表盘与粘贴栏的舞台。
 pub(super) const MIN_HEIGHT: f32 = ui::stage_height(ring::AREA, 0.);
+
+/// 窗口背景的日冕代表的状态：进度取列表小环的，速度为 `now` 时的下载速度。正在放弃的按暂停，放弃没做完的按失败。
+fn corona(row: &Row, look: &Look, now: Instant) -> Mode {
+    let progress = look.fraction;
+    if row.discarding {
+        return Mode::Paused { progress };
+    }
+    match &row.task.status {
+        Status::Running => Mode::Downloading {
+            progress,
+            speed: row.rate.bytes_per_second(now),
+        },
+        Status::Paused => Mode::Paused { progress },
+        Status::Failed(_) | Status::DiscardUnfinished => Mode::Failed {
+            progress: (progress > 0.).then_some(progress),
+        },
+        Status::Done if row.task.seeding => Mode::Seeding {
+            upload: row
+                .torrent_progress
+                .as_ref()
+                .map_or(0., |p| p.upload_rate as f64),
+        },
+        Status::Done => Mode::Done,
+    }
+}
 
 /// 一个 BT 任务的诊断：在诊断中，或诊断的结果（诊断不了时为原因）。只对诊断时那一次运行（任务停过、开始或停止了做种
 /// 之后不再显示）。
@@ -66,6 +92,7 @@ impl Shell {
             let ticks = look.ticks;
             dial::dial(
                 look.color,
+                corona(row, &look, now),
                 dial::figure(move |bounds, window, _| {
                     ring::paint_ticks(bounds, ring::RADIUS, &ticks, window)
                 }),

@@ -1,7 +1,7 @@
 [package]
 name = "hs-dlx-scene"
 version.workspace = true
-description = "Animated window background for the hs-dlx desktop app: an eclipse corona and a lensed grid rendered off-screen with wgpu"
+description = "Animated window background for the hs-dlx desktop app: an eclipse corona whose lit arc and rays show task state, rendered off-screen with wgpu"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

@@ -8,6 +8,7 @@ use gpui_kit::{
     canvas, div, px,
 };
 use hs_dlx_app::{Failure, WebState};
+use hs_dlx_scene::Mode;
 use hs_m3u8_core::{FileInfo, Probe, VariantInfo};
 
 use super::{NewTask, PageCheck, Probing, TorrentChoice, duration_of};
@@ -37,8 +38,6 @@ const LABEL_WIDTH: f32 = 184.;
 pub(super) const FIGURE_WIDTH: f32 = LABEL_X + LABEL_WIDTH;
 /// 同心环区域的高。
 pub(super) const FIGURE_HEIGHT: f32 = BOX_TOP + BOX + BOX_TOP;
-/// 同心环外面的日冕的强度（表盘的为 1）。
-const RINGS_GLOW: f32 = 0.2;
 /// 点在环宽之外多远以内仍算点中这一环。
 const HIT_SLOP: f32 = 8.;
 
@@ -204,6 +203,7 @@ impl NewTask {
         };
         dial::dial(
             theme::accent(),
+            Mode::Preparing,
             dial::figure(move |bounds, window, _| {
                 ring::paint_comet(bounds, ring::RADIUS, head, theme::accent(), window)
             }),
@@ -270,12 +270,11 @@ impl NewTask {
                         canvas(
                             move |bounds, _, cx| {
                                 bounds_cell.set(bounds);
-                                // 日冕弱一档：环与右侧的标签是这一页的主角
                                 backdrop::report_disc(
                                     Disc {
                                         center: bounds.center(),
                                         radius: edge,
-                                        strength: RINGS_GLOW,
+                                        mode: Mode::Choosing,
                                     },
                                     cx,
                                 );
@@ -464,6 +463,7 @@ fn file_dial(info: &FileInfo) -> Div {
         .unwrap_or_else(|| "类型未知".to_owned());
     dial::dial(
         theme::accent(),
+        Mode::Choosing,
         dial::figure(move |bounds, window, _| {
             ring::paint_ticks(bounds, ring::RADIUS, &ticks, window)
         }),
@@ -482,6 +482,7 @@ fn torrent_dial(choice: &TorrentChoice) -> Div {
     let line = format!("{count} / {} 个文件", choice.info.files.len());
     dial::dial(
         theme::accent(),
+        Mode::Choosing,
         dial::figure(move |bounds, window, _| {
             ring::paint_ticks(bounds, ring::RADIUS, &ticks, window)
         }),
@@ -500,6 +501,7 @@ fn failed_dial(failure: &Failure) -> Div {
     let ticks = Ticks::full(ring::COMET_TICKS, theme::alpha(theme::warn(), 0.45), false);
     dial::dial(
         theme::warn(),
+        Mode::Failed { progress: None },
         dial::figure(move |bounds, window, _| {
             ring::paint_ticks(bounds, ring::RADIUS, &ticks, window)
         }),

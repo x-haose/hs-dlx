@@ -1,9 +1,10 @@
-//! 窗口的动态背景：日冕、绕圆盘弯曲并向外流的网格，延伸进两侧面板（着色器与渲染见 hs-dlx-scene）。
+//! 窗口的动态背景：日冕，光漫进一块面板（着色器、各状态的样子与过渡见 hs-dlx-scene）。
 //!
 //! 一个后台线程持有 GPU 渲染器，按界面送来的最新参数画一帧、读回成图；界面每隔 [`FRAME`] 送一次参数、取走画好的
-//! 图，铺在窗口最底层（[`layer`]）。日冕的圆与面板的位置不另写一份坐标：表盘（新建页为同心环）与面板在布局时报上
-//! 来（[`report_disc`]、[`panel_floor`]），下一次送参数时用。面板自己不涂底色：铺着的图是按它现在的位置画的时，面板
-//! 的底已在图里（光从朝圆盘的那条边漫进去）；不是时（刚换页、刚改大小、没有 GPU）面板自己涂纯色底。
+//! 图，铺在窗口最底层（[`layer`]）。日冕的圆、它代表的状态与面板的位置不另写一份：表盘（新建页为同心环）与面板在
+//! 布局时报上来（[`report_disc`]、[`panel_floor`]），下一次送参数时用。着色器只照一块面板，是这一帧最先布局的那块；
+//! 面板自己不涂底色：铺着的图是按它现在的位置画的时，面板的底已在图里（光从朝圆盘的那条边漫进去）；不是时（其余
+//! 面板、刚换页、刚改大小、没有 GPU）面板自己涂纯色的窗口底色。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
@@ -13,25 +14,17 @@ use gpui_kit::{
     App, Bounds, Corners, Global, IntoElement, Pixels, Point, RenderImage, Size, Styled as _,
     canvas, fill, px,
 };
-use hs_dlx_scene::{GRID_STEP, MAX_PANELS, Palette, Params, Renderer};
+use hs_dlx_scene::{Mode, Motion, Params, Renderer, Target, Theme};
 
-use crate::{dial, theme};
+use crate::theme;
 
 /// 多久送一次参数、取一次图：每秒 30 帧。
 pub const FRAME: Duration = Duration::from_millis(33);
 /// 背景每个逻辑点画几个像素，高分屏上由界面放大铺满：背景都是柔和的光，开销与像素数成正比（每帧整张图要上传给
 /// 界面），按屏幕的像素画在 2 倍屏上要多花 4 倍。
 const DETAIL: f32 = 1.;
-/// 日冕的光芒走完一个循环的时长：循环首尾相接，画面不跳。
-const LOOP: Duration = Duration::from_secs(24);
-/// 页面上有没有圆盘变了之后，日冕多久亮起或熄灭。
-const FADE: Duration = Duration::from_millis(400);
-/// 两次送参数之间最多算多长：窗口卡住之后回来，光芒与网格不一下跳一大截。
+/// 两次送参数之间最多算多长：窗口卡住之后回来，光芒与过渡不一下跳一大截。
 const MAX_STEP: Duration = Duration::from_millis(100);
-/// 有下载时网格每秒向外流过多少逻辑点：`FLOW_BASE` 加上 `FLOW_PER_DECADE` 乘速度（MB/s 加 1）的常用对数。1 MB/s
-/// 约 8 点、10 MB/s 约 12 点、100 MB/s 约 18 点；没有下载时不流。
-const FLOW_BASE: f32 = 6.;
-const FLOW_PER_DECADE: f32 = 6.;
 /// 送出的参数多久还没画出来，就当 GPU 用不了：取适配器、建设备与驱动的其他调用卡住时没有期限，画一帧正常时在几十
 /// 毫秒内。
 const STALL: Duration = Duration::from_secs(10);
@@ -55,15 +48,8 @@ pub struct Backdrop {
     /// 送出、还没画出的参数已经等了多久（按每次送参数的间隔累计，每次最多算 [`MAX_STEP`]：电脑睡眠的时长不算进去）；
     /// 都画出了时为 None
     waiting: Option<Duration>,
-    /// 光芒在一个循环里走到哪（0 到 1）
-    phase: f32,
-    /// 网格向外流过的距离（逻辑点，0 到一个格距）
-    flow: f32,
-    /// 日冕此刻的强度（0 到 1）：向报上来的圆盘的强度走，页面上没有圆盘时向 0 走
-    strength: f32,
-    /// 日冕此刻的圆心与半径（逻辑点）：向报上来的走，换页时滑过去而不是跳过去；页面上没有圆盘时留在原处熄灭。一次也
-    /// 没报过时为 None
-    disc: Option<(Point<Pixels>, f32)>,
+    /// 日冕此刻的样子：向报上来的圆盘与状态滑过去，页面上没有圆盘时留在原处熄灭
+    motion: Motion,
     /// 最近送出去的参数：没变就不再送，静止时不重画
     sent: Option<Params>,
     /// 已停：不再送参数、不再取图
@@ -107,15 +93,16 @@ struct Painted {
 #[derive(Debug, Clone, Default, PartialEq)]
 struct Measured {
     disc: Option<Disc>,
-    panels: Vec<Bounds<Pixels>>,
+    /// 最先布局的面板
+    panel: Option<Bounds<Pixels>>,
 }
 
-/// 日冕从哪个圆放出：圆心（窗口坐标）、半径（逻辑点，日冕的亮边贴着它）与强度（0 到 1）。
+/// 日冕从哪个圆放出：圆心（窗口坐标）、半径（逻辑点，日冕的亮边贴着它）与它代表的状态。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Disc {
     pub center: Point<Pixels>,
     pub radius: f32,
-    pub strength: f32,
+    pub mode: Mode,
 }
 
 /// 窗口这一帧的大小、每点几个像素、是不是在前台。
@@ -174,10 +161,7 @@ impl Backdrop {
             shared,
             last_tick: Instant::now(),
             waiting: None,
-            phase: 0.,
-            flow: 0.,
-            strength: 0.,
-            disc: None,
+            motion: Motion::new(),
             sent: None,
             stopped: false,
         }
@@ -188,15 +172,14 @@ impl Backdrop {
         self.stopped
     }
 
-    /// 走一步动画、按上一帧的布局送参数、取走画好的图。`speed` 为所有任务合计的下载速度（字节每秒）。返回是否换了
-    /// 图（要重画窗口）；背景停了时返回原因，只返回这一次，此后什么也不做。
-    pub fn tick(&mut self, speed: f64, cx: &mut App) -> Result<bool, Stopped> {
+    /// 走一步动画、按上一帧的布局送参数、取走画好的图。返回是否换了图（要重画窗口）；背景停了时返回原因，只返回
+    /// 这一次，此后什么也不做。
+    pub fn tick(&mut self, cx: &mut App) -> Result<bool, Stopped> {
         if self.stopped {
             return Ok(false);
         }
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_tick).min(MAX_STEP);
-        let step = elapsed.as_secs_f32();
         self.last_tick = now;
         let reduce_motion = cx.reduce_motion();
         let board = cx.global_mut::<Board>();
@@ -238,36 +221,29 @@ impl Backdrop {
         if viewport.size.width <= px(0.) || viewport.size.height <= px(0.) {
             return Ok(changed);
         }
-        let animate = viewport.active && !reduce_motion;
-        if animate {
-            self.phase = (self.phase + step / LOOP.as_secs_f32()).rem_euclid(1.);
-            self.flow = (self.flow + step * flow_rate(speed)).rem_euclid(GRID_STEP);
-        }
-        let target = measured.disc.map_or(0., |disc| disc.strength);
-        self.strength = if animate {
-            let reach = step / FADE.as_secs_f32();
-            self.strength + (target - self.strength).clamp(-reach, reach)
-        } else {
-            target
-        };
-        if let Some(disc) = measured.disc {
-            // 每一步走剩下的一部分：约 FADE 内走完大半，换页时圆心与半径滑过去
-            let share = if animate {
-                (step / FADE.as_secs_f32()).min(1.)
-            } else {
-                1.
-            };
-            let (center, radius) = self.disc.unwrap_or((disc.center, disc.radius));
-            self.disc = Some((
-                center + (disc.center - center) * share,
-                radius + (disc.radius - radius) * share,
-            ));
-        }
-        let (center, radius) = self.disc.unwrap_or_else(|| {
-            let middle = Point::new(viewport.size.width / 2., viewport.size.height / 2.);
-            (middle, dial::DISC_RADIUS)
+        let target = measured.disc.map(|disc| Target {
+            center: [f32::from(disc.center.x), f32::from(disc.center.y)],
+            radius: disc.radius,
+            mode: disc.mode,
         });
-        let params = self.params(viewport, center, radius, &measured.panels);
+        let still = !viewport.active || reduce_motion;
+        self.motion.step(target.as_ref(), theme(), elapsed, still);
+        // 还没有报过圆盘：没有要画的
+        let Some(corona) = self.motion.corona() else {
+            return Ok(changed);
+        };
+        let scale = DETAIL.min(viewport.scale);
+        let params = Params {
+            width: (f32::from(viewport.size.width) * scale).round() as u32,
+            height: (f32::from(viewport.size.height) * scale).round() as u32,
+            scale,
+            corona,
+            ground: srgb(theme::ground()),
+            panel: measured.panel.map(|bounds| {
+                [bounds.left(), bounds.top(), bounds.right(), bounds.bottom()].map(f32::from)
+            }),
+            panel_radius: PANEL_RADIUS,
+        };
         if self.sent != Some(params) {
             self.sent = Some(params);
             self.waiting.get_or_insert(Duration::ZERO);
@@ -280,46 +256,6 @@ impl Backdrop {
             self.shared.wake.notify_one();
         }
         Ok(changed)
-    }
-
-    fn params(
-        &self,
-        viewport: Viewport,
-        center: Point<Pixels>,
-        radius: f32,
-        panels: &[Bounds<Pixels>],
-    ) -> Params {
-        let scale = DETAIL.min(viewport.scale);
-        let pixels = |value: Pixels| f32::from(value) * scale;
-        let mut slots = [None; MAX_PANELS];
-        assert!(
-            panels.len() <= MAX_PANELS,
-            "一页上的面板不超过 {MAX_PANELS} 块，这一帧量到 {} 块",
-            panels.len()
-        );
-        for (slot, bounds) in slots.iter_mut().zip(panels) {
-            *slot = Some([
-                pixels(bounds.left()),
-                pixels(bounds.top()),
-                pixels(bounds.right()),
-                pixels(bounds.bottom()),
-            ]);
-        }
-        Params {
-            width: pixels(viewport.size.width).round() as u32,
-            height: pixels(viewport.size.height).round() as u32,
-            scale,
-            phase: self.phase,
-            center: [pixels(center.x), pixels(center.y)],
-            radius: radius * scale,
-            strength: self.strength,
-            flow: self.flow,
-            palette: palette(),
-            ground: srgb(theme::ground()),
-            deck: srgb(theme::deck()),
-            panels: slots,
-            panel_radius: PANEL_RADIUS,
-        }
     }
 }
 
@@ -387,28 +323,11 @@ fn work(shared: &Shared) {
     }
 }
 
-/// 网格每秒向外流过的逻辑点（见 [`FLOW_BASE`]）。
-fn flow_rate(speed: f64) -> f32 {
-    if speed <= 0. {
-        return 0.;
-    }
-    let megabytes = (speed / 1e6) as f32;
-    FLOW_BASE + FLOW_PER_DECADE * (1. + megabytes).log10()
-}
-
-/// 当前主题的光（线性的 0 到 1）。
-fn palette() -> Palette {
+/// 当前主题：日冕的光随它换。
+fn theme() -> Theme {
     match theme::current() {
-        theme::Theme::Eclipse => Palette {
-            light: [0.25, 0.85, 1.0],
-            deep: [0.10, 0.18, 1.0],
-            core: [0.85, 0.97, 1.0],
-        },
-        theme::Theme::BloodMoon => Palette {
-            light: [1.0, 0.26, 0.05],
-            deep: [0.32, 0.01, 0.015],
-            core: [1.0, 0.80, 0.50],
-        },
+        theme::Theme::Eclipse => Theme::Eclipse,
+        theme::Theme::BloodMoon => Theme::BloodMoon,
     }
 }
 
@@ -469,26 +388,30 @@ pub fn layer() -> impl IntoElement {
     .size_full()
 }
 
-/// 表盘、新建页的同心环在布局时报上日冕从哪个圆放出。
+/// 表盘、新建页的同心环在布局时报上日冕从哪个圆放出、代表什么状态。
 pub fn report_disc(disc: Disc, cx: &mut App) {
     cx.global_mut::<Board>().measuring.disc = Some(disc);
 }
 
-/// 面板的底：铺满面板（描边以内），布局时报上自己的位置；铺着的图是按这个位置画的时什么也不涂（底已在图里），否则
-/// 涂面板的纯色底。
+/// 面板的底：铺满面板（描边以内），布局时报上自己的位置（这一帧最先布局的那块交给着色器）；铺着的图是按这个位置
+/// 画的时什么也不涂（底已在图里），否则涂窗口底色。
 pub fn panel_floor() -> impl IntoElement {
     canvas(
-        |bounds, _, cx| cx.global_mut::<Board>().measuring.panels.push(bounds),
+        |bounds, _, cx| {
+            cx.global_mut::<Board>()
+                .measuring
+                .panel
+                .get_or_insert(bounds);
+        },
         |bounds, (), window, cx| {
             let covered = cx.global::<Board>().shown.as_ref().is_some_and(|shown| {
                 shown
                     .measured
-                    .panels
-                    .iter()
-                    .any(|panel| same(*panel, bounds))
+                    .panel
+                    .is_some_and(|panel| same(panel, bounds))
             });
             if !covered {
-                window.paint_quad(fill(bounds, theme::deck()).corner_radii(px(PANEL_RADIUS)));
+                window.paint_quad(fill(bounds, theme::ground()).corner_radii(px(PANEL_RADIUS)));
             }
         },
     )

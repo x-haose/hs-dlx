@@ -8,6 +8,7 @@ use gpui_kit::{
 use hs_dlx_app::web::{AudioCodec, Choice, Container, VideoCodec, no_choice_reason};
 use hs_dlx_app::ytdlp::{ExtractError, Live};
 use hs_dlx_app::{Failure, FailureKind, Resolved, WebState};
+use hs_dlx_scene::Mode;
 
 use super::{NewTask, NewTaskEvent, Probing};
 use crate::dial;
@@ -381,6 +382,7 @@ pub(super) fn web_dial(choice: &WebChoice) -> Div {
     let line = format!("{}{size}", codecs(option));
     dial::dial(
         theme::accent(),
+        Mode::Choosing,
         dial::figure(move |bounds, window, _| {
             ring::paint_ticks(bounds, ring::RADIUS, &ticks, window)
         }),

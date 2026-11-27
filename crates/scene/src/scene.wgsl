@@ -1,31 +1,30 @@
-// 窗口的背景：日冕（深色圆盘边缘的光，光丝向外放射、缓缓流动）、绕圆盘弯曲并向外流的网格；面板里以面板底色为主，
-// 光从朝圆盘的那条竖边按指数漫进去。坐标是像素，原点在左上。输出已做色调映射与 sRGB 编码，不透明。
+// 窗口的背景：日冕（深色圆盘边缘的光，光丝向外放射、缓缓流动）。只有一段弧被点亮（从起点顺时针到进度），弧前端可以有
+// 一颗亮点，没点亮的一段只剩一圈暗的边；一块面板里光从朝圆盘的那条竖边按指数漫进去。坐标是像素，原点在左上。输出已做
+// 色调映射与 sRGB 编码，不透明。
 
 struct Params {
     // 宽、高（像素）、每个逻辑点几个像素、光芒在一个循环里走到哪（0 到 1）
     size: vec4f,
-    // 圆盘中心 x、y 与半径（像素），网格向外流过的距离（逻辑点，0 到一个格距）
+    // 圆盘中心 x、y 与半径（像素），整体强度（0 到 1）
     disc: vec4f,
-    // 光的主色（线性的 0 到 1）；w 为日冕与透镜弯曲的强度（0 到 1）
+    // 点亮的弧长（0 到 1，1 为整圈）、弧的起点从 12 点顺时针转过的圈数（0 到 1）、光丝与光晕伸出多远的倍数（大于 0）、
+    // 弧前端亮点的亮度（0 到 1）
+    arc: vec4f,
+    // 光的主色、越往外越偏向的颜色、紧贴圆盘边缘的亮环的颜色（线性的 0 到 1；w 不用）
     light: vec4f,
-    // 外缘偏向的颜色、亮环的颜色（线性的 0 到 1；w 不用）
     deep: vec4f,
     core: vec4f,
-    // 面板外与面板里的底色（sRGB 编码的 0 到 1；w 不用）
+    // 底色（sRGB 编码的 0 到 1；w 不用）：画面不比它暗
     ground: vec4f,
-    deck: vec4f,
-    // 面板几块、圆角半径（逻辑点）
+    // 面板：左、上、右、下（像素）
     panel: vec4f,
-    // 面板：左、上、右、下（像素）；只有前 panel.x 块有效
-    panels: array<vec4f, 4>,
+    // 有没有面板（0 或 1）、面板的圆角半径（像素）
+    shape: vec4f,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
 
 const TAU: f32 = 6.2831853;
-// 网格的格距（逻辑点）与它在离中心多远处淡到一半
-const GRID_STEP: f32 = 46.0;
-const GRID_REACH: f32 = 700.0;
 // 光漫进面板的深度（逻辑点）
 const SPILL: f32 = 85.0;
 
@@ -71,17 +70,6 @@ fn aces(x: vec3f) -> vec3f {
     return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), vec3f(0.0), vec3f(1.0));
 }
 
-// 引力透镜：画面上半径 r 处看到的，是原来半径为返回值处的（正向是 r_in * (1 + k R² / (r_in² + 0.4 R²))，k 为
-// 0.9 乘强度；几次迭代求逆）
-fn unlens(r: f32, radius: f32, strength: f32) -> f32 {
-    let k = 0.9 * strength;
-    var inner = r;
-    for (var i = 0; i < 6; i++) {
-        inner = r / (1.0 + k * radius * radius / (inner * inner + 0.4 * radius * radius));
-    }
-    return inner;
-}
-
 // 点 p 到圆角矩形 rect（左、上、右、下）边上的有符号距离，里面为负
 fn rounded(p: vec2f, rect: vec4f, radius: f32) -> f32 {
     let center = (rect.xy + rect.zw) * 0.5;
@@ -105,9 +93,13 @@ fn fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
     let p = position.xy;
     let scale = params.size.z;
     let phase = params.size.w;
-    let strength = params.light.w;
     let center = params.disc.xy;
     let radius = params.disc.z;
+    let strength = params.disc.w;
+    let progress = params.arc.x;
+    let start = params.arc.y;
+    let reach = params.arc.z;
+    let bead = params.arc.w;
     let uv = p - center;
     let r = length(uv);
     let angle = atan2(uv.y, uv.x);
@@ -122,55 +114,46 @@ fn fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
     let fine = fbm(vec3f(dir * 38.0 + warp, d * 3.0 + around.y));
     streak *= 0.65 + 0.7 * fine;
     let outside = max(d, 0.0);
-    let corona = exp(-outside / (0.035 + 0.32 * streak)) * (0.18 + 0.8 * streak);
+
+    // 点亮的弧：从起点顺时针量到 progress。离圆盘越远两端收得越缓，光丝在端头渐隐而不是一刀切；弧长在最后 3% 里把
+    // 两端之间的缺口合上，到整圈时没有接缝，也不在 1 处跳变
+    let along = fract(atan2(uv.x, -uv.y) / TAU - start);
+    let soft = 0.07 * outside;
+    let closed = smoothstep(0.97, 1.0, progress);
+    let ends = smoothstep(0.0, 0.012 + soft, along)
+        * (1.0 - smoothstep(progress - 0.014 - soft, progress + 0.003, along));
+    let lit = mix(ends, 1.0, closed);
+
+    let corona = exp(-outside / ((0.035 + 0.32 * streak) * reach)) * (0.18 + 0.8 * streak);
     let halo = exp(-outside / 0.05);
-    let glow = exp(-outside / 0.30);
+    let glow = exp(-outside / (0.30 * reach));
     let ambient = exp(-outside / 1.8);
-    // 亮环：红、绿、蓝的边缘各错开一点，带色散的彩边
+    // 亮环：红、绿、蓝的边缘各错开一点，带色散的彩边；没点亮的一段只留一圈暗的
     let w = 0.008;
     let rim = vec3f(exp(-abs(d - 0.007) / w), exp(-abs(d) / w), exp(-abs(d + 0.006) / w));
     let base = mix(params.light.rgb, params.deep.rgb, clamp(d / 0.9, 0.0, 1.0));
-    var hdr = rim * params.core.rgb * 3.2 + halo * base * 1.2 + corona * base * 1.15 + glow * params.deep.rgb * 0.12
-        + ambient * mix(params.deep.rgb, params.light.rgb, 0.35) * (0.06 + 0.16 * streak);
+    var hdr = (rim * params.core.rgb * 3.2 + halo * base * 1.2 + corona * base * 1.15 + glow * params.deep.rgb * 0.12) * lit
+        + rim * vec3f(0.16) * (1.0 - lit)
+        + ambient * mix(params.deep.rgb, params.light.rgb, 0.35) * (0.05 + 0.10 * streak * lit) * min(reach, 1.0);
+    // 弧前端的亮点：到整圈时随缺口一起淡掉
+    if (bead > 0.0) {
+        let a = TAU * (start + progress);
+        let head = center + radius * vec2f(sin(a), -cos(a));
+        let q = length(p - head) / radius;
+        hdr += params.core.rgb * (exp(-q / 0.012) * 6.0 + exp(-q / 0.07) * 0.9) * bead * (1.0 - closed);
+    }
     hdr *= smoothstep(-0.01, 0.0, d) * strength;
 
-    // 面板里以面板底色为主：光从朝圆盘的那条竖边漫进去；inside 为点在面板里的覆盖（边上一个像素过渡）
-    var fade = 1.0;
-    var inside = 0.0;
-    let count = i32(params.panel.x);
-    let corner = params.panel.y * scale;
-    for (var i = 0; i < 4; i++) {
-        if (i >= count) {
-            break;
-        }
-        let rect = params.panels[i];
-        let cover = clamp(0.5 - rounded(p, rect, corner), 0.0, 1.0);
-        if (cover > 0.0) {
-            let left = exp(-max(depth(p, rect, center.x), 0.0) / (SPILL * scale));
-            fade = mix(1.0, left, cover);
-            inside = cover;
-        }
+    // 面板里光从朝圆盘的那条竖边漫进去；边上一个像素过渡
+    if (params.shape.x > 0.5) {
+        let rect = params.panel;
+        let cover = clamp(0.5 - rounded(p, rect, params.shape.y), 0.0, 1.0);
+        let spill = exp(-max(depth(p, rect, center.x), 0.0) / (SPILL * scale));
+        hdr *= mix(1.0, spill, cover);
     }
-    hdr *= fade;
     var color = pow(aces(hdr), vec3f(1.0 / 2.2));
-
-    // 网格：画面上的点先按透镜求回原来的位置，再看离最近的网格线多远；网格线从中心向外流
-    let inner = unlens(r, radius, strength) / max(r, 0.001);
-    let flat = uv * inner / scale;
-    let step = GRID_STEP;
-    let flow = params.disc.w;
-    let along = abs(flat) - flow;
-    let off = abs(fract(along / step + 0.5) - 0.5) * step;
-    let width = fwidth(flat) * 0.75;
-    let line_x = 1.0 - smoothstep(0.0, max(width.x, 0.001), off.x);
-    let line_y = 1.0 - smoothstep(0.0, max(width.y, 0.001), off.y);
-    // 离中心越远越淡；刚流出中心的一格淡入
-    let reach = exp(-abs(flat) / GRID_REACH) * clamp(abs(flat) / step, vec2f(0.0), vec2f(1.0));
-    let grid = max(line_x * reach.x, line_y * reach.y) * 0.11 * fade;
-    color = mix(color, params.light.rgb, grid);
 
     // 胶片颗粒
     color += (hash(vec3f(p, floor(phase * 720.0))) - 0.5) * 0.035;
-    let floor = mix(params.ground.rgb, params.deck.rgb, inside);
-    return vec4f(max(color, floor), 1.0);
+    return vec4f(max(color, params.ground.rgb), 1.0);
 }
