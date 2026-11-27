@@ -44,6 +44,8 @@ impl Shell {
             ),
             Err(reason) => (reason.clone(), true),
         });
+        // TitleBar 把放子元素的整条标成拖动区。Windows 上鼠标下的命中列表里有拖动区时，系统把按下当成拖标题栏，点击
+        // 到不了元素；能点的元素都要 occlude，把拖动区挡在命中列表外
         TitleBar::new()
             .h(px(TITLE_HEIGHT))
             // 透明：窗口的背景铺到顶
@@ -87,6 +89,7 @@ impl Shell {
                     .children(self.updates.read(cx).pending().map(|version| {
                         div()
                             .id("update-pending")
+                            .occlude()
                             .text_size(px(13.))
                             .text_color(theme::accent())
                             .cursor_pointer()
@@ -118,6 +121,7 @@ impl Shell {
         let on = self.settings.is_some();
         div()
             .id("settings")
+            .occlude()
             .size(px(SETTINGS))
             .flex()
             .items_center()
