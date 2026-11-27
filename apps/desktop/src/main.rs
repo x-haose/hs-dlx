@@ -2,6 +2,10 @@
 //! 转交给它后退出（见 hs-dlx-instance）。有任务在跑时关掉主窗口可以让它们在后台继续，应用只在明确退出时退出（见
 //! main_window）。
 
+// Windows 上按图形界面程序链接，不带控制台窗口。起控制台程序（python、taskkill、powershell 等）的子进程要带
+// CREATE_NO_WINDOW，否则每起一个就弹一个控制台窗口。
+#![windows_subsystem = "windows"]
+
 mod backdrop;
 mod clock;
 mod dial;
