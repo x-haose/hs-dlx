@@ -537,11 +537,17 @@ mod platform {
     /// 不弹控制台窗口、不随本进程的控制台结束（CREATE_NO_WINDOW | DETACHED_PROCESS）。
     const DETACHED: u32 = 0x0800_0000 | 0x0000_0008;
 
-    /// 等本进程退出再装（安装程序见到应用还在运行会直接结束它，等于强退），静默（/S）、不重建快捷方式（/NS）；装完（或
-    /// 没装上）再打开应用（不用安装程序的 /R：它在自己退出之前打开，新版本启动时清理删不掉还在运行的安装程序）。退出码
-    /// 不是 0（或拿不到）时把它写进结果文件。路径都经环境变量传入，脚本里没有要转义的文字。
+    /// 等本进程退出再装（安装程序见到应用还在运行会直接结束它，等于强退）；装完（或没装上）再打开应用（不用安装程序的
+    /// /R：它在自己退出之前打开，新版本启动时清理删不掉还在运行的安装程序）。退出码不是 0（或拿不到）时把它写进结果
+    /// 文件。路径都经环境变量传入，脚本里没有要转义的文字。
+    ///
+    /// 运行的是新版本的安装程序，NSIS 与 Inno Setup 打的都可能，两套参数都带，各自跳过不认识的：NSIS 认 /S（静默）、
+    /// /NS（不重建快捷方式）；Inno Setup 认 /VERYSILENT（不显示进度）、/SUPPRESSMSGBOXES（不弹消息框）、/NORESTART（要
+    /// 重启时不重启；不带时完全静默下会不问就重启系统）。NSIS 模板按前缀、不分大小写认 /P、/R、/NS，其余参数都不以
+    /// 它们开头。
     const SCRIPT: &str = "Wait-Process -Id $env:HS_DLX_PID -ErrorAction SilentlyContinue; \
-        try { $code = (Start-Process -FilePath $env:HS_DLX_SETUP -ArgumentList '/S','/NS' -Wait -PassThru).ExitCode } \
+        try { $code = (Start-Process -FilePath $env:HS_DLX_SETUP \
+        -ArgumentList '/S','/NS','/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait -PassThru).ExitCode } \
         catch { $code = $_.Exception.Message }; \
         if (-not ($code -is [int] -and $code -eq 0)) { [IO.File]::WriteAllText($env:HS_DLX_FAILED, \"installer: $code\") }; \
         Start-Process -FilePath $env:HS_DLX_EXE";

@@ -36,6 +36,9 @@ const PIP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// 换下来的组件目录挪到的名字的前缀（见 [`Components::replace_dir`]）。
 const TRASH: &str = "trash-";
+/// 组件目录被别的进程暂时占着、改不了名时最多等多久（见 [`rename_dir`]）：杀毒软件扫完刚写出的文件就放开，虚拟机里
+/// 慢一些；过了这么久还占着当作一直被占，报错。
+const HELD_PATIENCE: Duration = Duration::from_secs(30);
 /// 命令的错误输出最多留多少字节写进错误信息：出错时末尾是原因。
 const STDERR_TAIL: usize = 4096;
 /// PyPI 的 JSON 接口响应最多多少字节：yt-dlp 的全部发布约 1.2 MB（2026-11）。
@@ -547,7 +550,7 @@ impl Components {
 
     /// 把装好的 `staging` 放到 `target`：`target` 在时先把它整个改名挪开（`trash-<名>-<纳秒>`，由
     /// [`Components::sweep`] 删），再放新的，放不上时挪回来。Windows 上目录里有文件被占时改名整体失败，旧的完好；不删
-    /// 一半。
+    /// 一半。被暂时占着时等它放开（见 [`rename_dir`]），这期间不看取消。
     async fn replace_dir(&self, staging: &Path, target: &Path) -> Result<(), Error> {
         let name = target
             .file_name()
@@ -557,13 +560,13 @@ impl Components {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_nanos());
         let trash = self.root.join(format!("{TRASH}{name}-{nanos}"));
-        let moved = match tokio::fs::rename(target, &trash).await {
+        let moved = match rename_dir(target, &trash).await {
             Ok(()) => true,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => return Err(Error::disk(target, &error)),
+            Err(error) => return Err(self.rename_error(target, &error)),
         };
-        if let Err(error) = tokio::fs::rename(staging, target).await {
-            if moved && let Err(back) = tokio::fs::rename(&trash, target).await {
+        if let Err(error) = rename_dir(staging, target).await {
+            if moved && let Err(back) = rename_dir(&trash, target).await {
                 // 旧的留在 trash 里：之后照没装处理
                 return Err(Error::Disk(format!(
                     "{}：{error}；旧的挪不回来（在 {}）：{back}",
@@ -571,9 +574,22 @@ impl Components {
                     trash.display()
                 )));
             }
-            return Err(Error::disk(target, &error));
+            return Err(self.rename_error(target, &error));
         }
         Ok(())
+    }
+
+    /// 改名 `target` 失败的错误；等过之后仍像是被占着时写明怎么办。
+    fn rename_error(&self, target: &Path, error: &std::io::Error) -> Error {
+        if !held(error) {
+            return Error::disk(target, error);
+        }
+        Error::Disk(format!(
+            "{}：{error}；等了 {} 秒仍改不了名，多为组件目录里的文件被杀毒软件等程序占着：把组件目录 {} 加进它的例外后重装",
+            target.display(),
+            HELD_PATIENCE.as_secs(),
+            self.root.display()
+        ))
     }
 
     /// 记下当前（`yt_dlp`）、上一个与跳过的 yt-dlp 版本：先写临时文件、落盘再改名。
@@ -986,6 +1002,28 @@ async fn checked(path: &Path, sha256: &str) -> Result<Result<(), String>, Error>
     .expect("算哈希不会 panic，运行时关闭时本任务也一起丢弃")
 }
 
+/// 把目录 `from` 改名为 `to`。Windows 上目录里只要有文件被别的进程开着，整个目录就改不了名；刚写出的文件常被杀毒
+/// 软件开着扫一阵：这时隔一会儿再试（50 毫秒起翻倍，至多隔 1 秒），至多等 [`HELD_PATIENCE`]，之后报最后一次的错误。
+async fn rename_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    let deadline = tokio::time::Instant::now() + HELD_PATIENCE;
+    let mut pause = Duration::from_millis(50);
+    loop {
+        match tokio::fs::rename(from, to).await {
+            Err(error) if held(&error) && tokio::time::Instant::now() + pause < deadline => {
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(Duration::from_secs(1));
+            }
+            renamed => return renamed,
+        }
+    }
+}
+
+/// 改名失败是因为被别的进程占着：Windows 的 ERROR_ACCESS_DENIED（目录里有文件开着）与 ERROR_SHARING_VIOLATION。别的
+/// 平台没有这种占用。
+fn held(error: &std::io::Error) -> bool {
+    cfg!(windows) && matches!(error.raw_os_error(), Some(5 | 32))
+}
+
 /// 删掉目录 `path`（不在时什么也不做）。
 async fn remove_dir(path: &Path) -> Result<(), Error> {
     match tokio::fs::remove_dir_all(path).await {
@@ -1370,5 +1408,26 @@ mod tests {
             latest_of(b"{}", Channel::Stable),
             Err(Error::Index(_))
         ));
+    }
+
+    /// Windows 上目录里有文件开着时整个目录改不了名，错误认作被占着；文件关上后，等着的改名接着成功。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn renaming_a_held_dir_waits_until_released() {
+        let root = std::env::temp_dir().join(format!("hs-dlx-ytdlp-held-{}", std::process::id()));
+        let _fresh = std::fs::remove_dir_all(&root);
+        let (from, to) = (root.join("staging"), root.join("target"));
+        std::fs::create_dir_all(&from).expect("建得了临时目录");
+        let open = std::fs::File::create(from.join("module.pyd")).expect("写得了临时文件");
+        let blocked = std::fs::rename(&from, &to).expect_err("目录里有文件开着时改不了名");
+        assert!(held(&blocked), "{blocked}");
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(open);
+        });
+        rename_dir(&from, &to).await.expect("文件关上后改得了名");
+        release.await.expect("关文件的任务不会 panic");
+        assert!(to.join("module.pyd").is_file());
+        std::fs::remove_dir_all(&root).expect("删得了临时目录");
     }
 }
