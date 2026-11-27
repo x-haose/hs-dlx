@@ -322,6 +322,14 @@ impl Ending {
         }
     }
 
+    /// 接在还没写进存储的 `earlier` 之后停下的：两次的运行时长相加，这一次没给的总片数、续传数据沿用那一次的。
+    fn after(mut self, earlier: &Ending) -> Ending {
+        self.ran += earlier.ran;
+        self.total = self.total.or(earlier.total);
+        self.resume = self.resume.or_else(|| earlier.resume.clone());
+        self
+    }
+
     /// 把还没写进存储的结束状态叠到从存储读出的 `task` 上。
     fn overlay(&self, task: &mut Task) {
         task.status = self.status.clone();
@@ -539,14 +547,14 @@ impl Service {
             let _entered = service.runtime().enter();
             for id in seeding {
                 if let Err(error) = service.shared.start_seeding(id) {
+                    let cleared = service.shared.change(|tx| {
+                        store::set_seeding_task(tx, id, false)?;
+                        store::get(tx, id)?.ok_or(Error::NotFound(id))
+                    });
                     service.shared.events.send(Event::SeedingEnded {
                         id,
                         end: SeedEnd::Failed(error.to_string()),
-                        unsaved: service
-                            .shared
-                            .write(|tx| store::set_seeding_task(tx, id, false))
-                            .err()
-                            .map(|error| error.to_string()),
+                        unsaved: cleared.err().map(|error| error.to_string()),
                     });
                 }
             }
@@ -1248,7 +1256,7 @@ impl Handle {
 
     /// 从存储里删掉任务，输出不动：用于已完成的（任务目录已在完成时删掉，输出归用户；BT 另删保存目录里它的 `.parts`
     /// 文件，删不掉时发 [`Event::Orphaned`]）与没有自己的任务目录的 HLS、文件任务。别的报 [`Error::NotFinished`]：它们
-    /// 的任务目录（BT 为下了的文件）要用 [`Handle::discard`] 一起删，还没定下的任务也只经它删。在做种的先停止做种（同 [`Handle::stop_seeding`]，
+    /// 的任务目录（BT 为下了的文件）要用 [`Handle::discard`] 一起删，还没定下的任务也只经它删；在运行的报 [`Error::Running`]。在做种的先停止做种（同 [`Handle::stop_seeding`]，
     /// 记不进存储时报那个错，做种照旧），停下后再删；等的期间又开始做种时报 [`Error::Seeding`]。返回的句柄在任何执行器
     /// 上都可等待。
     pub fn forget(&self, id: TaskId) -> JoinHandle<Result<(), Error>> {
@@ -1260,9 +1268,7 @@ impl Handle {
                 // 发送端随做种的任务结束而释放：那时已停下
                 let _ended = ended.wait_for(|ended| *ended).await;
             }
-            shared.forget(id)?;
-            shared.events.send(Event::Removed { id });
-            Ok(())
+            shared.forget(id)
         })
     }
 
@@ -1343,15 +1349,13 @@ impl Handle {
                         after: DISCARD_TIMEOUT,
                     })
                 });
-            match &result {
-                Ok(_) => shared.events.send(Event::Removed { id }),
+            if result.is_err() {
                 // 没放弃成而记录还在：状态多半已改为放弃没做完。读不出时报的仍是放弃的错误
-                Err(_) => {
-                    if let Ok(task) = shared.task(id) {
-                        shared.events.send(Event::Changed {
-                            task: Box::new(task),
-                        });
-                    }
+                let mut store = lock(&shared.store);
+                if let Ok(task) = shared.task_in(&mut store, id) {
+                    shared.events.send(Event::Changed {
+                        task: Box::new(task),
+                    });
                 }
             }
             drop(guard);
@@ -1439,15 +1443,22 @@ async fn run_discard(
         let _stopped = stopped.wait_for(|done| *done).await;
     }
     // 还没定下的任务磁盘上没有东西（取种子信息加进会话的种子已随那一轮准备停下而移除）
-    let pending = shared.write(|tx| {
-        let task = store::get(tx, id)?.ok_or(Error::NotFound(id))?;
-        if task.spec.pending().is_none() {
-            return Ok(false);
+    let pending = {
+        let mut store = lock(&shared.store);
+        let pending = shared.write_in(&mut store, |tx| {
+            let task = store::get(tx, id)?.ok_or(Error::NotFound(id))?;
+            if task.spec.pending().is_none() {
+                return Ok(false);
+            }
+            store::delete(tx, id)?;
+            Ok(true)
+        })?;
+        if pending {
+            lock(&shared.offers).remove(&id);
+            shared.events.send(Event::Removed { id });
         }
-        store::delete(tx, id)?;
-        lock(&shared.offers).remove(&id);
-        Ok(true)
-    })?;
+        pending
+    };
     if pending {
         return Ok(Vec::new());
     }
@@ -1457,7 +1468,7 @@ async fn run_discard(
     if task.spec.web().is_some() {
         shared.discard_web(id, task.work_dir.as_deref()).await?;
         return shared
-            .write(|tx| store::delete(tx, id))
+            .remove(id)
             .map(|()| Vec::new())
             .map_err(|cause| Error::RecordNotDeleted {
                 id,
@@ -1470,7 +1481,7 @@ async fn run_discard(
             .discard_cloud(id, spec, task.work_dir.as_deref())
             .await?;
         return shared
-            .write(|tx| store::delete(tx, id))
+            .remove(id)
             .map(|()| Vec::new())
             .map_err(|cause| Error::RecordNotDeleted {
                 id,
@@ -1492,7 +1503,7 @@ async fn run_discard(
                 cause: Box::new(cause),
             })?;
         return shared
-            .write(|tx| store::delete(tx, id))
+            .remove(id)
             .map(|()| Vec::new())
             .map_err(|cause| Error::RecordNotDeleted {
                 id,
@@ -1517,7 +1528,7 @@ async fn run_discard(
         return Err(Error::WorkDirLeft { id, leftovers });
     }
     // 核心报出的残留已没有记录，只在这里报一次，删不掉记录时也要带着
-    if let Err(cause) = shared.write(|tx| store::delete(tx, id)) {
+    if let Err(cause) = shared.remove(id) {
         return Err(Error::RecordNotDeleted {
             id,
             leftovers,
@@ -1606,16 +1617,25 @@ impl Shared {
         Ok(value)
     }
 
-    /// 同 [`Shared::write`]，`f` 给出改了之后的任务：提交后发 [`Event::Changed`]，返回它。
+    /// 同 [`Shared::write`]，`f` 给出改了之后的任务：提交后在 `store` 锁内发 [`Event::Changed`]，返回它。
     fn change(
         &self,
         f: impl FnOnce(&Transaction<'_>) -> Result<Task, Error>,
     ) -> Result<Task, Error> {
-        let task = self.write(f)?;
+        let mut store = lock(&self.store);
+        let task = self.write_in(&mut store, f)?;
         self.events.send(Event::Changed {
             task: Box::new(task.clone()),
         });
         Ok(task)
+    }
+
+    /// 删掉任务 `id` 的记录，在 `store` 锁内发 [`Event::Removed`]。
+    fn remove(&self, id: TaskId) -> Result<(), Error> {
+        let mut store = lock(&self.store);
+        self.write_in(&mut store, |tx| store::delete(tx, id))?;
+        self.events.send(Event::Removed { id });
+        Ok(())
     }
 
     /// 存储里的任务 `id`，停下了而状态还没补写进存储的按停下时的状态；没有时报 [`Error::NotFound`]。
@@ -1956,7 +1976,7 @@ impl Shared {
             let keep = shared.closed.load(Ordering::Relaxed)
                 && !by_user.load(Ordering::Relaxed)
                 && !matches!(seeded.end, SeedEnd::Reached | SeedEnd::Incomplete);
-            let saved = shared.write(|tx| {
+            let saved = shared.change(|tx| {
                 if let Some(resume) = &seeded.resume {
                     store::set_torrent_resume(tx, id, resume)?;
                 }
@@ -1965,15 +1985,7 @@ impl Shared {
             });
             lock(&shared.seeders).remove(&id);
             ended_tx.send_replace(true);
-            let unsaved = match saved {
-                Ok(task) => {
-                    shared.events.send(Event::Changed {
-                        task: Box::new(task),
-                    });
-                    None
-                }
-                Err(error) => Some(error.to_string()),
-            };
+            let unsaved = saved.err().map(|error| error.to_string());
             shared.events.send(Event::SeedingEnded {
                 id,
                 end: seeded.end,
@@ -2004,9 +2016,14 @@ impl Shared {
         Ok(Some(ended))
     }
 
-    /// 见 [`Handle::forget`]：不在做种的任务。在做种的报 [`Error::Seeding`]。
+    /// 见 [`Handle::forget`]：不在做种的任务。在做种的报 [`Error::Seeding`]，在运行的（含刚停下、还在收尾的）报
+    /// [`Error::Running`]。删了记录在 `store` 锁内发 [`Event::Removed`]。
     fn forget(&self, id: TaskId) -> Result<(), Error> {
-        let part = self.write(|tx| {
+        let mut store = lock(&self.store);
+        let part = self.write_in(&mut store, |tx| {
+            if lock(&self.running).contains_key(&id) {
+                return Err(Error::Running(id));
+            }
             if lock(&self.discarding).contains(&id) {
                 return Err(Error::Discarding(id));
             }
@@ -2029,6 +2046,8 @@ impl Shared {
             store::delete(tx, id)?;
             Ok(part)
         })?;
+        self.events.send(Event::Removed { id });
+        drop(store);
         if let Some((folder, resume)) = part {
             self.forget_part_file(folder, resume);
         }
@@ -2564,8 +2583,9 @@ impl Shared {
         }
     }
 
-    /// 任务 `id` 停下了：把 `ending`（连同这次运行了多久）写进存储（写不进时记为待补写），去掉运行登记 `guard`，发出
-    /// [`Event::Changed`] 与 [`Event::Ended`]。
+    /// 任务 `id` 停下了：在 `store` 锁内把 `ending`（连同这次运行了多久）写进存储（写不进时记为待补写）、发出
+    /// [`Event::Changed`] 与 [`Event::Ended`]，再去掉运行登记 `guard`：等它停下的操作（放弃、之后的继续）的事件都在
+    /// 这之后。
     fn conclude(
         &self,
         id: TaskId,
@@ -2574,16 +2594,14 @@ impl Shared {
         guard: RunningGuard,
     ) {
         guard.stamp(&mut ending);
-        let saved = self.save(id, &ending);
-        self.announce(id, ending, leftovers, guard, saved);
+        let mut store = lock(&self.store);
+        let saved = self.save_in(&mut store, id, &ending);
+        self.announce_in(&mut store, id, ending, None, leftovers, saved);
+        drop(guard);
     }
 
-    /// 把任务 `id` 的结束状态 `ending` 写进存储，返回写了之后的任务；写不进时记为待补写，报出原因。
-    fn save(&self, id: TaskId, ending: &Ending) -> Result<Task, Error> {
-        self.save_in(&mut lock(&self.store), id, ending)
-    }
-
-    /// 同 [`Shared::save`]，调用方已持着 `store` 锁。
+    /// 把任务 `id` 的结束状态 `ending` 写进存储，返回写了之后的任务；写不进时记为待补写（并上之前没写进的），报出
+    /// 原因。调用方持着 `store` 锁。
     fn save_in(&self, store: &mut Store, id: TaskId, ending: &Ending) -> Result<Task, Error> {
         let saved = self.write_in(store, |tx| {
             save_ending(tx, id, ending)?;
@@ -2595,30 +2613,43 @@ impl Shared {
                 !error.violates_constraint(),
                 "{id}的结束状态与存储的表结构不一致：{error}"
             );
-            lock(&self.unsaved).insert(id, ending.clone());
+            // 之前的待补写这次也没写进：并进这一次，不丢它的运行时长
+            let mut unsaved = lock(&self.unsaved);
+            let pending = match unsaved.get(&id) {
+                Some(earlier) => ending.clone().after(earlier),
+                None => ending.clone(),
+            };
+            unsaved.insert(id, pending);
         }
         saved
     }
 
-    /// [`Shared::conclude`] 写进存储之后的一半：去掉运行登记 `guard`，发出 [`Event::Changed`] 与 [`Event::Ended`]
-    /// （`saved` 为写进存储的结果）。
-    fn announce(
+    /// 任务 `id` 的结束状态 `ending` 写进存储之后（`saved` 为结果）：发出 [`Event::Changed`]、[`Event::Stage`]（停下
+    /// 等用户、`offer` 为可选项时）与 [`Event::Ended`]。调用方持着 `store` 锁、还没释放运行登记：别的操作的事件排不到
+    /// 这几个之间或之前。
+    fn announce_in(
         &self,
+        store: &mut Store,
         id: TaskId,
         ending: Ending,
+        offer: Option<Offer>,
         leftovers: Vec<Leftover>,
-        guard: RunningGuard,
         saved: Result<Task, Error>,
     ) {
-        drop(guard);
         let (task, unsaved) = match saved {
             Ok(task) => (Some(task), None),
             // 没写进的已记为待补写，照它读；这时读也读不出的不发 Changed，原因随 Ended 报出
-            Err(error) => (self.task(id).ok(), Some(error.to_string())),
+            Err(error) => (self.task_in(store, id).ok(), Some(error.to_string())),
         };
         if let Some(task) = task {
             self.events.send(Event::Changed {
                 task: Box::new(task),
+            });
+        }
+        if let Some(offer) = offer {
+            self.events.send(Event::Stage {
+                id,
+                stage: Box::new(Stage::Asking(offer)),
             });
         }
         self.events.send(Event::Ended {
@@ -2804,7 +2835,8 @@ impl Shared {
                 ..Ending::of(status)
             };
             guard.stamp(&mut ending);
-            let saved = shared.save(id, &ending);
+            let saved = shared.save_in(&mut lock(&shared.store), id, &ending);
+            // 登记还在：删目录的这一段里任务不能继续、放弃要等、移除不收
             if saved.is_ok()
                 && ending.status == Status::Done
                 && let Some(work_dir) = work_dir
@@ -2816,7 +2848,9 @@ impl Shared {
                     reason: error.to_string(),
                 });
             }
-            shared.announce(id, ending, leftovers, guard, saved);
+            let mut store = lock(&shared.store);
+            shared.announce_in(&mut store, id, ending, None, leftovers, saved);
+            drop(guard);
         });
     }
 }

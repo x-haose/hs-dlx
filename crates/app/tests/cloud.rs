@@ -637,9 +637,20 @@ fn offloading_needs_a_login_and_an_unsettled_magnet() {
     );
 
     log_in(&rt, &service);
+    let mut events = service.subscribe();
     let cloud = service.offload(id, CloudProvider::PikPak).unwrap();
     assert_eq!(cloud.status, Status::Preparing);
-    // 交出去之后种子不再占着：同一条磁力链接可以另建任务由本机下
+    rt.block_on(async {
+        loop {
+            if let Event::Changed { task } = events.recv().await.unwrap()
+                && task.id == id
+                && task.spec.cloud().is_some()
+            {
+                break;
+            }
+        }
+    });
+    // 定下为云离线任务之后种子不再占着：同一条磁力链接可以另建任务由本机下
     let mut local = rt
         .block_on(service.paste(MAGNET, &dir.join("out"), 3))
         .unwrap();

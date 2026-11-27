@@ -508,18 +508,13 @@ impl Shared {
             .await
             .map_err(Stop::store)?;
             let work_dir = naming::file_work_dir(&root);
-            let rooted = self.write(|tx| {
+            // 标题换成了根名
+            let rooted = self.change(|tx| {
                 store::set_cloud_root(tx, id, &root, &work_dir, &files)?;
                 store::get(tx, id)?.ok_or(Error::NotFound(id))
             });
             match rooted {
-                Ok(task) => {
-                    // 标题换成了根名
-                    self.events.send(Event::Changed {
-                        task: Box::new(task),
-                    });
-                    return Ok((root, work_dir, files));
-                }
+                Ok(_) => return Ok((root, work_dir, files)),
                 Err(Error::PathTaken(path))
                     if !seen.contains(&naming::path_key(&path.to_string_lossy())) => {}
                 Err(error) => return Err(Stop::store(error)),

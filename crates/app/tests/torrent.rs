@@ -1045,33 +1045,36 @@ impl Socks {
 }
 
 /// 取 `uri` 的种子信息，等到报出含 `wanted` 的 BT 代理的问题（最多 20 秒；之前报的别的问题，如 libtorrent 自己连代理
-/// 出的错，跳过）；取到种子信息或超时还没报时为最后报的问题（没报过为 None）。
+/// 出的错，跳过）。代理的问题由后台的探测记下，取到种子信息比它还早时这一次一回也没报：再取一次。超时还没报时为
+/// 最后报的问题（没报过为 None）。
 fn proxy_problem(
     rt: &Runtime,
     service: &Service,
     uri: &str,
     wanted: &str,
 ) -> Result<String, Option<String>> {
-    let fetch = service.fetch_metadata(uri.to_owned()).unwrap();
-    let mut progress = fetch.progress;
-    let _resume = fetch.resume;
     let mut last = None;
     rt.block_on(async {
         let found = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
-                if let Some(problem) = progress.borrow_and_update().proxy_problem.clone() {
-                    if problem.contains(wanted) {
-                        return Some(problem);
+                let fetch = service.fetch_metadata(uri.to_owned()).unwrap();
+                let mut progress = fetch.progress;
+                let _resume = fetch.resume;
+                loop {
+                    if let Some(problem) = progress.borrow_and_update().proxy_problem.clone() {
+                        if problem.contains(wanted) {
+                            return problem;
+                        }
+                        last = Some(problem);
                     }
-                    last = Some(problem);
-                }
-                if progress.changed().await.is_err() {
-                    return None;
+                    if progress.changed().await.is_err() {
+                        break;
+                    }
                 }
             }
         })
         .await;
-        found.ok().flatten().ok_or(last)
+        found.map_err(|_| last)
     })
 }
 

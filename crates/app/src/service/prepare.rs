@@ -106,7 +106,7 @@ pub enum Answer {
     Files { wanted: Vec<i32>, folder: PathBuf },
     /// 单个文件（认出文件的 [`Offer::Confirm`]）：保存目录
     File { folder: PathBuf },
-    /// 安装组件并接着解析（[`Offer::Components`]）
+    /// 安装组件并接着解析（[`Offer::Components`]）。组件是各任务共用的：之后暂停或放弃这个任务不停掉安装
     Install,
     /// 换掉任务的请求头并从头准备；对哪种可选项都可以，来源是磁力链接或种子文件的任务没有请求头
     Headers(Vec<(String, String)>),
@@ -351,6 +351,11 @@ impl Shared {
             check_option_header(name, value).map_err(Error::InvalidInput)?;
         }
         absolute(&folder)?;
+        if !matches!(url.scheme(), "http" | "https") && !intake::torrent_source(&url) {
+            return Err(Error::InvalidInput(format!(
+                "要 http 或 https 的地址、磁力链接或种子文件的地址：{url}"
+            )));
+        }
         // 规整成与核心算任务目录时相同的写法（去掉 `.` 与重复的分隔符）
         let folder = std::path::absolute(&folder).map_err(|cause| Error::Io {
             action: "规整",
@@ -580,11 +585,11 @@ impl Shared {
                         continue;
                     }
                     lock(&shared.offers).insert(id, offer.clone());
+                    shared.events.send(Event::Stage {
+                        id,
+                        stage: Box::new(Stage::Asking(offer)),
+                    });
                 }
-                shared.events.send(Event::Stage {
-                    id,
-                    stage: Box::new(Stage::Asking(offer)),
-                });
             }
         });
     }
@@ -617,7 +622,8 @@ impl Shared {
 
     /// 一轮准备没定下就结束了：停下等用户（`ended` 为可选项）、失败或被取消。在 `store` 锁内核对这一轮没被顶掉（顶掉
     /// 了的什么也不做），把状态写进存储（写不进时记为待补写）、记下可选项、去掉登记，再发 [`Event::Changed`]、
-    /// [`Event::Stage`]（有可选项时）与 [`Event::Ended`]。结论出来之后才到的取消（暂停）照暂停算。
+    /// [`Event::Stage`]（有可选项时）与 [`Event::Ended`]，都在锁内、释放登记之前。结论出来之后才到的取消（暂停）照
+    /// 暂停算。
     fn finish_flow(&self, flow: Flow, ended: Result<Offer, Stop>) {
         let Flow { id, cancel, guard } = flow;
         let mut store = lock(&self.store);
@@ -630,36 +636,13 @@ impl Shared {
             Err(Stop::Cancelled) => (Status::Paused, None),
             Err(Stop::Failed(failure)) => (Status::Failed(failure), None),
         };
-        let saved = self.save_in(&mut store, id, &Ending::of(status.clone()));
+        let ending = Ending::of(status);
+        let saved = self.save_in(&mut store, id, &ending);
         if let Some(offer) = &offer {
             lock(&self.offers).insert(id, offer.clone());
         }
+        self.announce_in(&mut store, id, ending, offer, Vec::new(), saved);
         drop(guard);
-        let (task, unsaved) = match saved {
-            Ok(task) => (Some(task), None),
-            // 没写进的已记为待补写，照它读；这时读也读不出的不发 Changed，原因随 Ended 报出
-            Err(error) => (self.task_in(&mut store, id).ok(), Some(error.to_string())),
-        };
-        drop(store);
-        if let Some(task) = task {
-            self.events.send(Event::Changed {
-                task: Box::new(task),
-            });
-        }
-        if let Some(offer) = offer {
-            self.events.send(Event::Stage {
-                id,
-                stage: Box::new(Stage::Asking(offer)),
-            });
-        }
-        self.events.send(Event::Ended {
-            id,
-            status,
-            result: None,
-            total: None,
-            leftovers: Vec::new(),
-            unsaved,
-        });
     }
 
     /// 任务 `id` 在运行表里的登记还是 `guard` 的那一次（没被另一轮或下载顶掉）。
@@ -669,8 +652,10 @@ impl Shared {
             .is_some_and(|running| running.serial == guard.serial)
     }
 
-    /// 这一轮走到了 `step`：记下并发 [`Event::Stage`]；已被顶掉的不记。
+    /// 这一轮走到了 `step`：记下并发 [`Event::Stage`]；已被顶掉的不记。在 `store` 锁内做：与顶掉它的那一轮发的
+    /// 事件先后分明。
     fn step(&self, flow: &Flow, step: Step) {
+        let _store = lock(&self.store);
         {
             let mut running = lock(&self.running);
             match running.get_mut(&flow.id) {
