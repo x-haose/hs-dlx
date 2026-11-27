@@ -46,7 +46,7 @@ fn corona(row: &Row, look: &Look, now: Instant) -> Mode {
             progress,
             speed: row.rate.bytes_per_second(now),
         },
-        Status::Paused => Mode::Paused { progress },
+        Status::Paused | Status::Preparing | Status::Waiting(_) => Mode::Paused { progress },
         Status::Failed(_) | Status::DiscardUnfinished => Mode::Failed {
             progress: (progress > 0.).then_some(progress),
         },
@@ -450,7 +450,12 @@ impl Shell {
             ))
         };
         match &row.task.status {
-            Status::DiscardUnfinished => Foot {
+            // 还没定下的任务在这一页只能放弃
+            Status::DiscardUnfinished | Status::Preparing | Status::Waiting(_) => Foot {
+                primary: None,
+                rest: vec![discard(cx).flex_1()],
+            },
+            Status::Paused | Status::Failed(_) if row.task.spec.pending().is_some() => Foot {
                 primary: None,
                 rest: vec![discard(cx).flex_1()],
             },

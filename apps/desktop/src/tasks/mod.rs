@@ -231,9 +231,14 @@ impl Tasks {
     }
 
     fn apply(&mut self, event: Event, cx: &mut Context<Self>) {
-        if let Event::Ended { id, .. } | Event::Renamed { id } = &event
+        let stopped = match &event {
+            Event::Ended { id, .. } => Some(*id),
+            Event::Changed { task } => Some(task.id),
+            _ => None,
+        };
+        if let Some(id) = stopped
             && self.creating > 0
-            && self.row(*id).is_none()
+            && self.row(id).is_none()
         {
             self.early.push(event);
             return;
@@ -307,23 +312,20 @@ impl Tasks {
                     row.web_progress = Some(*progress);
                 }
             }
-            Event::Renamed { id } => match self.service.task(id) {
-                Ok(task) => {
-                    if let Some(row) = self.row_mut(id) {
-                        let was = row::file_name(&row.task.spec);
-                        row.task.work_dir = task.work_dir;
-                        row.set_spec(task.spec);
-                        let name = row::file_name(&row.task.spec);
-                        if name != was {
-                            row.signal(Level::Info, format!("保存为 {name}"));
-                        }
+            // 只取标题、输出与任务目录（云离线任务列出文件、定下内容的根时变）：状态由结束与做种的事件改
+            Event::Changed { task } => {
+                if let Some(row) = self.row_mut(task.id) {
+                    let was = row::file_name(&row.task.spec);
+                    row.task.work_dir = task.work_dir;
+                    row.set_spec(task.spec);
+                    let name = row::file_name(&row.task.spec);
+                    if name != was {
+                        row.signal(Level::Info, format!("保存为 {name}"));
                     }
                 }
-                Err(error) => {
-                    let title = self.title(id);
-                    self.add_notice(format!("「{title}」的保存位置定了，但读不出来：{error}"));
-                }
-            },
+            }
+            // 列表里的行由界面发起的新建、放弃与移除增删
+            Event::Added { .. } | Event::Stage { .. } | Event::Removed { .. } => {}
             Event::SeedingStarted { id } => {
                 if let Some(row) = self.row_mut(id) {
                     row.task.seeding = true;
@@ -644,8 +646,11 @@ fn ended_signal(
         }
         Status::Paused => (Level::Info, "已暂停，任务目录保留".to_owned()),
         Status::Failed(failure) => (Level::Error, failure.message.clone()),
-        Status::Running | Status::DiscardUnfinished => {
-            unreachable!("任务服务只在任务停下后发结束事件，停下的状态不会是运行中或放弃没做完")
+        Status::Waiting(_) => (Level::Info, "停下等你处理".to_owned()),
+        Status::Preparing | Status::Running | Status::DiscardUnfinished => {
+            unreachable!(
+                "任务服务只在任务停下后发结束事件，停下的状态不会是准备中、运行中或放弃没做完"
+            )
         }
     }
 }

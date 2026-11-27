@@ -586,8 +586,7 @@ impl Shared {
                 return;
             }
             written.1 = Some(now);
-            // 接收端随界面关闭而丢弃时没有谁要
-            let _closed = events.send(Event::WebProgress {
+            events.send(Event::WebProgress {
                 id,
                 progress: Box::new(WebProgress::Merging {
                     written: written.0,
@@ -651,8 +650,7 @@ impl Shared {
     }
 
     fn web_progress(&self, id: TaskId, progress: WebProgress) {
-        // 接收端随界面关闭而丢弃时没有谁要
-        let _closed = self.events.send(Event::WebProgress {
+        self.events.send(Event::WebProgress {
             id,
             progress: Box::new(progress),
         });
@@ -738,15 +736,14 @@ pub(super) async fn remove_work_dir(work_dir: &Path) -> Result<(), crate::Error>
 /// 发进度：一路的字节加上之前各路的。
 #[derive(Clone)]
 struct Reporter {
-    events: tokio::sync::mpsc::UnboundedSender<Event>,
+    events: super::Outbox,
     id: TaskId,
     at: Position,
 }
 
 impl Reporter {
     fn send(&self, bytes: u64, received: u64) {
-        // 接收端随界面关闭而丢弃时没有谁要
-        let _closed = self.events.send(Event::WebProgress {
+        self.events.send(Event::WebProgress {
             id: self.id,
             progress: Box::new(WebProgress::Fetching {
                 part: self.at.part,

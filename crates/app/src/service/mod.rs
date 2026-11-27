@@ -7,31 +7,34 @@
 use std::collections::{HashMap, HashSet};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hs_m3u8_core::hls::Preference;
 use hs_m3u8_core::remux::Shape;
 use hs_m3u8_core::{
     CancellationToken, Engine, FileOutput, FileOutputOptions, FileProgress, FileRequest, Job,
     JobControl, JobRequest, Leftover, LeftoverKind, Output, OutputOptions, Probe, Progress, Proxy,
-    Resource, Saved, Source, Stage, Unsettled, Url, check_option_header,
+    Resource, Saved, Source, Stage as JobStage, Unsettled, Url, check_option_header,
 };
 use rusqlite::Transaction;
-use tokio::runtime::{Handle, Runtime};
+use tokio::runtime::Runtime;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
 mod cloud;
+mod prepare;
 mod web;
 mod web_task;
 
 pub use cloud::{CloudPhase, CloudProgress};
+pub use prepare::{Answer, Offer, Recognized, Stage, Step};
 pub use web::{Resolved, WebConfig, WebState};
 pub use web_task::WebProgress;
 
+use crate::intake::{self, Intake, Rejected};
 use crate::preference::StoredPreference;
 use crate::public_trackers::{self, PublicTrackers};
 use crate::store::{self, Store};
@@ -62,7 +65,7 @@ const PROXY_RECHECK_USABLE: Duration = Duration::from_secs(10 * 60);
 /// 放弃（等任务停下、删任务目录）最多等多久；删大目录也在这之内做完。
 const DISCARD_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 正在下载的更新（[`Service::download_update`]）。
+/// 正在下载的更新（[`Handle::download_update`]）。
 pub struct UpdateDownload {
     /// 已下的字节数
     pub received: watch::Receiver<u64>,
@@ -78,9 +81,19 @@ pub struct Downloaded {
     dir: PathBuf,
 }
 
-/// 交给界面的事件。
-#[derive(Debug)]
+/// 服务发给各订阅方（[`Handle::subscribe`]）的事件。同一任务的事件按发生的先后到。
+#[derive(Debug, Clone)]
 pub enum Event {
+    /// 建了任务（不论由谁建的）；同一任务的其他事件都在它之后。之后存储写不进而没建成时随即发 [`Event::Removed`]
+    Added { task: Box<Task> },
+    /// 任务在存储里的内容变了（状态、标题、种类与输出、请求头、是否做种、完成的时刻与运行时长）：`task` 为变了之后的。
+    /// 任务停下时先发它，再发带着附带信息的 [`Event::Ended`]
+    Changed { task: Box<Task> },
+    /// 还没定下的任务准备到了哪一步，或停下等用户时的可选项（同 [`Handle::stage`]）。任务不再准备（定下、暂停、
+    /// 失败、放弃）时不另发，见那时的 [`Event::Changed`] 或 [`Event::Removed`]
+    Stage { id: TaskId, stage: Box<Stage> },
+    /// 任务的记录删了（放弃做完、从列表移除，或刚建的任务没能记进存储）
+    Removed { id: TaskId },
     /// 运行中的 HLS 任务的进度快照；同一任务两次之间至少隔 100 毫秒，进度没变时不发
     Progress { id: TaskId, progress: Box<Progress> },
     /// 运行中的文件任务的进度快照，节流同上
@@ -103,9 +116,7 @@ pub enum Event {
         id: TaskId,
         progress: Box<WebProgress>,
     },
-    /// 任务的标题或输出变了（云离线任务列出文件、定下内容的根），要重读任务（[`Service::task`]）
-    Renamed { id: TaskId },
-    /// 已完成的 BT 任务开始做种（下完接着做、[`Service::seed`]，或打开应用时接着上次的）
+    /// 已完成的 BT 任务开始做种（下完接着做、[`Handle::seed`]，或打开应用时接着上次的）
     SeedingStarted { id: TaskId },
     /// 做种时定时存进度没存成（`reason` 为原因）：照常做种，下一次再存；这期间的上传与做种时长要等存成了才记下
     SeedingNotSaved { id: TaskId, reason: String },
@@ -114,11 +125,11 @@ pub enum Event {
     SeedingEnded {
         id: TaskId,
         end: SeedEnd,
-        unsaved: Option<Error>,
+        unsaved: Option<String>,
     },
-    /// 任务停下。`result` 在状态为 [`Status::Done`] 时为写出的结果，`total` 同 [`Task::total`]，`leftovers` 为完成时
+    /// 任务停下；还没定下的任务的一轮准备停下（暂停、失败、停下等用户）时也发。`result` 在状态为 [`Status::Done`] 时为写出的结果，`total` 同 [`Task::total`]，`leftovers` 为完成时
     /// 没删掉的东西（被替换的旧输出、没删干净的任务目录等，输出不受影响）。`unsaved` 为 Some 时状态没能写进存储：服务
-    /// 记着它，下一次写存储（任何操作或 [`Service::flush`]）时补写，[`Service::tasks`] 也按它返回；补写之前服务关闭
+    /// 记着它，下一次写存储（任何操作或 [`Handle::flush`]）时补写，[`Handle::tasks`] 也按它返回；补写之前服务关闭
     /// 而补写不进的，下次打开时按暂停处理
     Ended {
         id: TaskId,
@@ -126,10 +137,10 @@ pub enum Event {
         result: Option<Finished>,
         total: Option<usize>,
         leftovers: Vec<Leftover>,
-        unsaved: Option<Error>,
+        unsaved: Option<String>,
     },
-    /// 运行中记点播的总片数时存储写不进；任务照常运行，停下时随结束状态再写一次
-    TotalUnsaved { id: TaskId, error: Error },
+    /// 运行中记点播的总片数时存储写不进（`error` 为原因）；任务照常运行，停下时随结束状态再写一次
+    TotalUnsaved { id: TaskId, error: String },
     /// 新建任务时存储写不进，已开始的任务取消了，但磁盘上留下了东西：没删干净的任务目录，或取消前已写出的输出。它们
     /// 不在任何任务名下，要用户处理
     Orphaned { paths: Vec<PathBuf>, reason: String },
@@ -138,7 +149,23 @@ pub enum Event {
 /// 事件的接收端，在任何执行器上都可等待。
 pub type Events = mpsc::UnboundedReceiver<Event>;
 
-/// 磁力链接取种子信息（[`Service::fetch_metadata`]）。
+/// 事件的发送端：每个订阅方各有一条无界队列、各收到一份，先后一致；接收端已丢弃的订阅方随下一次发送去掉。
+#[derive(Clone, Default)]
+pub(crate) struct Outbox(Arc<Mutex<Vec<mpsc::UnboundedSender<Event>>>>);
+
+impl Outbox {
+    fn subscribe(&self) -> Events {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        lock(&self.0).push(sender);
+        receiver
+    }
+
+    fn send(&self, event: Event) {
+        lock(&self.0).retain(|subscriber| subscriber.send(event.clone()).is_ok());
+    }
+}
+
+/// 磁力链接取种子信息（[`Handle::fetch_metadata`]）。
 pub struct MetadataFetch {
     pub progress: watch::Receiver<MetadataProgress>,
     /// 结果为种子的续传数据；释放即停止取
@@ -168,7 +195,7 @@ impl Drop for MetadataHandle {
     }
 }
 
-/// 进行中的 PikPak 登录（[`Service::login_pikpak`]）：在系统浏览器里打开 `url`，登录后点确认。
+/// 进行中的 PikPak 登录（[`Handle::login_pikpak`]）：在系统浏览器里打开 `url`，登录后点确认。
 pub struct PikPakLogin {
     /// 确认页上显示的码，供用户核对
     pub user_code: String,
@@ -179,11 +206,16 @@ pub struct PikPakLogin {
     pub done: AbortOnDropHandle<Result<(), Error>>,
 }
 
-/// 一个正在运行的任务。
+/// 一个正在运行的任务：在下载、录制，或还没定下、在准备。
 struct Running {
     control: Control,
     /// 停下（状态已写进存储或记为待补写、已从运行表里去掉）时变为 true
     stopped: watch::Receiver<bool>,
+    /// 这次登记的编号：同一任务的登记被换掉（准备完定下后换成下载的，或准备的一轮被另一轮顶掉）之后，旧登记释放时
+    /// 不动新的
+    serial: u64,
+    /// 在准备时：这一刻的步骤；在下载或录制时为 None
+    step: Option<prepare::Step>,
 }
 
 /// 运行中任务的控制：各种任务的进度不同。
@@ -197,6 +229,8 @@ enum Control {
     Cloud(CancellationToken),
     /// 取消即暂停
     Web(CancellationToken),
+    /// 还没定下的任务的一轮准备：取消即暂停
+    Prepare(CancellationToken),
 }
 
 impl Control {
@@ -204,17 +238,24 @@ impl Control {
         match self {
             Control::Hls(control) => control.cancel(),
             Control::File(control) => control.cancel(),
-            Control::Torrent(cancel) | Control::Cloud(cancel) | Control::Web(cancel) => {
+            Control::Torrent(cancel)
+            | Control::Cloud(cancel)
+            | Control::Web(cancel)
+            | Control::Prepare(cancel) => {
                 cancel.cancel();
             }
         }
     }
 
-    /// 停止录制；文件、BT、云离线与网页视频任务没有录制，什么也不做。
+    /// 停止录制；文件、BT、云离线、网页视频任务与准备中的任务没有录制，什么也不做。
     fn stop(&self) {
         match self {
             Control::Hls(control) => control.stop(),
-            Control::File(_) | Control::Torrent(_) | Control::Cloud(_) | Control::Web(_) => {}
+            Control::File(_)
+            | Control::Torrent(_)
+            | Control::Cloud(_)
+            | Control::Web(_)
+            | Control::Prepare(_) => {}
         }
     }
 }
@@ -261,12 +302,33 @@ struct Ending {
     resume: Option<Resume>,
     /// BT 任务下完时接着做不做种；None 时不改存储里的
     seeding: Option<bool>,
+    /// 这次运行了多久，累加进 [`Task::active`]；准备的一轮停下时为零
+    ran: Duration,
+    /// 完成的时刻，Unix 秒；没完成时为 None，不改存储里的
+    finished_at: Option<i64>,
 }
 
 impl Ending {
+    /// 以 `status` 停下，别的都不改。
+    fn of(status: Status) -> Ending {
+        Ending {
+            status,
+            result: None,
+            total: None,
+            resume: None,
+            seeding: None,
+            ran: Duration::ZERO,
+            finished_at: None,
+        }
+    }
+
     /// 把还没写进存储的结束状态叠到从存储读出的 `task` 上。
     fn overlay(&self, task: &mut Task) {
         task.status = self.status.clone();
+        task.active += self.ran;
+        if self.finished_at.is_some() {
+            task.finished_at = self.finished_at;
+        }
         task.result.clone_from(&self.result);
         if self.total.is_some() {
             task.total = self.total;
@@ -292,7 +354,12 @@ struct Shared {
     unsaved: Mutex<HashMap<TaskId, Ending>>,
     /// 服务在运行时里起的、会改状态的任务（运行中任务的收尾、放弃、存储写不进时不要了的任务的收尾）；关闭时等它们
     tracker: TaskTracker,
-    events: mpsc::UnboundedSender<Event>,
+    events: Outbox,
+    /// 下一次运行登记的编号（见 [`Running::serial`]）
+    serials: AtomicU64,
+    /// 停下等用户的任务的可选项；只在内存里，重开应用后没有（磁力任务选文件的除外，见 `Shared::restore_offers`）。
+    /// 增删都在 `store` 锁内，与任务状态的改动不交错
+    offers: Mutex<HashMap<TaskId, Offer>>,
     /// BT 引擎，第一次用到时建会话
     bt: Bt,
     /// 取公共 tracker 列表的任务（BT 会话建起时开始，取到为止）；关闭时取消
@@ -302,11 +369,11 @@ struct Shared {
     /// 看着 BT 代理的任务与它看着的地址（BT 会话已建、设了代理时有，见 `Shared::watch_torrent_proxy`）；改了代理或
     /// 关闭时取消
     proxy_probe: Mutex<Option<(Url, AbortOnDropHandle<()>)>>,
-    /// 代理设置改了（[`Service::set_proxy`]）：没取到公共 tracker 列表时不等退避、立即再取
+    /// 代理设置改了（[`Handle::set_proxy`]）：没取到公共 tracker 列表时不等退避、立即再取
     proxy_changed: Arc<Notify>,
     /// 服务的运行时：在运行时外面（界面线程）用到 BT 引擎时，取公共 tracker 列表的任务也起在这里
-    runtime: Handle,
-    /// 做种的设置，随 [`Service::set_seeding`] 改；在做种的随时照它判停不停
+    runtime: tokio::runtime::Handle,
+    /// 做种的设置，随 [`Handle::set_seeding`] 改；在做种的随时照它判停不停
     seeding: watch::Sender<Seeding>,
     /// 在做种的（含正在加入会话、还没开始的）：停止做种经它找到，登记与查询都在 `store` 锁内
     seeders: Mutex<HashMap<TaskId, SeedControl>>,
@@ -322,23 +389,41 @@ struct Shared {
 /// 一个在做种的任务的控制。
 struct SeedControl {
     cancel: CancellationToken,
-    /// 用户停止了做种（[`Service::stop_seeding`]）：停下后不再做种，即使停的期间应用正在退出
+    /// 用户停止了做种（[`Handle::stop_seeding`]）：停下后不再做种，即使停的期间应用正在退出
     by_user: Arc<AtomicBool>,
     /// 停下了（进度与「不再做种」已写进存储、已撤登记）时为 true
     ended: watch::Receiver<bool>,
 }
 
-/// 任务服务。不能在 tokio 运行时里释放：释放时要在自己的运行时上等任务停下（见 [`Service::close`]）。
+/// 任务服务：持有运行时，负责关闭与释放；对任务与设置的操作都在 [`Handle`] 上，服务可直接当它用。不能在 tokio
+/// 运行时里释放：释放时要在自己的运行时上等任务停下（见 [`Service::close`]）。
 pub struct Service {
-    shared: Arc<Shared>,
+    handle: Handle,
     /// 只在释放时取走（释放要按值关闭运行时）
     runtime: Option<Runtime>,
 }
 
+/// 任务服务的操作入口：可克隆，可跨线程用。服务（[`Service`]）关闭之后新建与继续报 [`Error::Closed`]，释放之后在
+/// 运行时里做的操作（返回句柄的那些）不再有结果。
+#[derive(Clone)]
+pub struct Handle {
+    shared: Arc<Shared>,
+}
+
+impl std::ops::Deref for Service {
+    type Target = Handle;
+
+    fn deref(&self) -> &Handle {
+        &self.handle
+    }
+}
+
 impl Service {
     /// 用 `store` 建服务，HTTP 同时最多 `max_requests` 个请求（见 [`hs_m3u8_core::Engine::new`]），BT 会话连
-    /// `network`，PikPak 的接口在 `pikpak`（官方的为 [`pikpak::Endpoints::official`]）；返回服务与事件的接收端。上次异常退出时还标着运行中的任务改为暂停；其中 BT 任务存的续传数据改为不可信
-    /// （可能比磁盘上的多），下次继续时先整体校验已下的文件。
+    /// `network`，PikPak 的接口在 `pikpak`（官方的为 [`pikpak::Endpoints::official`]）；返回服务与第一个订阅的事件
+    /// 接收端（另见 [`Handle::subscribe`]）。上次退出时还标着运行中、准备中的任务改为暂停；其中 BT 任务存的续传数据
+    /// 改为不可信（可能比磁盘上的多），下次继续时先整体校验已下的文件。停下等用户的任务照旧等着，可选项要
+    /// [`Handle::resume`] 重新准备才有（磁力任务选文件的由存着的种子信息得出，随后以 [`Event::Stage`] 报来）。
     pub fn new(
         mut store: Store,
         max_requests: NonZeroUsize,
@@ -375,7 +460,8 @@ impl Service {
             let _entered = runtime.enter();
             Engine::new(max_requests)
         };
-        let (events, receiver) = mpsc::unbounded_channel();
+        let events = Outbox::default();
+        let receiver = events.subscribe();
         let update_every = web.update_every;
         let web = web::Web::new(web, engine.clone());
         let shared = Arc::new(Shared {
@@ -387,6 +473,8 @@ impl Service {
             unsaved: Mutex::new(HashMap::new()),
             tracker: TaskTracker::new(),
             events,
+            serials: AtomicU64::new(0),
+            offers: Mutex::new(HashMap::new()),
             bt: Bt::new(
                 network,
                 settings.upload_limit,
@@ -404,7 +492,7 @@ impl Service {
             web,
         });
         let service = Service {
-            shared,
+            handle: Handle { shared },
             runtime: Some(runtime),
         };
         // 上次更新 yt-dlp 换下来的旧版本：这时没有任务在用。完成了的网页视频任务留下的任务目录另删，不等前者（它等着
@@ -438,8 +526,7 @@ impl Service {
                         Err(error) => Err(error),
                     };
                     if let Err(error) = removed {
-                        // 接收端就在返回值里，界面关闭前不会丢弃
-                        let _closed = shared.events.send(Event::Orphaned {
+                        shared.events.send(Event::Orphaned {
                             paths: vec![work_dir],
                             reason: error.to_string(),
                         });
@@ -452,42 +539,20 @@ impl Service {
             let _entered = service.runtime().enter();
             for id in seeding {
                 if let Err(error) = service.shared.start_seeding(id) {
-                    // 接收端就在返回值里，这时不会已丢弃
-                    let _closed = service.shared.events.send(Event::SeedingEnded {
+                    service.shared.events.send(Event::SeedingEnded {
                         id,
                         end: SeedEnd::Failed(error.to_string()),
                         unsaved: service
                             .shared
                             .write(|tx| store::set_seeding_task(tx, id, false))
-                            .err(),
+                            .err()
+                            .map(|error| error.to_string()),
                     });
                 }
             }
         }
+        service.shared.restore_offers();
         Ok((service, receiver))
-    }
-
-    fn runtime(&self) -> &Runtime {
-        self.runtime.as_ref().expect("运行时只在释放时取走")
-    }
-
-    /// 全部任务，按新建先后；停下了而状态还没补写进存储的，按停下时的状态。
-    pub fn tasks(&self) -> Result<Vec<Task>, Error> {
-        let mut store = lock(&self.shared.store);
-        let tx = store.transaction()?;
-        let mut tasks = store::list(&tx)?;
-        let unsaved = lock(&self.shared.unsaved);
-        for task in &mut tasks {
-            if let Some(ending) = unsaved.get(&task.id) {
-                ending.overlay(task);
-            }
-        }
-        Ok(tasks)
-    }
-
-    /// 把停下了而状态还没写进存储的补写进去。
-    pub fn flush(&self) -> Result<(), Error> {
-        self.shared.write(|_| Ok(()))
     }
 
     /// 退出前停下所有任务：不再开始任务（新建与继续报 [`Error::Closed`]），取消运行中的，最多等 2 秒让它们与放弃等
@@ -512,15 +577,15 @@ impl Service {
         drop(lock(&self.shared.public_fetch).take());
         drop(lock(&self.shared.web_updates).take());
         drop(lock(&self.shared.proxy_probe).take());
+        let runtime = self.runtime.as_ref().expect("运行时只在释放时取走");
         let tracker = &self.shared.tracker;
         tracker.close();
-        let _timed_out = self
-            .runtime()
-            .block_on(async { tokio::time::timeout(CLOSE_TIMEOUT, tracker.wait()).await });
+        let _timed_out =
+            runtime.block_on(async { tokio::time::timeout(CLOSE_TIMEOUT, tracker.wait()).await });
         // 在途的换令牌发出后旧的 refresh_token 即作废：等它收下、存好新的（一次接口请求的时限内）
         let session = lock(&self.shared.pikpak).clone();
         if let Some(session) = session {
-            self.runtime().block_on(session.settle());
+            runtime.block_on(session.settle());
         }
         let flushed = self.flush();
         let saved = match self.shared.bt.close() {
@@ -531,6 +596,113 @@ impl Service {
             Err(error) => Err(error),
         };
         flushed.and(saved)
+    }
+}
+
+impl Handle {
+    fn runtime(&self) -> &tokio::runtime::Handle {
+        &self.shared.runtime
+    }
+
+    /// 订阅事件：之后发生的事件各订阅方都收到一份；释放接收端即退订。
+    pub fn subscribe(&self) -> Events {
+        self.shared.events.subscribe()
+    }
+
+    /// 把粘贴的文字 `text` 拆成一条或多条（见 [`intake::split`]），每条建一个还没定下的任务、存到 `folder` 并开始
+    /// 准备；`at` 为新建时间（Unix 秒）。返回各行的结果：建出的任务（准备中），或这一行没建成的原因；整段不收时只有
+    /// 一项。返回的句柄在任何执行器上都可等待。
+    pub fn paste(
+        &self,
+        text: &str,
+        folder: &Path,
+        at: i64,
+    ) -> JoinHandle<Vec<Result<Task, Rejected>>> {
+        let (shared, text, folder) = (self.shared.clone(), text.to_owned(), folder.to_path_buf());
+        self.runtime().spawn(async move {
+            let lines = match intake::split(&text, &folder) {
+                Ok(lines) => lines,
+                Err(reason) => {
+                    return vec![Err(Rejected {
+                        text,
+                        reason: Box::new(reason),
+                    })];
+                }
+            };
+            let mut results = Vec::with_capacity(lines.len());
+            for line in lines {
+                results.push(match line {
+                    Ok(intake) => {
+                        let text = intake.url.to_string();
+                        shared.add(intake, at).await.map_err(|reason| Rejected {
+                            text,
+                            reason: Box::new(reason),
+                        })
+                    }
+                    Err(rejected) => Err(rejected),
+                });
+            }
+            results
+        })
+    }
+
+    /// 按拆好的一条 `intake` 建一个还没定下的任务并开始准备，返回存进存储的任务（准备中）；`at` 为新建时间（Unix
+    /// 秒）。之后服务自己往下走：认地址、解析、取种子信息，到要用户决定的一步停下等（[`Status::Waiting`]，可选项见
+    /// [`Handle::stage`]，选择经 [`Handle::choose`]），都定了即定下是哪种任务并开始下载；每一步以 [`Event`] 报来。
+    /// 请求头不合要求、保存目录不是绝对路径、磁力链接用不了、种子文件不是种子时报 [`Error::InvalidInput`]，种子文件
+    /// 读不出时报 [`Error::Io`]，种子已在某个任务里时报 [`Error::TorrentTaken`]，正在退出时报 [`Error::Closed`]。
+    /// 返回的句柄在任何执行器上都可等待。
+    pub fn add(&self, intake: Intake, at: i64) -> JoinHandle<Result<Task, Error>> {
+        let shared = self.shared.clone();
+        self.runtime()
+            .spawn(async move { shared.add(intake, at).await })
+    }
+
+    /// 还没定下的任务 `id` 此刻准备到哪一步，或停下等用户时的可选项。定下了的、暂停或失败的为 None；停下等用户而
+    /// 可选项已不在的（重开应用后）也为 None，要 [`Handle::resume`] 重新准备。没有这个任务时报 [`Error::NotFound`]。
+    pub fn stage(&self, id: TaskId) -> Result<Option<Stage>, Error> {
+        self.shared.stage(id)
+    }
+
+    /// 交上用户对停下等用户的任务 `id` 的选择：任务回到准备中接着走（都定了的随即定下、开始下载），返回准备中的
+    /// 任务。任务没在等选择、可选项已不在、`answer` 与在等的对不上、选的不在可选项里、保存目录不是绝对路径时报
+    /// [`Error::InvalidInput`]；别的拒绝的情形同 [`Handle::resume`]。
+    pub fn choose(&self, id: TaskId, answer: Answer) -> Result<Task, Error> {
+        let _entered = self.runtime().enter();
+        self.shared.choose(id, answer)
+    }
+
+    /// 把还没定下的磁力任务 `id` 交给网盘 `provider` 云离线（整包离线，不分文件），存到建任务时给的保存目录：在取
+    /// 种子信息的停掉，任务随即定下为云离线任务并开始；返回准备中的任务。任务已定下、来源不是磁力链接时报
+    /// [`Error::InvalidInput`]，没登录网盘时报 [`Error::NotLoggedIn`]，正在放弃时报 [`Error::Discarding`]。
+    pub fn offload(&self, id: TaskId, provider: crate::CloudProvider) -> Result<Task, Error> {
+        let _entered = self.runtime().enter();
+        self.shared.offload(id, provider)
+    }
+
+    /// 记下没有要选的任务开始前要不要先停下确认（见 [`Settings::confirm_before_start`]）：之后开始的准备照它。
+    pub fn set_confirm_before_start(&self, confirm: bool) -> Result<(), Error> {
+        self.shared
+            .write(|tx| store::set_confirm_before_start(tx, confirm))
+    }
+
+    /// 全部任务，按新建先后；停下了而状态还没补写进存储的，按停下时的状态。
+    pub fn tasks(&self) -> Result<Vec<Task>, Error> {
+        let mut store = lock(&self.shared.store);
+        let tx = store.transaction()?;
+        let mut tasks = store::list(&tx)?;
+        let unsaved = lock(&self.shared.unsaved);
+        for task in &mut tasks {
+            if let Some(ending) = unsaved.get(&task.id) {
+                ending.overlay(task);
+            }
+        }
+        Ok(tasks)
+    }
+
+    /// 把停下了而状态还没写进存储的补写进去。
+    pub fn flush(&self) -> Result<(), Error> {
+        self.shared.write(|_| Ok(()))
     }
 
     /// 设置。
@@ -687,7 +859,7 @@ impl Service {
 
     /// 下载 `release` 里本平台的安装包（经设置里的代理，放在 `feed.dir`，没下完的再下时接着下），先取签名、核对它是
     /// 这个版本这个文件的，下完验内容。返回已下的字节数与句柄：句柄的结果为验过的安装包，交给
-    /// [`Service::install_update`]；释放它即取消。`release` 没有本平台的安装包时报 [`Error::Update`]，读不出设置时直接
+    /// [`Handle::install_update`]；释放它即取消。`release` 没有本平台的安装包时报 [`Error::Update`]，读不出设置时直接
     /// 报错；其余失败（取不到、签名不符等）经句柄报 [`Error::Update`]，签名不符的文件删掉。
     pub fn download_update(
         &self,
@@ -874,7 +1046,7 @@ impl Service {
     }
 
     /// 认出地址是什么（播放列表、网页还是文件，见 [`Engine::identify`]），经设置里的代理；句柄与读不出设置时同
-    /// [`Service::probe`]。
+    /// [`Handle::probe`]。
     pub fn identify(
         &self,
         mut source: Source,
@@ -895,24 +1067,7 @@ impl Service {
         let id = hs_dlx_torrent::magnet_id(&uri)
             .map_err(|error| Error::Torrent(format!("加不进磁力链接：{error}")))?;
         torrent_free(&self.shared, id.as_str())?;
-        let engine = self.shared.bt_engine()?;
-        let (progress, receiver) = watch::channel(MetadataProgress::default());
-        let probe_dir = self.shared.bt.probe_dir().to_path_buf();
-        let slot = torrent::FetchSlot::default();
-        let handle = self.runtime().spawn(torrent::fetch_metadata(
-            engine,
-            uri,
-            probe_dir,
-            progress,
-            slot.clone(),
-        ));
-        Ok(MetadataFetch {
-            progress: receiver,
-            resume: MetadataHandle {
-                task: AbortOnDropHandle::new(handle),
-                slot,
-            },
-        })
+        self.shared.fetch_metadata(uri)
     }
 
     /// 读种子文件（bencode 写的内容 `torrent`）：结果为续传数据（供新建任务，[`DraftKind::Torrent`]）与其中的种子信息。
@@ -973,8 +1128,13 @@ impl Service {
     /// 取消，它建出的任务目录删掉，磁盘上还留下东西时发 [`Event::Orphaned`]。
     pub fn create(&self, draft: Draft, created_at: i64) -> JoinHandle<Result<Task, Error>> {
         let shared = self.shared.clone();
-        self.runtime()
-            .spawn(async move { shared.create(draft, created_at).await })
+        self.runtime().spawn(async move {
+            shared
+                .establish(draft, |spec, work_dir, resume| {
+                    shared.insert_and_start(spec, work_dir, resume, created_at)
+                })
+                .await
+        })
     }
 
     /// 继续暂停或失败的任务：照新建时的请求再开始，任务目录里已完成的不重下（文件任务在服务器不支持范围请求或没给出
@@ -988,8 +1148,8 @@ impl Service {
     }
 
     /// 不再续录，只把停着的直播录制任务目录里已录的写成输出（见 [`Engine::merge_recorded`]）：用于来源变了、接不上，
-    /// 或不想再录的时候。记下这个选择（[`Task::write_only`]），之后由 [`Service::resume`] 改回续录。拒绝的情形同
-    /// [`Service::resume`]；目录里是点播的下载、或没有录到可合并的分片时，任务以失败
+    /// 或不想再录的时候。记下这个选择（[`Task::write_only`]），之后由 [`Handle::resume`] 改回续录。拒绝的情形同
+    /// [`Handle::resume`]；目录里是点播的下载、或没有录到可合并的分片时，任务以失败
     /// （[`crate::FailureKind::NothingToWrite`]）停下。返回开始后的任务，停下后照常发 [`Event::Ended`]。
     pub fn write_recorded(&self, id: TaskId) -> Result<Task, Error> {
         let _entered = self.runtime().enter();
@@ -999,9 +1159,9 @@ impl Service {
     /// 把停着的任务的输出改为只要本地 HLS，任务目录不变，已下的分片照样用：用于内容放不进 MP4
     /// （[`crate::FailureKind::Mp4Unsupported`]）之后，再继续或只写出已录的。只要 MP4 的，目录与 MP4 同名、去掉扩展名；
     /// 两者都要的留下原来的本地 HLS；只要本地 HLS 的不变。返回改后的任务。新路径已被别的任务占着时报
-    /// [`Error::PathTaken`]；拒绝的情形同 [`Service::set_headers`]。
+    /// [`Error::PathTaken`]；拒绝的情形同 [`Handle::set_headers`]。
     pub fn switch_to_hls(&self, id: TaskId) -> Result<Task, Error> {
-        self.shared.write(|tx| {
+        self.shared.change(|tx| {
             let mut task = self.shared.stopped(tx, id)?;
             let Kind::Hls(spec) = &mut task.spec.kind else {
                 return Err(Error::NotHls(id));
@@ -1020,9 +1180,9 @@ impl Service {
     /// 把停着的网页视频任务的输出容器从 MP4 改为 MKV（输出的扩展名随之改为 `.mkv`），任务目录不变，已下的各路照样用：
     /// 用于合并或转封装时内容放不进 MP4（[`crate::FailureKind::Mp4Unsupported`]）之后再继续。已是 MKV 的不变；保持原样
     /// 的（一路、不转封装）报 [`Error::InvalidInput`]。返回改后的任务。新路径已被别的任务占着时报 [`Error::PathTaken`]；拒绝的情形同
-    /// [`Service::set_headers`]。
+    /// [`Handle::set_headers`]。
     pub fn switch_web_to_matroska(&self, id: TaskId) -> Result<Task, Error> {
-        self.shared.write(|tx| {
+        self.shared.change(|tx| {
             let mut task = self.shared.stopped(tx, id)?;
             let Kind::Web(spec) = &mut task.spec.kind else {
                 return Err(Error::InvalidInput(format!("{id}不是网页视频任务")));
@@ -1043,13 +1203,7 @@ impl Service {
 
     /// 存储里的任务 `id`，停下了而状态还没补写进存储的按停下时的状态；没有时报 [`Error::NotFound`]。
     pub fn task(&self, id: TaskId) -> Result<Task, Error> {
-        let mut store = lock(&self.shared.store);
-        let tx = store.transaction()?;
-        let mut task = store::get(&tx, id)?.ok_or(Error::NotFound(id))?;
-        if let Some(ending) = lock(&self.shared.unsaved).get(&id) {
-            ending.overlay(&mut task);
-        }
-        Ok(task)
+        self.shared.task(id)
     }
 
     /// 任务目录里已完成的内容（见 [`Engine::inspect`]）：任务不在运行时显示已下了多少、继续前算出续传的起点。任务没有
@@ -1094,7 +1248,7 @@ impl Service {
 
     /// 从存储里删掉任务，输出不动：用于已完成的（任务目录已在完成时删掉，输出归用户；BT 另删保存目录里它的 `.parts`
     /// 文件，删不掉时发 [`Event::Orphaned`]）与没有自己的任务目录的 HLS、文件任务。别的报 [`Error::NotFinished`]：它们
-    /// 的任务目录（BT 为下了的文件）要用 [`Service::discard`] 一起删。在做种的先停止做种（同 [`Service::stop_seeding`]，
+    /// 的任务目录（BT 为下了的文件）要用 [`Handle::discard`] 一起删，还没定下的任务也只经它删。在做种的先停止做种（同 [`Handle::stop_seeding`]，
     /// 记不进存储时报那个错，做种照旧），停下后再删；等的期间又开始做种时报 [`Error::Seeding`]。返回的句柄在任何执行器
     /// 上都可等待。
     pub fn forget(&self, id: TaskId) -> JoinHandle<Result<(), Error>> {
@@ -1106,30 +1260,41 @@ impl Service {
                 // 发送端随做种的任务结束而释放：那时已停下
                 let _ended = ended.wait_for(|ended| *ended).await;
             }
-            shared.forget(id)
+            shared.forget(id)?;
+            shared.events.send(Event::Removed { id });
+            Ok(())
         })
     }
 
-    /// 换掉暂停或失败的任务的请求头，之后继续时照它请求。名与值不合要求（见 [`check_option_header`]）、或任务是 BT
-    /// 任务（没有请求头）的报 [`Error::InvalidInput`]；任务在运行或正在放弃时报 [`Error::Running`]、[`Error::Discarding`]，已完成、放弃没做完
-    /// 的报 [`Error::AlreadyDone`]、[`Error::DiscardUnfinished`]。
+    /// 换掉停着的任务（暂停、失败，或还没定下、在等用户）的请求头，之后继续时照它请求。名与值不合要求（见
+    /// [`check_option_header`]）、或任务没有请求头（BT、云离线，来源是磁力链接或种子文件的）的报
+    /// [`Error::InvalidInput`]；任务在运行（含准备中）或正在放弃时报 [`Error::Running`]、[`Error::Discarding`]，已完成、
+    /// 放弃没做完的报 [`Error::AlreadyDone`]、[`Error::DiscardUnfinished`]。
     pub fn set_headers(&self, id: TaskId, headers: Vec<(String, String)>) -> Result<(), Error> {
         for (name, value) in &headers {
             check_option_header(name, value).map_err(Error::InvalidInput)?;
         }
-        self.shared.write(|tx| {
-            let task = self.shared.stopped(tx, id)?;
-            if task.spec.torrent().is_some() || task.spec.cloud().is_some() {
-                return Err(Error::InvalidInput(format!("{id}没有请求头")));
-            }
-            if task.spec.web().is_some() {
-                web_task::check_headers(&headers)?;
-            }
-            store::set_headers(tx, id, &headers)
-        })
+        self.shared
+            .change(|tx| {
+                let mut task = self.shared.stopped(tx, id)?;
+                let headerless = task.spec.torrent().is_some()
+                    || task.spec.cloud().is_some()
+                    || intake::torrent_source(&task.spec.url);
+                if headerless {
+                    return Err(Error::InvalidInput(format!("{id}没有请求头")));
+                }
+                if task.spec.web().is_some() {
+                    web_task::check_headers(&headers)?;
+                }
+                store::set_headers(tx, id, &headers)?;
+                task.spec.headers = headers;
+                Ok(task)
+            })
+            .map(drop)
     }
 
-    /// 暂停：取消运行中的任务，保留任务目录；停下后状态为 [`Status::Paused`]。没在运行时什么也不做。
+    /// 暂停：取消运行中的任务，保留任务目录；停下后状态为 [`Status::Paused`]。准备中的任务停掉在做的那一步（杀掉
+    /// 这次解析、不再取种子信息），之后继续时从头准备。没在运行时（含停下等用户的）什么也不做。
     pub fn pause(&self, id: TaskId) {
         if let Some(running) = lock(&self.shared.running).get(&id) {
             running.control.cancel();
@@ -1145,7 +1310,7 @@ impl Service {
 
     /// 放弃任务：在运行就先取消并等它停下，把状态记为 [`Status::DiscardUnfinished`]，再删掉任务目录（见 [`Engine::discard`]；
     /// BT 任务为 libtorrent 建的文件、空了的目录与存部分块的 `.parts` 文件）与存储里的记录；返回留下的东西（BT 任务
-    /// 没有）。
+    /// 没有）。还没定下的任务磁盘上没有东西，停下后直接删记录。删了记录发 [`Event::Removed`]。
     /// 任务目录没删干净时记录留着，报 [`Error::WorkDirLeft`]（BT 任务的文件没删干净时报 [`Error::ContentLeft`]）；目录删了而记录没删掉时报 [`Error::RecordNotDeleted`]；
     /// 30 秒内做不完报 [`Error::TimedOut`]（之后再放弃从做到的地方接着做）。做完之前任务记为正在放弃，继续与移除都报
     /// [`Error::Discarding`]，再放弃一次同样报这个错误。返回的句柄在任何执行器上都可等待。
@@ -1168,7 +1333,8 @@ impl Service {
         };
         let _entered = self.runtime().enter();
         self.shared.tracker.spawn(async move {
-            let discarding = run_discard(id, &guard.shared, stopped);
+            let shared = &guard.shared;
+            let discarding = run_discard(id, shared, stopped);
             let result = tokio::time::timeout(DISCARD_TIMEOUT, discarding)
                 .await
                 .unwrap_or_else(|_| {
@@ -1177,6 +1343,17 @@ impl Service {
                         after: DISCARD_TIMEOUT,
                     })
                 });
+            match &result {
+                Ok(_) => shared.events.send(Event::Removed { id }),
+                // 没放弃成而记录还在：状态多半已改为放弃没做完。读不出时报的仍是放弃的错误
+                Err(_) => {
+                    if let Ok(task) = shared.task(id) {
+                        shared.events.send(Event::Changed {
+                            task: Box::new(task),
+                        });
+                    }
+                }
+            }
             drop(guard);
             result
         })
@@ -1251,7 +1428,7 @@ async fn fetch_public_trackers(shared: Weak<Shared>, engine: Engine, sources: Ve
     }
 }
 
-/// [`Service::discard`] 的步骤：等任务停下、删任务目录、删存储里的记录。
+/// [`Handle::discard`] 的步骤：等任务停下、删任务目录、删存储里的记录。
 async fn run_discard(
     id: TaskId,
     shared: &Arc<Shared>,
@@ -1260,6 +1437,19 @@ async fn run_discard(
     if let Some(mut stopped) = stopped {
         // 运行登记释放时先置为 true 再丢弃发送端，等到值或发送端已丢弃都说明任务已停下
         let _stopped = stopped.wait_for(|done| *done).await;
+    }
+    // 还没定下的任务磁盘上没有东西（取种子信息加进会话的种子已随那一轮准备停下而移除）
+    let pending = shared.write(|tx| {
+        let task = store::get(tx, id)?.ok_or(Error::NotFound(id))?;
+        if task.spec.pending().is_none() {
+            return Ok(false);
+        }
+        store::delete(tx, id)?;
+        lock(&shared.offers).remove(&id);
+        Ok(true)
+    })?;
+    if pending {
+        return Ok(Vec::new());
     }
     // 先记为放弃没做完：之后被打断、超时或删不掉记录，任务都停在这个状态，不能继续，只能再放弃
     shared.write(|tx| store::set_status(tx, id, &Status::DiscardUnfinished))?;
@@ -1340,15 +1530,45 @@ async fn run_discard(
 /// 运行中任务的登记：任务停下（或运行时关闭时收尾的任务被丢弃）时从运行表里去掉，并告诉等它停下的放弃。
 struct RunningGuard {
     id: TaskId,
+    /// 见 [`Running::serial`]
+    serial: u64,
     shared: Arc<Shared>,
     stopped: watch::Sender<bool>,
+    /// 登记的时刻：停下时算这次运行了多久
+    started: Instant,
+}
+
+impl RunningGuard {
+    /// 任务停下时把这次运行了多久、完成的时刻（状态为 [`Status::Done`] 时）记进 `ending`。
+    fn stamp(&self, ending: &mut Ending) {
+        ending.ran = self.started.elapsed();
+        if ending.status == Status::Done {
+            ending.finished_at = Some(unix_now());
+        }
+    }
 }
 
 impl Drop for RunningGuard {
     fn drop(&mut self) {
-        lock(&self.shared.running).remove(&self.id);
+        {
+            let mut running = lock(&self.shared.running);
+            if running
+                .get(&self.id)
+                .is_some_and(|running| running.serial == self.serial)
+            {
+                running.remove(&self.id);
+            }
+        }
         self.stopped.send_replace(true);
     }
+}
+
+/// 现在的时刻，Unix 秒。
+fn unix_now() -> i64 {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("系统时钟不早于 1970 年");
+    i64::try_from(since.as_secs()).expect("Unix 秒远小于 i64 的上限")
 }
 
 impl Shared {
@@ -1370,12 +1590,47 @@ impl Shared {
 
     /// 在一个事务里先补写没写进去的结束状态，再做 `f`，然后提交（见 [`Shared::commit`]）。
     fn write<T>(&self, f: impl FnOnce(&Transaction<'_>) -> Result<T, Error>) -> Result<T, Error> {
-        let mut store = lock(&self.store);
+        self.write_in(&mut lock(&self.store), f)
+    }
+
+    /// 同 [`Shared::write`]，调用方已持着 `store` 锁。
+    fn write_in<T>(
+        &self,
+        store: &mut Store,
+        f: impl FnOnce(&Transaction<'_>) -> Result<T, Error>,
+    ) -> Result<T, Error> {
         let tx = store.transaction()?;
         let applied = self.apply_unsaved(&tx)?;
         let value = f(&tx)?;
         self.commit(tx, applied)?;
         Ok(value)
+    }
+
+    /// 同 [`Shared::write`]，`f` 给出改了之后的任务：提交后发 [`Event::Changed`]，返回它。
+    fn change(
+        &self,
+        f: impl FnOnce(&Transaction<'_>) -> Result<Task, Error>,
+    ) -> Result<Task, Error> {
+        let task = self.write(f)?;
+        self.events.send(Event::Changed {
+            task: Box::new(task.clone()),
+        });
+        Ok(task)
+    }
+
+    /// 存储里的任务 `id`，停下了而状态还没补写进存储的按停下时的状态；没有时报 [`Error::NotFound`]。
+    fn task(&self, id: TaskId) -> Result<Task, Error> {
+        self.task_in(&mut lock(&self.store), id)
+    }
+
+    /// 同 [`Shared::task`]，调用方已持着 `store` 锁。
+    fn task_in(&self, store: &mut Store, id: TaskId) -> Result<Task, Error> {
+        let tx = store.transaction()?;
+        let mut task = store::get(&tx, id)?.ok_or(Error::NotFound(id))?;
+        if let Some(ending) = lock(&self.unsaved).get(&id) {
+            ending.overlay(&mut task);
+        }
+        Ok(task)
     }
 
     /// 提交补写了 `applied`（[`Shared::apply_unsaved`] 的返回）的事务 `tx`；提交了的补写从待补写里去掉，其间同一任务
@@ -1391,7 +1646,8 @@ impl Shared {
         Ok(())
     }
 
-    /// 停着的任务 `id`（暂停或失败；存储里标着运行中而已不在运行的按停着算）：在运行、正在放弃、已完成、放弃没做完的
+    /// 停着的任务 `id`（暂停、失败或停下等用户；存储里标着运行中、准备中而已不在运行的按停着算）：在运行（含准备中）、
+    /// 正在放弃、已完成、放弃没做完的
     /// 报 [`Error::Running`]、[`Error::Discarding`]、[`Error::AlreadyDone`]、[`Error::DiscardUnfinished`]，没有时报
     /// [`Error::NotFound`]。调用方持着 `store` 锁（`tx` 是它的事务），检查与之后的写入之间任务不会开始或开始放弃。
     fn stopped(&self, tx: &Transaction<'_>, id: TaskId) -> Result<Task, Error> {
@@ -1405,7 +1661,11 @@ impl Shared {
         match task.status {
             Status::Done => Err(Error::AlreadyDone(id)),
             Status::DiscardUnfinished => Err(Error::DiscardUnfinished(id)),
-            Status::Running | Status::Paused | Status::Failed(_) => Ok(task),
+            Status::Preparing
+            | Status::Waiting(_)
+            | Status::Running
+            | Status::Paused
+            | Status::Failed(_) => Ok(task),
         }
     }
 
@@ -1414,6 +1674,28 @@ impl Shared {
         let mut store = lock(&self.store);
         let tx = store.transaction()?;
         store::get(&tx, id)?.ok_or(Error::NotFound(id))
+    }
+
+    /// 磁力链接 `uri` 取种子信息（见 [`Handle::fetch_metadata`]），不查种子在不在任务里。
+    fn fetch_metadata(self: &Arc<Self>, uri: String) -> Result<MetadataFetch, Error> {
+        let engine = self.bt_engine()?;
+        let (progress, receiver) = watch::channel(MetadataProgress::default());
+        let probe_dir = self.bt.probe_dir().to_path_buf();
+        let slot = torrent::FetchSlot::default();
+        let handle = self.runtime.spawn(torrent::fetch_metadata(
+            engine,
+            uri,
+            probe_dir,
+            progress,
+            slot.clone(),
+        ));
+        Ok(MetadataFetch {
+            progress: receiver,
+            resume: MetadataHandle {
+                task: AbortOnDropHandle::new(handle),
+                slot,
+            },
+        })
     }
 
     /// BT 引擎；还没有时照存储里上次关闭时的端口与 DHT 状态建会话（见 [`Shared::torrent_engine`]）。不持 `store` 锁调用。
@@ -1563,7 +1845,7 @@ impl Shared {
         *watching = Some((watched, AbortOnDropHandle::new(probing)));
     }
 
-    /// 让下完的 BT 任务 `id` 做种（见 [`Service::seed`]）：在 `store` 锁内核对、记下在做种并登记，再在运行时里加入会话；
+    /// 让下完的 BT 任务 `id` 做种（见 [`Handle::seed`]）：在 `store` 锁内核对、记下在做种并登记，再在运行时里加入会话；
     /// 调用方须在运行时里。
     fn start_seeding(self: &Arc<Self>, id: TaskId) -> Result<(), Error> {
         let (engine, info_hash, resume, root) = {
@@ -1589,6 +1871,12 @@ impl Shared {
             let resume = store::torrent_resume(&tx, id)?;
             store::set_seeding_task(&tx, id, true)?;
             self.commit(tx, applied)?;
+            self.events.send(Event::Changed {
+                task: Box::new(Task {
+                    seeding: true,
+                    ..task
+                }),
+            });
             (engine, spec.info_hash, resume, spec.root)
         };
         let started = async move {
@@ -1628,8 +1916,7 @@ impl Shared {
                 cancel.cancel();
             }
         }
-        // 接收端随界面关闭而丢弃时没有谁要这些事件
-        let _closed = self.events.send(Event::SeedingStarted { id });
+        self.events.send(Event::SeedingStarted { id });
         let shared = self.clone();
         let policy = self.seeding.subscribe();
         self.tracker.spawn(async move {
@@ -1642,8 +1929,7 @@ impl Shared {
                         policy,
                         cancel,
                         |progress| {
-                            // 同上
-                            let _closed = events.send(Event::TorrentProgress {
+                            events.send(Event::TorrentProgress {
                                 id,
                                 progress: Box::new(progress),
                             });
@@ -1655,9 +1941,7 @@ impl Shared {
                                     .map_err(|error| error.to_string())
                             });
                             if let Err(reason) = saved {
-                                // 同上
-                                let _closed =
-                                    saving.events.send(Event::SeedingNotSaved { id, reason });
+                                saving.events.send(Event::SeedingNotSaved { id, reason });
                             }
                         },
                     )
@@ -1676,20 +1960,29 @@ impl Shared {
                 if let Some(resume) = &seeded.resume {
                     store::set_torrent_resume(tx, id, resume)?;
                 }
-                store::set_seeding_task(tx, id, keep)
+                store::set_seeding_task(tx, id, keep)?;
+                store::get(tx, id)?.ok_or(Error::NotFound(id))
             });
             lock(&shared.seeders).remove(&id);
             ended_tx.send_replace(true);
-            // 同上
-            let _closed = shared.events.send(Event::SeedingEnded {
+            let unsaved = match saved {
+                Ok(task) => {
+                    shared.events.send(Event::Changed {
+                        task: Box::new(task),
+                    });
+                    None
+                }
+                Err(error) => Some(error.to_string()),
+            };
+            shared.events.send(Event::SeedingEnded {
                 id,
                 end: seeded.end,
-                unsaved: saved.err(),
+                unsaved,
             });
         });
     }
 
-    /// 见 [`Service::stop_seeding`]；在做种时返回它停下的信号。
+    /// 见 [`Handle::stop_seeding`]；在做种时返回它停下的信号。
     fn stop_seeding(&self, id: TaskId) -> Result<Option<watch::Receiver<bool>>, Error> {
         let mut store = lock(&self.store);
         let tx = store.transaction()?;
@@ -1711,7 +2004,7 @@ impl Shared {
         Ok(Some(ended))
     }
 
-    /// 见 [`Service::forget`]：不在做种的任务。在做种的报 [`Error::Seeding`]。
+    /// 见 [`Handle::forget`]：不在做种的任务。在做种的报 [`Error::Seeding`]。
     fn forget(&self, id: TaskId) -> Result<(), Error> {
         let part = self.write(|tx| {
             if lock(&self.discarding).contains(&id) {
@@ -1721,7 +2014,9 @@ impl Shared {
                 return Err(Error::Seeding(id));
             }
             let task = store::get(tx, id)?.ok_or(Error::NotFound(id))?;
-            let unfinished = task.work_dir.is_some() || task.spec.torrent().is_some();
+            let unfinished = task.work_dir.is_some()
+                || task.spec.torrent().is_some()
+                || task.spec.pending().is_some();
             if task.status != Status::Done && unfinished {
                 return Err(Error::NotFinished(id));
             }
@@ -1759,8 +2054,7 @@ impl Shared {
             .await
             .expect("删文件不会 panic，运行时关闭时本任务也一起丢弃");
             if let Err((path, reason)) = removed {
-                // 接收端随界面关闭而丢弃时没有谁能处理
-                let _closed = events.send(Event::Orphaned {
+                events.send(Event::Orphaned {
                     paths: vec![path],
                     reason,
                 });
@@ -1783,7 +2077,13 @@ impl Shared {
         Ok(unsaved)
     }
 
-    async fn create(self: &Arc<Self>, draft: Draft, created_at: i64) -> Result<Task, Error> {
+    /// 按 `draft` 定下任务的规格（取名、定任务目录，见 [`Handle::create`]），交给 `commit` 记进存储并开始；`commit`
+    /// 报路径被这次取名时还没见过的任务占了时重新取名。
+    async fn establish(
+        self: &Arc<Self>,
+        draft: Draft,
+        commit: impl Fn(&TaskSpec, Option<PathBuf>, Option<Vec<u8>>) -> Result<Task, Error>,
+    ) -> Result<Task, Error> {
         // 与换请求头时同样校验：网页视频的 Cookie 写进交给 yt-dlp 的 cookies.txt，不经核心
         for (name, value) in &draft.headers {
             check_option_header(name, value).map_err(Error::InvalidInput)?;
@@ -1839,15 +2139,9 @@ impl Shared {
                 None
             }
             DraftKind::Cloud { provider } => {
-                return self
-                    .create_cloud(
-                        draft.url,
-                        folder,
-                        *provider,
-                        !draft.headers.is_empty(),
-                        created_at,
-                    )
-                    .await;
+                let spec =
+                    self.cloud_spec(draft.url, folder, *provider, !draft.headers.is_empty())?;
+                return commit(&spec, None, None);
             }
         };
         let base = match (&draft.kind, &info) {
@@ -1949,6 +2243,7 @@ impl Shared {
                         audio: audio.clone(),
                         container: *container,
                         path,
+                        plugin: WebSpec::YT_DLP.to_owned(),
                     });
                     (name, Some(work_dir), None, kind)
                 }
@@ -1959,7 +2254,7 @@ impl Shared {
                 headers: draft.headers.clone(),
                 kind,
             };
-            match self.insert_and_start(&spec, work_dir, resume, created_at) {
+            match commit(&spec, work_dir, resume) {
                 Err(Error::PathTaken(path))
                     if !seen.contains(&naming::path_key(&path.to_string_lossy())) => {}
                 result => return result,
@@ -1967,17 +2262,16 @@ impl Shared {
         }
     }
 
-    /// 新建云离线任务：在本机记下要把磁力链接 `url` 交给网盘 `provider`（属于现在登录的账号）并开始；提交、等网盘下完
-    /// 都在任务的运行里做，失败的以任务失败报出。内容的根到列出文件时才在保存目录 `folder` 里定下。带了请求头
-    /// （`has_headers`）、不是磁力链接时报 [`Error::InvalidInput`]，没登录时报 [`Error::NotLoggedIn`]。
-    async fn create_cloud(
+    /// 云离线任务的规格：把磁力链接 `url` 交给网盘 `provider`（属于现在登录的账号）；提交、等网盘下完都在任务的运行里
+    /// 做，失败的以任务失败报出。内容的根到列出文件时才在保存目录 `folder` 里定下。带了请求头（`has_headers`）、不是
+    /// 磁力链接时报 [`Error::InvalidInput`]，没登录时报 [`Error::NotLoggedIn`]。
+    fn cloud_spec(
         self: &Arc<Self>,
         url: Url,
         folder: PathBuf,
         provider: crate::CloudProvider,
         has_headers: bool,
-        created_at: i64,
-    ) -> Result<Task, Error> {
+    ) -> Result<TaskSpec, Error> {
         if has_headers {
             return Err(Error::InvalidInput("云离线任务没有请求头".to_owned()));
         }
@@ -1994,11 +2288,10 @@ impl Shared {
             folder,
             root: None,
         };
-        let spec = cloud::draft_spec(spec, url);
-        self.insert_and_start(&spec, None, None, created_at)
+        Ok(cloud::draft_spec(spec, url))
     }
 
-    /// 设置（[`Service::settings`] 的服务内用法）。
+    /// 设置（[`Handle::settings`] 的服务内用法）。
     fn settings(&self) -> Result<Settings, Error> {
         let mut store = lock(&self.store);
         let tx = store.transaction()?;
@@ -2028,8 +2321,19 @@ impl Shared {
             created_at,
         )?;
         let task = store::get(&tx, id)?.expect("同一事务里刚插入的行读得到");
-        let job = self.launch(&tx, &task)?;
+        // 开始了的任务随即会发进度：先发建了任务，没建成时再发删了
+        self.events.send(Event::Added {
+            task: Box::new(task.clone()),
+        });
+        let job = match self.launch(&tx, &task) {
+            Ok(job) => job,
+            Err(error) => {
+                self.events.send(Event::Removed { id });
+                return Err(error);
+            }
+        };
         if let Err(error) = self.commit(tx, applied) {
+            self.events.send(Event::Removed { id });
             drop(store);
             self.abandon(job, work_dir);
             return Err(error);
@@ -2042,6 +2346,7 @@ impl Shared {
     /// 运行时里。
     fn launch(self: &Arc<Self>, tx: &Transaction<'_>, task: &Task) -> Result<Launched, Error> {
         Ok(match &task.spec.kind {
+            Kind::Pending(_) => unreachable!("还没定下的任务不下载：继续时重新准备"),
             Kind::Hls(_) => {
                 let proxy = store::settings(tx)?.proxy;
                 Launched::Hls(self.engine.start(request(task, proxy)?)?)
@@ -2087,8 +2392,7 @@ impl Shared {
                     &seeding,
                     cancel,
                     |progress| {
-                        // 接收端随界面关闭而丢弃时没有谁要
-                        let _closed = events.send(Event::TorrentProgress {
+                        events.send(Event::TorrentProgress {
                             id,
                             progress: Box::new(progress),
                         });
@@ -2116,6 +2420,12 @@ impl Shared {
         let tx = store.transaction()?;
         let applied = self.apply_unsaved(&tx)?;
         let mut task = self.stopped(&tx, id)?;
+        if task.spec.pending().is_some() {
+            return match run {
+                Run::Resume => self.begin_flow(tx, applied, task, prepare::Entry::Fresh, false),
+                Run::WriteRecorded => Err(Error::NotHls(id)),
+            };
+        }
         let job = match run {
             Run::Resume => self.launch(&tx, &task)?,
             Run::WriteRecorded => {
@@ -2130,6 +2440,12 @@ impl Shared {
         if committed.is_err() {
             // 任务目录是这个任务原有的：照常登记，停下后按暂停写存储（同样写不进时记为待补写）
             job.cancel();
+        }
+        // 先发开始了，再登记：这次运行的进度与结束都在这之后
+        if committed.is_ok() {
+            self.events.send(Event::Changed {
+                task: Box::new(task.clone()),
+            });
         }
         self.track(&task, job, run);
         drop(store);
@@ -2155,8 +2471,7 @@ impl Shared {
                         Err(error) => Err(error),
                     };
                     if let Err(error) = deleted {
-                        // 同下
-                        let _closed = shared.events.send(Event::Orphaned {
+                        shared.events.send(Event::Orphaned {
                             paths: vec![run.root],
                             reason: error.to_string(),
                         });
@@ -2172,8 +2487,7 @@ impl Shared {
                     let _ended = run.done.await;
                     let work_dir = work_dir.expect("网页视频任务有任务目录");
                     if let Err(error) = web_task::remove_work_dir(&work_dir).await {
-                        // 同下
-                        let _closed = shared.events.send(Event::Orphaned {
+                        shared.events.send(Event::Orphaned {
                             paths: vec![work_dir],
                             reason: error.to_string(),
                         });
@@ -2202,8 +2516,7 @@ impl Shared {
                     Err(error) => (vec![work_dir], error.to_string()),
                 },
             };
-            // 接收端随界面关闭而丢弃时没有谁能处理
-            let _closed = shared.events.send(Event::Orphaned { paths, reason });
+            shared.events.send(Event::Orphaned { paths, reason });
         });
     }
 
@@ -2220,24 +2533,62 @@ impl Shared {
 
     /// 登记运行中的任务 `id`：暂停与放弃经它找到任务，返回的登记释放时去掉。
     fn register(self: &Arc<Self>, id: TaskId, control: Control) -> RunningGuard {
+        self.register_with(id, control, None)
+    }
+
+    /// 同 [`Shared::register`]；`step` 为准备的一轮开始时的步骤（下载、录制的为 None）。这个任务已有登记时换掉它：
+    /// 旧登记释放时不动新的。
+    fn register_with(
+        self: &Arc<Self>,
+        id: TaskId,
+        control: Control,
+        step: Option<prepare::Step>,
+    ) -> RunningGuard {
+        let serial = self.serials.fetch_add(1, Ordering::Relaxed);
         let (stopped_tx, stopped) = watch::channel(false);
-        lock(&self.running).insert(id, Running { control, stopped });
+        lock(&self.running).insert(
+            id,
+            Running {
+                control,
+                stopped,
+                serial,
+                step,
+            },
+        );
         RunningGuard {
             id,
+            serial,
             shared: self.clone(),
             stopped: stopped_tx,
+            started: Instant::now(),
         }
     }
 
-    /// 任务 `id` 停下了：把 `ending` 写进存储（写不进时记为待补写），去掉运行登记 `guard`，发出 [`Event::Ended`]。
-    fn conclude(&self, id: TaskId, ending: Ending, leftovers: Vec<Leftover>, guard: RunningGuard) {
+    /// 任务 `id` 停下了：把 `ending`（连同这次运行了多久）写进存储（写不进时记为待补写），去掉运行登记 `guard`，发出
+    /// [`Event::Changed`] 与 [`Event::Ended`]。
+    fn conclude(
+        &self,
+        id: TaskId,
+        mut ending: Ending,
+        leftovers: Vec<Leftover>,
+        guard: RunningGuard,
+    ) {
+        guard.stamp(&mut ending);
         let saved = self.save(id, &ending);
         self.announce(id, ending, leftovers, guard, saved);
     }
 
-    /// 把任务 `id` 的结束状态 `ending` 写进存储；写不进时记为待补写，报出原因。
-    fn save(&self, id: TaskId, ending: &Ending) -> Result<(), Error> {
-        let saved = self.write(|tx| save_ending(tx, id, ending));
+    /// 把任务 `id` 的结束状态 `ending` 写进存储，返回写了之后的任务；写不进时记为待补写，报出原因。
+    fn save(&self, id: TaskId, ending: &Ending) -> Result<Task, Error> {
+        self.save_in(&mut lock(&self.store), id, ending)
+    }
+
+    /// 同 [`Shared::save`]，调用方已持着 `store` 锁。
+    fn save_in(&self, store: &mut Store, id: TaskId, ending: &Ending) -> Result<Task, Error> {
+        let saved = self.write_in(store, |tx| {
+            save_ending(tx, id, ending)?;
+            store::get(tx, id)?.ok_or(Error::NotFound(id))
+        });
         if let Err(error) = &saved {
             // 违反约束的结束状态永远写不进：留着待补写会让之后的每次写入都失败
             assert!(
@@ -2249,31 +2600,34 @@ impl Shared {
         saved
     }
 
-    /// [`Shared::conclude`] 写进存储之后的一半：去掉运行登记 `guard`，发出 [`Event::Ended`]（`saved` 为写进存储的结果）。
+    /// [`Shared::conclude`] 写进存储之后的一半：去掉运行登记 `guard`，发出 [`Event::Changed`] 与 [`Event::Ended`]
+    /// （`saved` 为写进存储的结果）。
     fn announce(
         &self,
         id: TaskId,
         ending: Ending,
         leftovers: Vec<Leftover>,
         guard: RunningGuard,
-        saved: Result<(), Error>,
+        saved: Result<Task, Error>,
     ) {
         drop(guard);
-        let Ending {
-            status,
-            result,
-            total,
-            resume: _,
-            seeding: _,
-        } = ending;
-        // 接收端随界面关闭而丢弃时没有谁要这个事件；状态已写进存储或留着待补写
-        let _closed = self.events.send(Event::Ended {
+        let (task, unsaved) = match saved {
+            Ok(task) => (Some(task), None),
+            // 没写进的已记为待补写，照它读；这时读也读不出的不发 Changed，原因随 Ended 报出
+            Err(error) => (self.task(id).ok(), Some(error.to_string())),
+        };
+        if let Some(task) = task {
+            self.events.send(Event::Changed {
+                task: Box::new(task),
+            });
+        }
+        self.events.send(Event::Ended {
             id,
-            status,
-            result,
-            total,
+            status: ending.status,
+            result: ending.result,
+            total: ending.total,
             leftovers,
-            unsaved: saved.err(),
+            unsaved,
         });
     }
 
@@ -2306,7 +2660,7 @@ impl Shared {
                 // 只写出已录的必是直播
                 Err(_) => {
                     run == Run::Resume
-                        && matches!(last.stage, Stage::Downloading | Stage::Writing)
+                        && matches!(last.stage, JobStage::Downloading | JobStage::Writing)
                         && !(live && (forwarded.recorded || last.session.is_some()))
                 }
             };
@@ -2324,11 +2678,9 @@ impl Shared {
                 Err(error) => (Status::Failed(Failure::of(&error)), None, Vec::new()),
             };
             let ending = Ending {
-                status,
                 result,
                 total,
-                resume: None,
-                seeding: None,
+                ..Ending::of(status)
             };
             shared.conclude(id, ending, leftovers, guard);
         });
@@ -2347,8 +2699,7 @@ impl Shared {
                 control.progress(),
                 done.clone(),
                 move |progress| {
-                    // 接收端随界面关闭而丢弃时没有谁要
-                    let _closed = events.send(Event::FileProgress {
+                    events.send(Event::FileProgress {
                         id,
                         progress: Box::new(progress),
                     });
@@ -2372,11 +2723,8 @@ impl Shared {
                 Err(error) => (Status::Failed(Failure::of(&error)), None, Vec::new()),
             };
             let ending = Ending {
-                status,
                 result,
-                total: None,
-                resume: None,
-                seeding: None,
+                ..Ending::of(status)
             };
             shared.conclude(id, ending, leftovers, guard);
         });
@@ -2406,11 +2754,10 @@ impl Shared {
             };
             let finished = status == Status::Done;
             let ending = Ending {
-                status,
                 result,
-                total: None,
                 resume: ended.resume,
                 seeding: finished.then_some(ended.seeder.is_some()),
+                ..Ending::of(status)
             };
             shared.conclude(id, ending, Vec::new(), guard);
             if let Some(seeder) = ended.seeder {
@@ -2431,11 +2778,8 @@ impl Shared {
                 .expect("云离线任务的运行不会 panic，运行时关闭时本任务也一起丢弃");
             let (status, result) = cloud::ending(outcome);
             let ending = Ending {
-                status,
                 result,
-                total: None,
-                resume: None,
-                seeding: None,
+                ..Ending::of(status)
             };
             shared.conclude(id, ending, leftovers, guard);
         });
@@ -2455,21 +2799,19 @@ impl Shared {
                 .await
                 .expect("网页视频任务的运行不会 panic，运行时关闭时本任务也一起丢弃");
             let (status, result) = web_task::ending(outcome);
-            let ending = Ending {
-                status,
+            let mut ending = Ending {
                 result,
-                total: None,
-                resume: None,
-                seeding: None,
+                ..Ending::of(status)
             };
+            guard.stamp(&mut ending);
             let saved = shared.save(id, &ending);
             if saved.is_ok()
                 && ending.status == Status::Done
                 && let Some(work_dir) = work_dir
                 && let Err(error) = web_task::remove_work_dir(&work_dir).await
             {
-                // 输出已写好，留下的目录不影响结果；接收端随界面关闭而丢弃时没有谁要
-                let _closed = shared.events.send(Event::Orphaned {
+                // 输出已写好，留下的目录不影响结果
+                shared.events.send(Event::Orphaned {
                     paths: vec![work_dir],
                     reason: error.to_string(),
                 });
@@ -2537,17 +2879,20 @@ async fn forward_hls(
         recorded: false,
     };
     throttled(control.progress(), done, |snapshot: Progress| {
-        seen.recorded |= snapshot.stage == Stage::Recording;
+        seen.recorded |= snapshot.stage == JobStage::Recording;
         // 点播的总片数在下载开始时就定了；直播与准备阶段不记
         let count = snapshot.segments.total;
-        if snapshot.stage == Stage::Downloading && count > 0 && seen.total != Some(count) {
+        if snapshot.stage == JobStage::Downloading && count > 0 && seen.total != Some(count) {
             seen.total = Some(count);
             if let Err(error) = shared.write(|tx| store::set_total(tx, id, count)) {
-                // 接收端随界面关闭而丢弃时没有谁能处理；停下时随结束状态再写一次
-                let _closed = shared.events.send(Event::TotalUnsaved { id, error });
+                // 停下时随结束状态再写一次
+                shared.events.send(Event::TotalUnsaved {
+                    id,
+                    error: error.to_string(),
+                });
             }
         }
-        let _closed = shared.events.send(Event::Progress {
+        shared.events.send(Event::Progress {
             id,
             progress: Box::new(snapshot),
         });
@@ -2627,6 +2972,7 @@ fn finished_result(output: &Output, declared: Duration) -> Finished {
 
 fn save_ending(tx: &Transaction<'_>, id: TaskId, ending: &Ending) -> Result<(), Error> {
     store::set_status(tx, id, &ending.status)?;
+    store::add_run(tx, id, ending.ran, ending.finished_at)?;
     if let Some(result) = &ending.result {
         store::set_result(tx, id, result)?;
     }

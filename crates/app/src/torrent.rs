@@ -133,7 +133,7 @@ impl TorrentInfo {
     }
 }
 
-/// BT 任务存着的续传数据里的种子信息（[`crate::Service::inspect_torrent`]）。
+/// BT 任务存着的续传数据里的种子信息（[`crate::Handle::inspect_torrent`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedTorrent {
     pub info: TorrentInfo,

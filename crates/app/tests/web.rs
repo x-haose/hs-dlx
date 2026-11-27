@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use hs_dlx_app::web::Container;
 use hs_dlx_app::ytdlp::{Bundle, Bundled, ExtractError, FormatKey, Sources, Track};
 use hs_dlx_app::{
-    Draft, DraftKind, Error, Event, FailureKind, Service, Status, Store, TaskId, TorrentNetwork,
-    WebConfig, WebState,
+    Ask, Draft, DraftKind, Error, Event, FailureKind, Offer, Service, Stage, Status, Step, Store,
+    TaskId, TorrentNetwork, WebConfig, WebState,
 };
 use hs_m3u8_core::Url;
 use tokio::sync::mpsc;
@@ -553,4 +553,62 @@ fn a_stopped_task_reports_what_it_has_saved() {
             .unwrap(),
         130
     );
+}
+
+/// 粘贴网页地址：认出是网页后交给 yt-dlp 解析（步骤报出来）；只有通用解析器认得的以「回的是网页」失败，任务还没
+/// 定下。组件没装时停下等用户同意安装，可选项是组件的状态。
+#[test]
+fn a_pasted_page_goes_to_the_resolver_or_waits_for_the_components() {
+    let dir = test_dir("paste");
+    let root = dir.join("components");
+    lay_out(&root);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let base = runtime.block_on(start_page());
+    let page = base.join("page").unwrap();
+    {
+        let (service, mut events) = with_events(&dir, root);
+        let mut pasted = runtime
+            .block_on(service.paste(page.as_str(), &dir.join("out"), 1))
+            .unwrap();
+        let id = pasted.remove(0).unwrap().id;
+        let (resolving, status) = runtime.block_on(async {
+            let mut resolving = false;
+            loop {
+                match events.recv().await.unwrap() {
+                    Event::Stage { id: at, stage } if at == id => {
+                        resolving |= *stage
+                            == Stage::Working(Step::Resolving {
+                                plugin: "yt-dlp".to_owned(),
+                            });
+                    }
+                    Event::Ended { id: at, status, .. } if at == id => {
+                        return (resolving, status);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        assert!(resolving, "解析的步骤没报出来");
+        assert!(
+            matches!(&status, Status::Failed(failure) if failure.kind == FailureKind::Malformed),
+            "{status:?}"
+        );
+        assert!(service.task(id).unwrap().spec.pending().is_some());
+    }
+
+    let dir = test_dir("paste-missing");
+    let (service, mut events) = with_events(&dir, dir.join("components"));
+    let mut pasted = runtime
+        .block_on(service.paste(page.as_str(), &dir.join("out"), 1))
+        .unwrap();
+    let id = pasted.remove(0).unwrap().id;
+    assert_eq!(
+        runtime.block_on(ended(&mut events, id)),
+        Status::Waiting(Ask::Components)
+    );
+    assert_eq!(
+        service.stage(id).unwrap(),
+        Some(Stage::Asking(Offer::Components(WebState::Missing)))
+    );
+    runtime.block_on(service.discard(id)).unwrap().unwrap();
 }

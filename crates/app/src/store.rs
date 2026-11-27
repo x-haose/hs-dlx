@@ -14,9 +14,9 @@ use crate::preference::StoredPreference;
 use crate::torrent::{Resume, SessionState};
 use crate::web::Container;
 use crate::{
-    CloudFile, CloudProvider, CloudSpec, Error, Expected, Failure, FailureKind, FileSpec, Finished,
-    HlsSpec, Kind, OutputSpec, Seeding, Settings, Status, Task, TaskId, TaskSpec, Theme,
-    TorrentSpec, WebSpec, naming,
+    Ask, CloudFile, CloudProvider, CloudSpec, Error, Expected, Failure, FailureKind, FileSpec,
+    Finished, HlsSpec, Kind, OutputSpec, PendingSpec, Seeding, Settings, Status, Task, TaskId,
+    TaskSpec, Theme, TorrentSpec, WebSpec, naming,
 };
 use hs_dlx_cloud::pikpak::Account;
 use hs_dlx_ytdlp::{FormatKey, Track};
@@ -26,7 +26,7 @@ use std::num::NonZeroU32;
 type Migration = fn(&Transaction<'_>) -> Result<(), Error>;
 
 /// 各版本的迁移：第 i 项把版本 i 升到 i + 1。已发布的迁移不再改动，新的表结构只追加一项。
-const MIGRATIONS: [Migration; 12] = [
+const MIGRATIONS: [Migration; 13] = [
     create_task_table,
     rebuild_with_work_dir_and_result,
     create_settings_table,
@@ -39,6 +39,7 @@ const MIGRATIONS: [Migration; 12] = [
     add_torrent_proxy,
     rebuild_with_cloud,
     rebuild_with_web,
+    rebuild_with_pending,
 ];
 
 fn create_task_table(tx: &Transaction<'_>) -> Result<(), Error> {
@@ -762,6 +763,164 @@ fn rebuild_with_web(tx: &Transaction<'_>) -> Result<(), Error> {
     keep_task_counter(tx, counter)
 }
 
+/// 第 13 版：一条链接从粘贴起就是一个任务，定下是哪种任务之前种类为 `pending`。重建任务表（SQLite 改不了 CHECK）：
+/// - 种类加 `pending`（见 [`crate::Kind::Pending`]）：保存目录（`folder`）必有且只用于它，没有任务目录，各种类特有的列
+///   都为 NULL；来源是磁力链接或种子文件时记下种子的编号（`torrent_info_hash`，与 BT 任务的同一列、同一个唯一约束：
+///   一个种子至多在一个任务里）与已到手的续传数据（`pending_torrent`：种子文件转成的，或磁力链接取到的）。BT 任务的
+///   其余四列仍只用于 BT 任务。
+/// - 状态加 `preparing`、`waiting`，只用于 `pending`；`running`、`done` 不用于 `pending`。`waiting` 时在等什么
+///   （`ask`，[`crate::Ask`] 在存储里的写法）必有，别的状态为 NULL。
+/// - 完成的时刻（`finished_at`，Unix 秒）与处于运行中的累计毫秒数（`active_ms`）：已有的行为 NULL 与 0。
+/// - 网页视频任务加解析它的插件的编号（`web_plugin`，必有且只用于它）：已有的行为 `yt-dlp`。
+/// - 失败的种类加 `plugin`。其余约束不变，已有的行原样搬过来。
+/// - 设置加：开始前先停下确认（`confirm_before_start`，没设过为否）、同时开着的内置网页数（`web_pages`，1 到 3，没设
+///   过为 2）、控制协议开没开（`control_enabled`，没设过为否）与它的端口（`control_port`）、令牌（`control_token`，
+///   64 个小写十六进制数字），后两项没设过为 NULL。
+/// - 装了的插件（`plugin`：编号、版本、来源、是否启用、装的时刻）与按网站记下的用哪个插件（`site_plugin`：主机 →
+///   插件编号）。
+fn rebuild_with_pending(tx: &Transaction<'_>) -> Result<(), Error> {
+    let counter = task_counter(tx)?;
+    tx.execute_batch(
+        "CREATE TABLE task_v13 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL CHECK (kind IN ('pending', 'hls', 'file', 'torrent', 'cloud', 'web')),
+            title TEXT NOT NULL,
+            url TEXT NOT NULL,
+            headers TEXT NOT NULL,
+            preference TEXT,
+            output_kind TEXT CHECK (output_kind IN ('mp4', 'hls', 'both')),
+            mp4_path TEXT,
+            hls_path TEXT,
+            live INTEGER CHECK (live IN (0, 1)),
+            file_path TEXT,
+            file_length INTEGER CHECK (file_length >= 0),
+            file_accepts_ranges INTEGER CHECK (file_accepts_ranges IN (0, 1)),
+            file_etag TEXT,
+            file_last_modified TEXT,
+            file_content_type TEXT,
+            chunk_size INTEGER CHECK (chunk_size > 0),
+            torrent_info_hash TEXT UNIQUE CHECK (length(torrent_info_hash) = 40
+                                                 AND torrent_info_hash NOT GLOB '*[^0-9a-f]*'),
+            torrent_root TEXT,
+            torrent_resume BLOB,
+            torrent_trusted INTEGER CHECK (torrent_trusted IN (0, 1)),
+            torrent_seeding INTEGER CHECK (torrent_seeding IN (0, 1)),
+            cloud_provider TEXT CHECK (cloud_provider IN ('pikpak')),
+            cloud_user TEXT CHECK (cloud_user != ''),
+            cloud_job TEXT CHECK (cloud_job != ''),
+            cloud_before TEXT CHECK (cloud_before IS NULL OR cloud_job IS NULL),
+            cloud_folder TEXT,
+            cloud_root TEXT,
+            web_extractor TEXT CHECK (web_extractor != ''),
+            web_video_id TEXT CHECK (web_video_id != ''),
+            web_video TEXT CHECK (web_video != ''),
+            web_audio TEXT CHECK (web_audio != ''),
+            web_container TEXT CHECK (web_container IN ('mp4', 'matroska', 'original')),
+            web_path TEXT,
+            web_plugin TEXT CHECK (web_plugin != ''),
+            folder TEXT,
+            ask TEXT CHECK (ask IN ('quality', 'files', 'stream', 'confirm', 'page-challenge', 'page-login',
+                                    'page-play', 'plugin', 'components')),
+            pending_torrent BLOB,
+            work_dir TEXT,
+            status TEXT NOT NULL CHECK (status IN ('preparing', 'waiting', 'running', 'paused', 'failed', 'done',
+                                                   'discard-unfinished')),
+            error TEXT,
+            failure TEXT CHECK (
+                (status = 'failed') = (failure IS NOT NULL)
+                AND (failure IS NULL
+                     OR failure IN ('network', 'certificate', 'disk', 'output-taken', 'source-changed', 'not-expected',
+                                    'malformed', 'stalled', 'nothing-to-write', 'mp4-unsupported', 'unsupported',
+                                    'unrecoverable', 'cloud-login', 'cloud-quota', 'cloud-failed', 'cloud-api',
+                                    'integrity', 'web-login', 'web-geo', 'web-extract', 'web-gone',
+                                    'web-changed', 'web-denied', 'web-blocked', 'web-cookies', 'web-components',
+                                    'plugin', 'other')
+                     OR failure GLOB 'status:[0-9][0-9][0-9]')
+            ),
+            created_at INTEGER NOT NULL,
+            finished_at INTEGER,
+            active_ms INTEGER NOT NULL DEFAULT 0 CHECK (active_ms >= 0),
+            total INTEGER CHECK (total >= 0),
+            duration_ms INTEGER CHECK (duration_ms >= 0),
+            bytes INTEGER CHECK (bytes >= 0),
+            width INTEGER CHECK (width > 0),
+            height INTEGER CHECK (height > 0),
+            write_only INTEGER NOT NULL DEFAULT 0 CHECK (write_only IN (0, 1)),
+            CHECK (status NOT IN ('preparing', 'waiting') OR kind = 'pending'),
+            CHECK (status NOT IN ('running', 'done') OR kind != 'pending'),
+            CHECK ((status = 'waiting') = (ask IS NOT NULL)),
+            CHECK ((kind = 'pending') = (folder IS NOT NULL)),
+            CHECK (kind != 'pending' OR work_dir IS NULL),
+            CHECK (pending_torrent IS NULL OR (kind = 'pending' AND torrent_info_hash IS NOT NULL)),
+            CHECK (kind != 'hls' OR (preference IS NOT NULL AND output_kind IS NOT NULL AND live IS NOT NULL)),
+            CHECK (kind = 'hls' OR (preference IS NULL AND output_kind IS NULL AND live IS NULL AND mp4_path IS NULL
+                                    AND hls_path IS NULL AND total IS NULL AND write_only = 0)),
+            CHECK ((kind = 'file') = (file_path IS NOT NULL AND file_accepts_ranges IS NOT NULL)),
+            CHECK (kind = 'file' OR (file_path IS NULL AND file_accepts_ranges IS NULL AND file_length IS NULL
+                                     AND file_etag IS NULL AND file_last_modified IS NULL AND file_content_type IS NULL
+                                     AND chunk_size IS NULL)),
+            CHECK ((kind = 'torrent') = (torrent_root IS NOT NULL AND torrent_resume IS NOT NULL
+                                         AND torrent_trusted IS NOT NULL AND torrent_seeding IS NOT NULL)),
+            CHECK (kind = 'torrent' OR (torrent_root IS NULL AND torrent_resume IS NULL AND torrent_trusted IS NULL
+                                        AND torrent_seeding IS NULL)),
+            CHECK (kind != 'torrent' OR torrent_info_hash IS NOT NULL),
+            CHECK (kind IN ('torrent', 'pending') OR torrent_info_hash IS NULL),
+            CHECK (torrent_seeding IS NOT 1 OR status = 'done'),
+            CHECK (kind != 'torrent' OR (work_dir IS NULL AND headers = '[]')),
+            CHECK ((kind = 'cloud') = (cloud_provider IS NOT NULL AND cloud_user IS NOT NULL
+                                       AND cloud_folder IS NOT NULL)),
+            CHECK (kind = 'cloud' OR (cloud_provider IS NULL AND cloud_user IS NULL AND cloud_job IS NULL
+                                      AND cloud_before IS NULL AND cloud_folder IS NULL AND cloud_root IS NULL)),
+            CHECK (kind != 'cloud' OR (headers = '[]' AND (cloud_root IS NULL) = (work_dir IS NULL)
+                                       AND (cloud_root IS NULL OR cloud_job IS NOT NULL))),
+            CHECK ((kind = 'web') = (web_extractor IS NOT NULL AND web_video_id IS NOT NULL
+                                     AND web_container IS NOT NULL AND web_path IS NOT NULL
+                                     AND web_plugin IS NOT NULL)),
+            CHECK (kind = 'web' OR (web_extractor IS NULL AND web_video_id IS NULL AND web_video IS NULL
+                                    AND web_audio IS NULL AND web_container IS NULL AND web_path IS NULL
+                                    AND web_plugin IS NULL)),
+            CHECK (kind != 'web' OR ((web_video IS NOT NULL OR web_audio IS NOT NULL) AND work_dir IS NOT NULL))
+        ) STRICT;
+        INSERT INTO task_v13 (id, kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live,
+                              file_path, file_length, file_accepts_ranges, file_etag, file_last_modified,
+                              file_content_type, chunk_size, torrent_info_hash, torrent_root, torrent_resume,
+                              torrent_trusted, torrent_seeding, cloud_provider, cloud_user, cloud_job, cloud_before,
+                              cloud_folder, cloud_root, web_extractor, web_video_id, web_video, web_audio,
+                              web_container, web_path, web_plugin, work_dir, status, error, failure, created_at,
+                              total, duration_ms, bytes, width, height, write_only)
+            SELECT id, kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live,
+                   file_path, file_length, file_accepts_ranges, file_etag, file_last_modified,
+                   file_content_type, chunk_size, torrent_info_hash, torrent_root, torrent_resume,
+                   torrent_trusted, torrent_seeding, cloud_provider, cloud_user, cloud_job, cloud_before,
+                   cloud_folder, cloud_root, web_extractor, web_video_id, web_video, web_audio,
+                   web_container, web_path, CASE WHEN kind = 'web' THEN 'yt-dlp' END, work_dir, status, error,
+                   failure, created_at, total, duration_ms, bytes, width, height, write_only
+            FROM task;
+        DROP TABLE task;
+        ALTER TABLE task_v13 RENAME TO task;
+        ALTER TABLE settings ADD COLUMN confirm_before_start INTEGER NOT NULL DEFAULT 0
+            CHECK (confirm_before_start IN (0, 1));
+        ALTER TABLE settings ADD COLUMN web_pages INTEGER NOT NULL DEFAULT 2 CHECK (web_pages BETWEEN 1 AND 3);
+        ALTER TABLE settings ADD COLUMN control_enabled INTEGER NOT NULL DEFAULT 0
+            CHECK (control_enabled IN (0, 1));
+        ALTER TABLE settings ADD COLUMN control_port INTEGER CHECK (control_port BETWEEN 1 AND 65535);
+        ALTER TABLE settings ADD COLUMN control_token TEXT
+            CHECK (length(control_token) = 64 AND control_token NOT GLOB '*[^0-9a-f]*');
+        CREATE TABLE plugin (
+            id TEXT PRIMARY KEY CHECK (id != ''),
+            version TEXT NOT NULL CHECK (version != ''),
+            source TEXT NOT NULL CHECK (source != ''),
+            enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+            installed_at INTEGER NOT NULL
+        ) STRICT;
+        CREATE TABLE site_plugin (
+            host TEXT PRIMARY KEY CHECK (host != ''),
+            plugin TEXT NOT NULL CHECK (plugin != '')
+        ) STRICT;",
+    )?;
+    keep_task_counter(tx, counter)
+}
+
 /// 第 2 版迁移比较路径用的键：转小写再做 NFC，与写这一版时的 [`naming::path_key`] 相同；那边之后改规则不影响这次
 /// 迁移的结果。
 fn v2_path_key(path: &str) -> String {
@@ -866,9 +1025,10 @@ const COLUMNS: &str = "id, kind, title, url, headers, preference, output_kind, m
                        error, failure, created_at, total, duration_ms, bytes, width, height, write_only, \
                        file_accepts_ranges, torrent_info_hash, torrent_root, torrent_seeding, cloud_provider, \
                        cloud_job, cloud_folder, cloud_root, cloud_user, cloud_before, web_extractor, web_video_id, \
-                       web_video, web_audio, web_container, web_path";
+                       web_video, web_audio, web_container, web_path, folder, ask, finished_at, active_ms, \
+                       web_plugin";
 
-/// 种子 `info_hash`（信息哈希的十六进制，小写）所在的 BT 任务；没有时为 None。
+/// 种子 `info_hash`（信息哈希的十六进制，小写）所在的任务：BT 任务，或来源是它、还没定下的任务；没有时为 None。
 pub fn task_with_torrent(tx: &Transaction<'_>, info_hash: &str) -> Result<Option<TaskId>, Error> {
     Ok(tx
         .query_row(
@@ -880,10 +1040,195 @@ pub fn task_with_torrent(tx: &Transaction<'_>, info_hash: &str) -> Result<Option
         .map(TaskId))
 }
 
-/// 新建任务，状态为运行中，任务目录为 `work_dir`（绝对路径；BT 任务没有，为 None），BT 任务的续传数据为 `resume`
-/// （别的任务为 None）；返回分配的编号。输出或任务目录与已有任务的输出或任务目录相同（按 [`naming::path_key`] 比较）
-/// 时报 [`Error::PathTaken`]：共用任务目录时，放弃其中一个会删掉另一个已下的内容；共用输出时，后写出的那个要到写出时
-/// 才失败。BT 任务的种子已在别的任务里时报 [`Error::TorrentTaken`]。
+/// 任务在表里各种类特有的列与任务目录的值（种类为 [`Columns::kind`]，只属于别的种类的列为 None：表上的 CHECK 按
+/// 种类核对），由 [`insert`] 与 [`settle`] 写进表。
+struct Columns<'a> {
+    kind: &'static str,
+    preference: Option<String>,
+    output_kind: Option<&'static str>,
+    mp4: Option<String>,
+    hls: Option<String>,
+    live: Option<bool>,
+    file_path: Option<String>,
+    file_length: Option<i64>,
+    file_accepts_ranges: Option<bool>,
+    file_etag: Option<&'a str>,
+    file_last_modified: Option<&'a str>,
+    file_content_type: Option<&'a str>,
+    chunk_size: Option<i64>,
+    info_hash: Option<&'a str>,
+    torrent_root: Option<String>,
+    /// 新的续传数据还没有已有的块，可信
+    torrent_trusted: Option<bool>,
+    /// 还在下，不做种
+    torrent_seeding: Option<bool>,
+    cloud_provider: Option<&'static str>,
+    cloud_user: Option<&'a str>,
+    cloud_job: Option<&'a str>,
+    cloud_before: Option<String>,
+    cloud_folder: Option<String>,
+    cloud_root: Option<String>,
+    web_extractor: Option<&'a str>,
+    web_video_id: Option<&'a str>,
+    web_video: Option<String>,
+    web_audio: Option<String>,
+    web_container: Option<&'static str>,
+    web_path: Option<String>,
+    web_plugin: Option<&'a str>,
+    work_dir: Option<String>,
+}
+
+impl<'a> Columns<'a> {
+    /// 定下了的任务 `spec`、任务目录 `work_dir` 的各列。路径不是 UTF-8、不是（以文件名结尾的）绝对路径，网页视频没选
+    /// 视频也没选音频、没有任务目录或没有插件编号，文件大小超出范围时报 [`Error::InvalidInput`]。
+    fn of(spec: &'a TaskSpec, work_dir: Option<&Path>) -> Result<Columns<'a>, Error> {
+        if let Some(dir) = work_dir
+            && !dir.is_absolute()
+        {
+            return Err(Error::InvalidInput(format!(
+                "任务目录不是绝对路径：{}",
+                dir.display()
+            )));
+        }
+        let mut columns = Columns {
+            kind: kind_code(&spec.kind),
+            preference: None,
+            output_kind: None,
+            mp4: None,
+            hls: None,
+            live: None,
+            file_path: None,
+            file_length: None,
+            file_accepts_ranges: None,
+            file_etag: None,
+            file_last_modified: None,
+            file_content_type: None,
+            chunk_size: None,
+            info_hash: None,
+            torrent_root: None,
+            torrent_trusted: None,
+            torrent_seeding: None,
+            cloud_provider: None,
+            cloud_user: None,
+            cloud_job: None,
+            cloud_before: None,
+            cloud_folder: None,
+            cloud_root: None,
+            web_extractor: None,
+            web_video_id: None,
+            web_video: None,
+            web_audio: None,
+            web_container: None,
+            web_path: None,
+            web_plugin: None,
+            work_dir: work_dir.map(utf8).transpose()?,
+        };
+        match &spec.kind {
+            Kind::Pending(_) => unreachable!("还没定下的任务由 insert_pending 建，不经这里"),
+            Kind::Hls(hls) => {
+                let (kind, mp4, local) = output_columns(&hls.output)?;
+                columns.preference = Some(to_json(&hls.preference));
+                columns.output_kind = Some(kind);
+                columns.mp4 = mp4;
+                columns.hls = local;
+                columns.live = Some(hls.live);
+            }
+            Kind::File(file) => {
+                columns.file_path = Some(named_utf8(&file.path)?);
+                // 服务器报的，可能大得离谱
+                columns.file_length = file
+                    .expected
+                    .length
+                    .map(|length| {
+                        i64::try_from(length).map_err(|_| {
+                            Error::InvalidInput(format!("服务器报的文件大小 {length} 字节超出范围"))
+                        })
+                    })
+                    .transpose()?;
+                columns.file_accepts_ranges = Some(file.expected.accepts_ranges);
+                columns.file_etag = file.expected.etag.as_deref();
+                columns.file_last_modified = file.expected.last_modified.as_deref();
+                columns.file_content_type = file.expected.content_type.as_deref();
+                columns.chunk_size = file.chunk_size.map(|size| {
+                    i64::try_from(size.get()).expect("每个请求的字节数远小于 i64 的上限")
+                });
+            }
+            Kind::Torrent(torrent) => {
+                columns.info_hash = Some(torrent.info_hash.as_str());
+                columns.torrent_root = Some(named_utf8(&torrent.root)?);
+                columns.torrent_trusted = Some(true);
+                columns.torrent_seeding = Some(false);
+            }
+            Kind::Cloud(cloud) => {
+                if !cloud.folder.is_absolute() {
+                    return Err(Error::InvalidInput(format!(
+                        "保存目录不是绝对路径：{}",
+                        cloud.folder.display()
+                    )));
+                }
+                columns.cloud_provider = Some(provider_code(cloud.provider));
+                columns.cloud_user = Some(cloud.user.as_str());
+                columns.cloud_job = cloud.job.as_deref();
+                columns.cloud_before = cloud.before.as_ref().map(to_json);
+                columns.cloud_folder = Some(utf8(&cloud.folder)?);
+                columns.cloud_root = cloud.root.as_deref().map(named_utf8).transpose()?;
+            }
+            Kind::Web(web) => {
+                if web.video.is_none() && web.audio.is_none() {
+                    return Err(Error::InvalidInput("网页视频没选视频也没选音频".to_owned()));
+                }
+                if work_dir.is_none() {
+                    return Err(Error::InvalidInput("网页视频要有任务目录".to_owned()));
+                }
+                if web.plugin.is_empty() {
+                    return Err(Error::InvalidInput("网页视频没有插件的编号".to_owned()));
+                }
+                let format = |key: &Option<FormatKey>| {
+                    key.as_ref().map(|key| to_json(&StoredFormat::from(key)))
+                };
+                columns.web_extractor = Some(web.extractor.as_str());
+                columns.web_video_id = Some(web.video_id.as_str());
+                columns.web_video = format(&web.video);
+                columns.web_audio = format(&web.audio);
+                columns.web_container = Some(container_code(web.container));
+                columns.web_path = Some(named_utf8(&web.path)?);
+                columns.web_plugin = Some(web.plugin.as_str());
+            }
+        }
+        Ok(columns)
+    }
+
+    /// 占用的路径：输出与任务目录。
+    fn paths(&self) -> impl Iterator<Item = &String> {
+        [
+            &self.mp4,
+            &self.hls,
+            &self.file_path,
+            &self.torrent_root,
+            &self.cloud_root,
+            &self.web_path,
+            &self.work_dir,
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    /// 占用的路径都不在 `taken`（别的任务占用的路径的比较键）里；有在的时报 [`Error::PathTaken`]。
+    fn free(&self, taken: &HashSet<String>) -> Result<(), Error> {
+        match self
+            .paths()
+            .find(|path| taken.contains(&naming::path_key(path)))
+        {
+            Some(path) => Err(Error::PathTaken(path.into())),
+            None => Ok(()),
+        }
+    }
+}
+
+/// 新建定下了的任务，状态为运行中，任务目录为 `work_dir`（绝对路径；BT 任务没有，为 None），BT 任务的续传数据为
+/// `resume`（别的任务为 None）；返回分配的编号。输出或任务目录与已有任务的输出或任务目录相同（按
+/// [`naming::path_key`] 比较）时报 [`Error::PathTaken`]：共用任务目录时，放弃其中一个会删掉另一个已下的内容；共用输出
+/// 时，后写出的那个要到写出时才失败。BT 任务的种子已在别的任务里时报 [`Error::TorrentTaken`]。
 pub fn insert(
     tx: &Transaction<'_>,
     spec: &TaskSpec,
@@ -891,182 +1236,241 @@ pub fn insert(
     resume: Option<&[u8]>,
     created_at: i64,
 ) -> Result<TaskId, Error> {
-    let work_dir_text = work_dir.map(utf8).transpose()?;
-    if let Some(dir) = work_dir
-        && !dir.is_absolute()
+    let columns = Columns::of(spec, work_dir)?;
+    if let Some(info_hash) = columns.info_hash
+        && let Some(existing) = task_with_torrent(tx, info_hash)?
     {
-        return Err(Error::InvalidInput(format!(
-            "任务目录不是绝对路径：{}",
-            dir.display()
-        )));
+        return Err(Error::TorrentTaken(existing));
     }
-    // 只属于别的种类的列为 NULL（表上的 CHECK 按种类核对）
-    let (preference, output_kind, mp4, hls, live) = match &spec.kind {
-        Kind::Hls(spec) => {
-            let (kind, mp4, hls) = output_columns(&spec.output)?;
-            (
-                Some(to_json(&spec.preference)),
-                Some(kind),
-                mp4,
-                hls,
-                Some(spec.live),
-            )
-        }
-        Kind::File(_) | Kind::Torrent(_) | Kind::Cloud(_) | Kind::Web(_) => {
-            (None, None, None, None, None)
-        }
-    };
-    let (file_path, length, accepts_ranges, etag, last_modified, content_type, chunk) = match &spec
-        .kind
-    {
-        Kind::Hls(_) | Kind::Torrent(_) | Kind::Cloud(_) | Kind::Web(_) => {
-            (None, None, None, None, None, None, None)
-        }
-        Kind::File(file) => (
-            Some(named_utf8(&file.path)?),
-            // 服务器报的，可能大得离谱
-            file.expected
-                .length
-                .map(|length| {
-                    i64::try_from(length).map_err(|_| {
-                        Error::InvalidInput(format!("服务器报的文件大小 {length} 字节超出范围"))
-                    })
-                })
-                .transpose()?,
-            Some(file.expected.accepts_ranges),
-            file.expected.etag.as_deref(),
-            file.expected.last_modified.as_deref(),
-            file.expected.content_type.as_deref(),
-            file.chunk_size
-                .map(|size| i64::try_from(size.get()).expect("每个请求的字节数远小于 i64 的上限")),
-        ),
-    };
-    let (info_hash, root, trusted, seeding) = match &spec.kind {
-        Kind::Hls(_) | Kind::File(_) | Kind::Cloud(_) | Kind::Web(_) => (None, None, None, None),
-        Kind::Torrent(torrent) => {
-            if let Some(existing) = task_with_torrent(tx, &torrent.info_hash)? {
-                return Err(Error::TorrentTaken(existing));
-            }
-            // 新建时的续传数据还没有已有的块；还在下，不做种
-            (
-                Some(torrent.info_hash.as_str()),
-                Some(named_utf8(&torrent.root)?),
-                Some(true),
-                Some(false),
-            )
-        }
-    };
-    let (provider, user, job, before, folder, cloud_root) = match &spec.kind {
-        Kind::Hls(_) | Kind::File(_) | Kind::Torrent(_) | Kind::Web(_) => {
-            (None, None, None, None, None, None)
-        }
-        Kind::Cloud(cloud) => {
-            if !cloud.folder.is_absolute() {
-                return Err(Error::InvalidInput(format!(
-                    "保存目录不是绝对路径：{}",
-                    cloud.folder.display()
-                )));
-            }
-            (
-                Some(provider_code(cloud.provider)),
-                Some(cloud.user.as_str()),
-                cloud.job.as_deref(),
-                cloud.before.as_ref().map(to_json),
-                Some(utf8(&cloud.folder)?),
-                cloud.root.as_deref().map(named_utf8).transpose()?,
-            )
-        }
-    };
-    let (extractor, video_id, video, audio, container, web_path) = match &spec.kind {
-        Kind::Hls(_) | Kind::File(_) | Kind::Torrent(_) | Kind::Cloud(_) => {
-            (None, None, None, None, None, None)
-        }
-        Kind::Web(web) => {
-            if web.video.is_none() && web.audio.is_none() {
-                return Err(Error::InvalidInput("网页视频没选视频也没选音频".to_owned()));
-            }
-            if work_dir.is_none() {
-                return Err(Error::InvalidInput("网页视频要有任务目录".to_owned()));
-            }
-            (
-                Some(web.extractor.as_str()),
-                Some(web.video_id.as_str()),
-                web.video
-                    .as_ref()
-                    .map(|key| to_json(&StoredFormat::from(key))),
-                web.audio
-                    .as_ref()
-                    .map(|key| to_json(&StoredFormat::from(key))),
-                Some(container_code(web.container)),
-                Some(named_utf8(&web.path)?),
-            )
-        }
-    };
-    let taken = taken_paths(tx)?;
-    for path in [
-        &mp4,
-        &hls,
-        &file_path,
-        &root,
-        &cloud_root,
-        &web_path,
-        &work_dir_text,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if taken.contains(&naming::path_key(path)) {
-            return Err(Error::PathTaken(path.into()));
-        }
-    }
+    columns.free(&taken_paths(tx)?)?;
     tx.execute(
         "INSERT INTO task (kind, title, url, headers, preference, output_kind, mp4_path, hls_path, live, file_path,
                            file_length, file_etag, file_last_modified, file_content_type, chunk_size, work_dir,
                            status, created_at, file_accepts_ranges, torrent_info_hash, torrent_root, torrent_resume,
                            torrent_trusted, torrent_seeding, cloud_provider, cloud_job, cloud_folder, cloud_root,
                            cloud_user, cloud_before, web_extractor, web_video_id, web_video, web_audio,
-                           web_container, web_path)
+                           web_container, web_path, web_plugin)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'running', ?17, ?18, ?19, ?20,
-                 ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35)",
+                 ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)",
         params![
-            kind_code(&spec.kind),
+            columns.kind,
             spec.title,
             spec.url.as_str(),
             to_json(&spec.headers),
-            preference,
-            output_kind,
-            mp4,
-            hls,
-            live,
-            file_path,
-            length,
-            etag,
-            last_modified,
-            content_type,
-            chunk,
-            work_dir_text,
+            columns.preference,
+            columns.output_kind,
+            columns.mp4,
+            columns.hls,
+            columns.live,
+            columns.file_path,
+            columns.file_length,
+            columns.file_etag,
+            columns.file_last_modified,
+            columns.file_content_type,
+            columns.chunk_size,
+            columns.work_dir,
             created_at,
-            accepts_ranges,
-            info_hash,
-            root,
+            columns.file_accepts_ranges,
+            columns.info_hash,
+            columns.torrent_root,
             resume,
-            trusted,
-            seeding,
-            provider,
-            job,
-            folder,
-            cloud_root,
-            user,
-            before,
-            extractor,
-            video_id,
-            video,
-            audio,
-            container,
-            web_path,
+            columns.torrent_trusted,
+            columns.torrent_seeding,
+            columns.cloud_provider,
+            columns.cloud_job,
+            columns.cloud_folder,
+            columns.cloud_root,
+            columns.cloud_user,
+            columns.cloud_before,
+            columns.web_extractor,
+            columns.web_video_id,
+            columns.web_video,
+            columns.web_audio,
+            columns.web_container,
+            columns.web_path,
+            columns.web_plugin,
         ],
     )?;
     Ok(TaskId(tx.last_insert_rowid()))
+}
+
+/// 要建的还没定下的任务（[`insert_pending`]）。
+pub struct NewPending<'a> {
+    pub title: &'a str,
+    pub url: &'a Url,
+    pub headers: &'a [(String, String)],
+    /// 保存目录，绝对路径
+    pub folder: &'a Path,
+    /// 来源是磁力链接或种子文件时：种子的编号（信息哈希的十六进制，小写），与已到手的续传数据（种子文件转成的；
+    /// 磁力链接还没取到时为 None）
+    pub torrent: Option<(&'a str, Option<&'a [u8]>)>,
+}
+
+/// 新建还没定下的任务，状态为准备中；返回分配的编号。保存目录不是绝对路径或不是 UTF-8 时报
+/// [`Error::InvalidInput`]，种子已在别的任务里时报 [`Error::TorrentTaken`]。
+pub fn insert_pending(
+    tx: &Transaction<'_>,
+    pending: &NewPending<'_>,
+    created_at: i64,
+) -> Result<TaskId, Error> {
+    if !pending.folder.is_absolute() {
+        return Err(Error::InvalidInput(format!(
+            "保存目录不是绝对路径：{}",
+            pending.folder.display()
+        )));
+    }
+    let (info_hash, resume) = pending.torrent.unzip();
+    if let Some(info_hash) = info_hash
+        && let Some(existing) = task_with_torrent(tx, info_hash)?
+    {
+        return Err(Error::TorrentTaken(existing));
+    }
+    tx.execute(
+        "INSERT INTO task (kind, title, url, headers, folder, torrent_info_hash, pending_torrent, status, created_at)
+         VALUES ('pending', ?1, ?2, ?3, ?4, ?5, ?6, 'preparing', ?7)",
+        params![
+            pending.title,
+            pending.url.as_str(),
+            to_json(&pending.headers),
+            utf8(pending.folder)?,
+            info_hash,
+            resume.flatten(),
+            created_at,
+        ],
+    )?;
+    Ok(TaskId(tx.last_insert_rowid()))
+}
+
+/// 把还没定下的任务 `id` 定下为 `spec`（种类、标题、地址、请求头与各种类特有的内容都照它），任务目录为 `work_dir`、
+/// BT 任务的续传数据为 `resume`（同 [`insert`]），状态改为运行中；保存目录、在等什么与没定下时存的种子续传数据清掉。
+/// 路径被别的任务占着时报 [`Error::PathTaken`]，BT 任务的种子已在别的任务里时报 [`Error::TorrentTaken`]，没有这个还没
+/// 定下的任务时报 [`Error::NotFound`]。
+pub fn settle(
+    tx: &Transaction<'_>,
+    id: TaskId,
+    spec: &TaskSpec,
+    work_dir: Option<&Path>,
+    resume: Option<&[u8]>,
+) -> Result<(), Error> {
+    let columns = Columns::of(spec, work_dir)?;
+    if let Some(info_hash) = columns.info_hash
+        && let Some(existing) = task_with_torrent(tx, info_hash)?
+        && existing != id
+    {
+        return Err(Error::TorrentTaken(existing));
+    }
+    columns.free(&taken_except(tx, Some(id))?)?;
+    let settled = tx.execute(
+        "UPDATE task SET kind = ?2, title = ?3, url = ?4, headers = ?5, preference = ?6, output_kind = ?7,
+                         mp4_path = ?8, hls_path = ?9, live = ?10, file_path = ?11, file_length = ?12,
+                         file_etag = ?13, file_last_modified = ?14, file_content_type = ?15, chunk_size = ?16,
+                         work_dir = ?17, file_accepts_ranges = ?18, torrent_info_hash = ?19, torrent_root = ?20,
+                         torrent_resume = ?21, torrent_trusted = ?22, torrent_seeding = ?23, cloud_provider = ?24,
+                         cloud_job = ?25, cloud_folder = ?26, cloud_root = ?27, cloud_user = ?28,
+                         cloud_before = ?29, web_extractor = ?30, web_video_id = ?31, web_video = ?32,
+                         web_audio = ?33, web_container = ?34, web_path = ?35, web_plugin = ?36,
+                         status = 'running', error = NULL, failure = NULL, folder = NULL, ask = NULL,
+                         pending_torrent = NULL
+         WHERE id = ?1 AND kind = 'pending'",
+        params![
+            id.0,
+            columns.kind,
+            spec.title,
+            spec.url.as_str(),
+            to_json(&spec.headers),
+            columns.preference,
+            columns.output_kind,
+            columns.mp4,
+            columns.hls,
+            columns.live,
+            columns.file_path,
+            columns.file_length,
+            columns.file_etag,
+            columns.file_last_modified,
+            columns.file_content_type,
+            columns.chunk_size,
+            columns.work_dir,
+            columns.file_accepts_ranges,
+            columns.info_hash,
+            columns.torrent_root,
+            resume,
+            columns.torrent_trusted,
+            columns.torrent_seeding,
+            columns.cloud_provider,
+            columns.cloud_job,
+            columns.cloud_folder,
+            columns.cloud_root,
+            columns.cloud_user,
+            columns.cloud_before,
+            columns.web_extractor,
+            columns.web_video_id,
+            columns.web_video,
+            columns.web_audio,
+            columns.web_container,
+            columns.web_path,
+            columns.web_plugin,
+        ],
+    )?;
+    if settled == 0 {
+        return Err(Error::NotFound(id));
+    }
+    Ok(())
+}
+
+/// 换掉还没定下的任务的标题（准备中知道了更好的名字）；没有这个还没定下的任务时报 [`Error::NotFound`]。
+pub fn set_pending_title(tx: &Transaction<'_>, id: TaskId, title: &str) -> Result<(), Error> {
+    if tx.execute(
+        "UPDATE task SET title = ?2 WHERE id = ?1 AND kind = 'pending'",
+        params![id.0, title],
+    )? == 0
+    {
+        return Err(Error::NotFound(id));
+    }
+    Ok(())
+}
+
+/// 还没定下的任务存着的种子续传数据（种子文件转成的，或磁力链接取到的）；还没有时为 None。没有这个还没定下的任务时
+/// 报 [`Error::NotFound`]。
+pub fn pending_torrent(tx: &Transaction<'_>, id: TaskId) -> Result<Option<Vec<u8>>, Error> {
+    tx.query_row(
+        "SELECT pending_torrent FROM task WHERE id = ?1 AND kind = 'pending'",
+        [id.0],
+        |row| row.get(0),
+    )
+    .optional()?
+    .ok_or(Error::NotFound(id))
+}
+
+/// 记下还没定下的磁力任务取到的种子续传数据；没有这个来源是种子的、还没定下的任务时报 [`Error::NotFound`]。
+pub fn set_pending_torrent(tx: &Transaction<'_>, id: TaskId, resume: &[u8]) -> Result<(), Error> {
+    if tx.execute(
+        "UPDATE task SET pending_torrent = ?2
+         WHERE id = ?1 AND kind = 'pending' AND torrent_info_hash IS NOT NULL",
+        params![id.0, resume],
+    )? == 0
+    {
+        return Err(Error::NotFound(id));
+    }
+    Ok(())
+}
+
+/// 任务停下时记下这次运行了多久（`ran`，累加进 [`Task::active`]）与完成的时刻（`finished_at`，Unix 秒；None 时不改
+/// 存储里的）；没有这个任务时报 [`Error::NotFound`]。
+pub fn add_run(
+    tx: &Transaction<'_>,
+    id: TaskId,
+    ran: Duration,
+    finished_at: Option<i64>,
+) -> Result<(), Error> {
+    let millis = i64::try_from(ran.as_millis()).expect("运行时长的毫秒数远小于 i64 的上限");
+    if tx.execute(
+        "UPDATE task SET active_ms = active_ms + ?2, finished_at = COALESCE(?3, finished_at) WHERE id = ?1",
+        params![id.0, millis, finished_at],
+    )? == 0
+    {
+        return Err(Error::NotFound(id));
+    }
+    Ok(())
 }
 
 /// 全部任务，按新建先后。
@@ -1223,22 +1627,25 @@ pub fn set_write_only(tx: &Transaction<'_>, id: TaskId, write_only: bool) -> Res
     Ok(())
 }
 
-/// 改状态；没有这个任务时报 [`Error::NotFound`]。
+/// 改状态；没有这个任务时报 [`Error::NotFound`]。状态与种类对不上（见 [`Status`]）的由表上的 CHECK 拦下。
 pub fn set_status(tx: &Transaction<'_>, id: TaskId, status: &Status) -> Result<(), Error> {
-    let (name, error, failure) = match status {
-        Status::Running => ("running", None, None),
-        Status::Paused => ("paused", None, None),
+    let (name, error, failure, ask) = match status {
+        Status::Preparing => ("preparing", None, None, None),
+        Status::Waiting(ask) => ("waiting", None, None, Some(ask.code())),
+        Status::Running => ("running", None, None, None),
+        Status::Paused => ("paused", None, None, None),
         Status::Failed(failure) => (
             "failed",
             Some(failure.message.as_str()),
             Some(failure.kind.code()),
+            None,
         ),
-        Status::Done => ("done", None, None),
-        Status::DiscardUnfinished => ("discard-unfinished", None, None),
+        Status::Done => ("done", None, None, None),
+        Status::DiscardUnfinished => ("discard-unfinished", None, None, None),
     };
     let changed = tx.execute(
-        "UPDATE task SET status = ?2, error = ?3, failure = ?4 WHERE id = ?1",
-        params![id.0, name, error, failure],
+        "UPDATE task SET status = ?2, error = ?3, failure = ?4, ask = ?5 WHERE id = ?1",
+        params![id.0, name, error, failure, ask],
     )?;
     if changed == 0 {
         return Err(Error::NotFound(id));
@@ -1246,17 +1653,27 @@ pub fn set_status(tx: &Transaction<'_>, id: TaskId, status: &Status) -> Result<(
     Ok(())
 }
 
-/// 把还标着运行中的任务改为暂停：应用上次异常退出时没来得及改；返回改了几个。其中 BT 任务的续传数据改为不可信：
-/// 运行中下了的块没记进去，而存的续传数据可能比磁盘上的多（写盘与改文件在它之后）。
+/// 把还标着运行中、准备中的任务改为暂停：应用上次退出时没来得及改；返回改了几个。其中 BT 任务的续传数据改为
+/// 不可信：运行中下了的块没记进去，而存的续传数据可能比磁盘上的多（写盘与改文件在它之后）。
 pub fn pause_interrupted(tx: &Transaction<'_>) -> Result<usize, Error> {
     tx.execute(
         "UPDATE task SET torrent_trusted = 0 WHERE status = 'running' AND kind = 'torrent'",
         [],
     )?;
     Ok(tx.execute(
-        "UPDATE task SET status = 'paused' WHERE status = 'running'",
+        "UPDATE task SET status = 'paused' WHERE status IN ('running', 'preparing')",
         [],
     )?)
+}
+
+/// 停下等用户、等的是 `ask` 的任务，按新建先后。
+pub fn waiting_for(tx: &Transaction<'_>, ask: crate::Ask) -> Result<Vec<TaskId>, Error> {
+    let mut statement =
+        tx.prepare("SELECT id FROM task WHERE status = 'waiting' AND ask = ?1 ORDER BY id")?;
+    let ids = statement
+        .query_map([ask.code()], |row| row.get(0).map(TaskId))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ids)
 }
 
 /// BT 任务的续传数据；没有这个 BT 任务时报 [`Error::NotFound`]。
@@ -1618,6 +2035,11 @@ struct Row {
     web_audio: Option<String>,
     web_container: Option<String>,
     web_path: Option<String>,
+    folder: Option<String>,
+    ask: Option<String>,
+    finished_at: Option<i64>,
+    active_ms: i64,
+    web_plugin: Option<String>,
 }
 
 impl Row {
@@ -1666,6 +2088,11 @@ impl Row {
             web_audio: row.get(40)?,
             web_container: row.get(41)?,
             web_path: row.get(42)?,
+            folder: row.get(43)?,
+            ask: row.get(44)?,
+            finished_at: row.get(45)?,
+            active_ms: row.get(46)?,
+            web_plugin: row.get(47)?,
         })
     }
 
@@ -1714,11 +2141,14 @@ impl Row {
             self.web_video_id,
             self.web_container,
             self.web_path,
+            self.web_plugin,
         ) {
-            (None, None, None, None) if self.web_video.is_none() && self.web_audio.is_none() => {
+            (None, None, None, None, None)
+                if self.web_video.is_none() && self.web_audio.is_none() =>
+            {
                 None
             }
-            (Some(extractor), Some(video_id), Some(container), Some(path))
+            (Some(extractor), Some(video_id), Some(container), Some(path), Some(plugin))
                 if self.web_video.is_some() || self.web_audio.is_some() =>
             {
                 let path = PathBuf::from(path);
@@ -1740,9 +2170,16 @@ impl Row {
                     audio: format(self.web_audio)?,
                     container: parse_container(&container).ok_or_else(|| corrupt("容器"))?,
                     path,
+                    plugin,
                 })
             }
             _ => return Err(corrupt("网页视频的各列")),
+        };
+        let pending = match (self.kind.as_str(), self.folder.map(PathBuf::from)) {
+            ("pending", Some(folder)) if folder.is_absolute() => Some(PendingSpec { folder }),
+            ("pending", _) => return Err(corrupt("保存目录")),
+            (_, None) => None,
+            (_, Some(_)) => return Err(corrupt("保存目录")),
         };
         let kind = match (
             self.kind.as_str(),
@@ -1811,8 +2248,15 @@ impl Row {
             ("web", None, None, None, None, None, None, None) if cloud.is_none() => {
                 Kind::Web(web.ok_or_else(|| corrupt("网页视频的各列"))?)
             }
+            // 来源是种子时带着种子的编号（只用来查重，不读出）
+            ("pending", None, None, None, None, None, _, None)
+                if cloud.is_none() && web.is_none() =>
+            {
+                Kind::Pending(pending.ok_or_else(|| corrupt("保存目录"))?)
+            }
             _ => return Err(corrupt("种类")),
         };
+        let settled = !matches!(kind, Kind::Pending(_));
         let work_dir = match self.work_dir.map(PathBuf::from) {
             Some(dir) if !named_absolute(&dir) => return Err(corrupt("任务目录")),
             dir => dir,
@@ -1835,17 +2279,24 @@ impl Row {
             }),
             _ => return Err(corrupt("写出的结果")),
         };
-        let status = match (self.status.as_str(), self.error, self.failure) {
-            ("running", None, None) => Status::Running,
-            ("paused", None, None) => Status::Paused,
-            ("failed", Some(message), Some(code)) => Status::Failed(Failure {
+        let status = match (self.status.as_str(), self.error, self.failure, self.ask) {
+            ("preparing", None, None, None) if !settled => Status::Preparing,
+            ("waiting", None, None, Some(ask)) if !settled => {
+                Status::Waiting(Ask::parse(&ask).ok_or_else(|| corrupt("在等什么"))?)
+            }
+            ("running", None, None, None) if settled => Status::Running,
+            ("paused", None, None, None) => Status::Paused,
+            ("failed", Some(message), Some(code), None) => Status::Failed(Failure {
                 kind: FailureKind::parse(&code).ok_or_else(|| corrupt("失败的种类"))?,
                 message,
             }),
-            ("done", None, None) => Status::Done,
-            ("discard-unfinished", None, None) => Status::DiscardUnfinished,
+            ("done", None, None, None) if settled => Status::Done,
+            ("discard-unfinished", None, None, None) => Status::DiscardUnfinished,
             _ => return Err(corrupt("状态")),
         };
+        let active = u64::try_from(self.active_ms)
+            .map(Duration::from_millis)
+            .map_err(|_| corrupt("运行时长"))?;
         Ok(Task {
             id,
             spec: TaskSpec {
@@ -1861,6 +2312,8 @@ impl Row {
             result,
             write_only: self.write_only,
             seeding: self.torrent_seeding.unwrap_or(false),
+            finished_at: self.finished_at,
+            active,
         })
     }
 }
@@ -1891,6 +2344,7 @@ fn named_absolute(path: &Path) -> bool {
 /// 种类在表里的写法（表上有 CHECK）。
 fn kind_code(kind: &Kind) -> &'static str {
     match kind {
+        Kind::Pending(_) => "pending",
         Kind::Hls(_) => "hls",
         Kind::File(_) => "file",
         Kind::Torrent(_) => "torrent",
@@ -1976,6 +2430,7 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
         String,
         Option<String>,
         Option<String>,
+        bool,
     );
     let (
         folder,
@@ -1991,9 +2446,11 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
         web_preference,
         web_browser,
         web_browser_profile,
+        confirm_before_start,
     ): Columns = tx.query_row(
             "SELECT folder, proxy, theme, seed, seed_ratio_percent, seed_minutes, upload_limit, check_updates,
-                    torrent_proxy, web_channel, web_preference, web_browser, web_browser_profile
+                    torrent_proxy, web_channel, web_preference, web_browser, web_browser_profile,
+                    confirm_before_start
              FROM settings WHERE id = 1",
             [],
             |row| {
@@ -2011,6 +2468,7 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
                     row.get(10)?,
                     row.get(11)?,
                     row.get(12)?,
+                    row.get(13)?,
                 ))
             },
         )?;
@@ -2075,7 +2533,17 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
                 })
             })
             .transpose()?,
+        confirm_before_start,
     })
+}
+
+/// 记下没有要选的任务开始前要不要先停下确认。
+pub fn set_confirm_before_start(tx: &Transaction<'_>, confirm: bool) -> Result<(), Error> {
+    tx.execute(
+        "UPDATE settings SET confirm_before_start = ?1 WHERE id = 1",
+        params![confirm],
+    )?;
+    Ok(())
 }
 
 /// 记下解析网页视频时从哪个浏览器的哪个用户资料读 Cookie（None 为不读）。用户资料的目录不是 UTF-8 时报
@@ -3121,6 +3589,7 @@ mod tests {
                 }),
                 container: Container::Mp4,
                 path: m("节目.mp4"),
+                plugin: WebSpec::YT_DLP.into(),
             }),
         }
     }
@@ -3575,5 +4044,635 @@ mod tests {
             set_total(&tx, TaskId(99), 1),
             Err(Error::NotFound(_))
         ));
+    }
+
+    /// 表 `table` 的列名，按建表的顺序。
+    fn columns(conn: &Connection, table: &str) -> Vec<String> {
+        conn.prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// 表 `table` 各行里 `columns` 各列的值，按 `order` 排。
+    fn dump(
+        conn: &Connection,
+        table: &str,
+        columns: &[String],
+        order: &str,
+    ) -> Vec<Vec<rusqlite::types::Value>> {
+        conn.prepare(&format!(
+            "SELECT {} FROM {table} ORDER BY {order}",
+            columns.join(", ")
+        ))
+        .unwrap()
+        .query_map([], |row| (0..columns.len()).map(|at| row.get(at)).collect())
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// 第 12 版的存储（每种任务、每种状态都有，另有云离线的文件、网盘账号与改过的设置）升到第 13 版：原有各列的值
+    /// 逐列不变，新列为没有（网页视频任务的插件为 yt-dlp），每一行都读得回，编号接着数。
+    #[test]
+    fn rebuilding_for_pending_keeps_every_row_column_by_column() {
+        let dir = scratch("v12-rows");
+        let path = dir.join("tasks.sqlite");
+        let preference = to_json(&StoredPreference::try_from(&Preference::default()).unwrap());
+        let format = to_json(&StoredFormat::from(
+            web_spec(Some("137"), None)
+                .web()
+                .unwrap()
+                .video
+                .as_ref()
+                .unwrap(),
+        ));
+        let hash = |digit: char| format!("{digit}123456789abcdef0123456789abcdef01234567");
+        let (before, tables) = {
+            let mut conn = Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in &MIGRATIONS[..12] {
+                migration(&tx).unwrap();
+            }
+            for (title, status, extra_columns, extra_values) in [
+                ("暂停", "paused", ", total", ", 12".to_owned()),
+                ("运行", "running", "", String::new()),
+                (
+                    "失败",
+                    "failed",
+                    ", error, failure",
+                    ", 'HTTP 403', 'status:403'".to_owned(),
+                ),
+                (
+                    "完成",
+                    "done",
+                    ", duration_ms, bytes, width, height",
+                    ", 60000, 5, 1920, 1080".to_owned(),
+                ),
+                (
+                    "没放弃完",
+                    "discard-unfinished",
+                    ", write_only",
+                    ", 1".to_owned(),
+                ),
+            ] {
+                tx.execute(
+                    &format!(
+                        "INSERT INTO task (kind, title, url, headers, preference, output_kind, mp4_path, live,
+                                           work_dir, status, created_at{extra_columns})
+                         VALUES ('hls', ?1, 'https://a.example/v.m3u8', '[[\"Referer\",\"https://a.example/\"]]', ?2,
+                                 'mp4', ?3, 1, ?4, ?5, 7{extra_values})"
+                    ),
+                    params![
+                        title,
+                        preference,
+                        text(&format!("{title}.mp4")),
+                        text(&format!("{title}.hsdl")),
+                        status
+                    ],
+                )
+                .unwrap();
+            }
+            tx.execute(
+                "INSERT INTO task (kind, title, url, headers, file_path, file_length, file_accepts_ranges, file_etag,
+                                   file_last_modified, file_content_type, chunk_size, work_dir, status, error, failure,
+                                   created_at)
+                 VALUES ('file', '数据.zip', 'https://a.example/d', '[]', ?1, 9, 1, '\"v1\"', 'Mon', 'application/zip',
+                         1048576, ?2, 'failed', '变了', 'not-expected', 8)",
+                params![text("数据.zip"), text("数据.zip.hsdl")],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO task (kind, title, url, headers, torrent_info_hash, torrent_root, torrent_resume,
+                                   torrent_trusted, torrent_seeding, status, created_at, bytes)
+                 VALUES ('torrent', '专辑', 'magnet:?xt=urn:btih:x', '[]', ?1, ?2, x'0102', 1, 1, 'done', 9, 3)",
+                params![hash('0'), text("专辑")],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO task (kind, title, url, headers, torrent_info_hash, torrent_root, torrent_resume,
+                                   torrent_trusted, torrent_seeding, status, created_at)
+                 VALUES ('torrent', '另一张', 'magnet:?xt=urn:btih:y', '[]', ?1, ?2, x'03', 0, 0, 'paused', 10)",
+                params![hash('1'), text("另一张")],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO task (kind, title, url, headers, cloud_provider, cloud_user, cloud_before, cloud_folder,
+                                   status, created_at)
+                 VALUES ('cloud', '提交中', 'magnet:?xt=urn:btih:z', '[]', 'pikpak', 'u', '[\"VOld\"]', ?1, 'running',
+                         11)",
+                params![text("")],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO task (kind, title, url, headers, cloud_provider, cloud_user, cloud_job, cloud_folder,
+                                   cloud_root, work_dir, status, created_at)
+                 VALUES ('cloud', '节目', 'magnet:?xt=urn:btih:w', '[]', 'pikpak', 'u', 'VTask', ?1, ?2, ?3, 'paused',
+                         12)",
+                params![text(""), text("节目"), text("节目.hsdl")],
+            )
+            .unwrap();
+            let cloud = tx.last_insert_rowid();
+            tx.execute(
+                "INSERT INTO cloud_file (task_id, seq, file_id, path, size, gcid, fetched, done)
+                 VALUES (?1, 0, 'VA', 'a.bin', 7, '6805ed701e6ea96597858628f8999a955d441d9d', 1, 1)",
+                [cloud],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO task (kind, title, url, headers, web_extractor, web_video_id, web_video, web_container,
+                                   web_path, work_dir, status, created_at)
+                 VALUES ('web', '视频.mp4', 'https://www.youtube.com/watch?v=x', '[[\"Cookie\",\"SID=a\"]]', 'Youtube',
+                         'x', ?1, 'mp4', ?2, ?3, 'paused', 13)",
+                params![format, text("视频.mp4"), text("视频.mp4.hsdl")],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO task (kind, title, url, headers, file_path, file_accepts_ranges, status, created_at)
+                 VALUES ('file', '删了', 'https://a.example/x', '[]', ?1, 0, 'paused', 14)",
+                params![text("删了")],
+            )
+            .unwrap();
+            tx.execute("DELETE FROM task WHERE title = '删了'", [])
+                .unwrap();
+            tx.execute(
+                "INSERT INTO cloud_account (provider, user_id, device_id, refresh_token, access_token,
+                                            access_expires_at)
+                 VALUES ('pikpak', 'u', 'd', 'r', 'a', 5)",
+                [],
+            )
+            .unwrap();
+            tx.execute(
+                "UPDATE settings SET folder = ?1, proxy = 'direct', theme = 'blood-moon', seed = 0, upload_limit = 9,
+                                     check_updates = 0, torrent_port = 51413, web_channel = 'nightly',
+                                     web_preference = 'quality', web_browser = 'chrome'",
+                params![text("影片")],
+            )
+            .unwrap();
+            tx.pragma_update(None, "user_version", 12).unwrap();
+            tx.commit().unwrap();
+            let tables: Vec<(&str, Vec<String>, &str)> = [
+                ("task", "id"),
+                ("settings", "id"),
+                ("cloud_file", "task_id, seq"),
+                ("cloud_account", "provider"),
+            ]
+            .into_iter()
+            .map(|(table, order)| (table, columns(&conn, table), order))
+            .collect();
+            let before: Vec<_> = tables
+                .iter()
+                .map(|(table, columns, order)| dump(&conn, table, columns, order))
+                .collect();
+            assert_eq!(before[0].len(), 11);
+            (before, tables)
+        };
+
+        let mut store = Store::open(&path).unwrap();
+        for ((table, columns, order), before) in tables.iter().zip(&before) {
+            assert_eq!(&dump(&store.conn, table, columns, order), before, "{table}");
+        }
+        // 新加的列
+        let added = dump(
+            &store.conn,
+            "task",
+            &[
+                "kind",
+                "web_plugin",
+                "folder",
+                "ask",
+                "pending_torrent",
+                "finished_at",
+                "active_ms",
+            ]
+            .map(str::to_owned),
+            "id",
+        );
+        use rusqlite::types::Value::{Integer, Null, Text};
+        for row in added {
+            let plugin = if row[0] == Text("web".to_owned()) {
+                Text("yt-dlp".to_owned())
+            } else {
+                Null
+            };
+            assert_eq!(row[1..], [plugin, Null, Null, Null, Null, Integer(0)]);
+        }
+        let tx = store.transaction().unwrap();
+        let tasks = list(&tx).unwrap();
+        assert_eq!(tasks.len(), 11);
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| (task.finished_at, task.active))
+                .collect::<HashSet<_>>(),
+            HashSet::from([(None, Duration::ZERO)])
+        );
+        let read = settings(&tx).unwrap();
+        assert!(read.proxy == Proxy::Direct && !read.confirm_before_start);
+        assert_eq!(
+            (read.theme, read.seeding, read.check_updates),
+            (Theme::BloodMoon, Seeding::Off, false)
+        );
+        let defaults: (i64, i64, Option<i64>, Option<String>) = tx
+            .query_row(
+                "SELECT web_pages, control_enabled, control_port, control_token FROM settings",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(defaults, (2, 0, None, None));
+        for table in ["plugin", "site_plugin"] {
+            let rows: i64 = tx
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 0, "{table}");
+        }
+        // 删掉的任务的编号不再用
+        let id = insert_pending(&tx, &pending(&m(""), None), 15).unwrap();
+        assert_eq!(id, TaskId(13));
+        drop(tx);
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 要建的还没定下的任务：存到 `folder`；`torrent` 为种子的编号与已到手的续传数据。
+    fn pending<'a>(
+        folder: &'a Path,
+        torrent: Option<(&'a str, Option<&'a [u8]>)>,
+    ) -> NewPending<'a> {
+        static URL: std::sync::LazyLock<Url> =
+            std::sync::LazyLock::new(|| Url::parse("https://a.example/watch?v=1").unwrap());
+        static HEADERS: [(String, String); 0] = [];
+        NewPending {
+            title: "watch",
+            url: &URL,
+            headers: &HEADERS,
+            folder,
+            torrent,
+        }
+    }
+
+    /// 还没定下的任务写进去读得回：只有来源与保存目录，状态为准备中；每种「在等什么」都写得进、读得回；标题可换。定下
+    /// 时种类、各列与状态一起换，保存目录与在等的清掉，只能定一次；定下的输出照样查占用。
+    #[test]
+    fn pending_tasks_round_trip_and_settle_once() {
+        let mut store = Store::in_memory().unwrap();
+        let tx = store.transaction().unwrap();
+        assert!(matches!(
+            insert_pending(&tx, &pending(Path::new("m"), None), 1),
+            Err(Error::InvalidInput(_))
+        ));
+        let id = insert_pending(&tx, &pending(&m(""), None), 1).unwrap();
+        let task = get(&tx, id).unwrap().unwrap();
+        assert_eq!(
+            task.spec,
+            TaskSpec {
+                title: "watch".into(),
+                url: "https://a.example/watch?v=1".parse().unwrap(),
+                headers: Vec::new(),
+                kind: Kind::Pending(PendingSpec { folder: m("") }),
+            }
+        );
+        assert_eq!(
+            (task.status, task.work_dir, task.finished_at, task.active),
+            (Status::Preparing, None, None, Duration::ZERO)
+        );
+        assert!(taken_paths(&tx).unwrap().is_empty());
+        for ask in Ask::EVERY {
+            set_status(&tx, id, &Status::Waiting(ask)).unwrap();
+            assert_eq!(get(&tx, id).unwrap().unwrap().status, Status::Waiting(ask));
+            assert_eq!(waiting_for(&tx, ask).unwrap(), [id]);
+        }
+        set_status(&tx, id, &Status::Paused).unwrap();
+        assert!(waiting_for(&tx, Ask::Quality).unwrap().is_empty());
+        // 没定下的不会是运行中或已完成
+        for settled_only in [Status::Running, Status::Done] {
+            assert!(set_status(&tx, id, &settled_only).is_err());
+        }
+        set_pending_title(&tx, id, "更好的名字").unwrap();
+        assert_eq!(get(&tx, id).unwrap().unwrap().spec.title, "更好的名字");
+        assert!(matches!(pending_torrent(&tx, id), Ok(None)));
+        // 不是种子来源的存不了续传数据
+        assert!(matches!(
+            set_pending_torrent(&tx, id, b"r"),
+            Err(Error::NotFound(_))
+        ));
+
+        let other = add(&tx, OutputSpec::Mp4(m("数据.zip")), 2).unwrap();
+        let spec = file_spec(m("数据.zip"));
+        assert!(matches!(
+            settle(&tx, id, &spec, Some(&m("数据.zip.hsdl")), None),
+            Err(Error::PathTaken(_))
+        ));
+        delete(&tx, other).unwrap();
+        settle(&tx, id, &spec, Some(&m("数据.zip.hsdl")), None).unwrap();
+        let settled = get(&tx, id).unwrap().unwrap();
+        assert_eq!(
+            (settled.spec, settled.status, settled.work_dir),
+            (spec.clone(), Status::Running, Some(m("数据.zip.hsdl")))
+        );
+        assert!(matches!(
+            settle(&tx, id, &spec, Some(&m("数据.zip.hsdl")), None),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            set_pending_title(&tx, id, "x"),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(pending_torrent(&tx, id), Err(Error::NotFound(_))));
+        // 定下了的不会是准备中、等用户
+        for unsettled_only in [Status::Preparing, Status::Waiting(Ask::Confirm)] {
+            assert!(set_status(&tx, id, &unsettled_only).is_err());
+        }
+        // 运行时长累加，完成的时刻记一次
+        add_run(&tx, id, Duration::from_millis(1500), None).unwrap();
+        add_run(&tx, id, Duration::from_millis(500), Some(99)).unwrap();
+        let ran = get(&tx, id).unwrap().unwrap();
+        assert_eq!(
+            (ran.active, ran.finished_at),
+            (Duration::from_secs(2), Some(99))
+        );
+        set_confirm_before_start(&tx, true).unwrap();
+        assert!(settings(&tx).unwrap().confirm_before_start);
+    }
+
+    /// 来源是种子的还没定下的任务占着种子的编号：同一个种子不能再建（不论定没定下），续传数据到手后存下；定下为 BT
+    /// 任务时编号留着、续传数据换到 BT 的列，定下为云离线任务时编号让出来。退出时准备中的改为暂停，等用户的照旧。
+    #[test]
+    fn pending_torrents_hold_their_info_hash_until_handed_over() {
+        let mut store = Store::in_memory().unwrap();
+        let tx = store.transaction().unwrap();
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let folder = m("");
+        let magnet = insert_pending(&tx, &pending(&folder, Some((hash, None))), 1).unwrap();
+        assert_eq!(task_with_torrent(&tx, hash).unwrap(), Some(magnet));
+        assert!(matches!(
+            insert_pending(&tx, &pending(&folder, Some((hash, None))), 2),
+            Err(Error::TorrentTaken(at)) if at == magnet
+        ));
+        assert!(matches!(
+            insert(&tx, &torrent_spec(hash, m("别处")), None, Some(b"r"), 2),
+            Err(Error::TorrentTaken(at)) if at == magnet
+        ));
+        assert_eq!(pending_torrent(&tx, magnet).unwrap(), None);
+        set_pending_torrent(&tx, magnet, b"metadata").unwrap();
+        assert_eq!(
+            pending_torrent(&tx, magnet).unwrap().as_deref(),
+            Some(&b"metadata"[..])
+        );
+        set_status(&tx, magnet, &Status::Waiting(Ask::Files)).unwrap();
+        // 种子文件来的：续传数据建任务时就有
+        let other = "1123456789abcdef0123456789abcdef01234567";
+        let file = insert_pending(&tx, &pending(&folder, Some((other, Some(b"file")))), 3).unwrap();
+        assert_eq!(
+            pending_torrent(&tx, file).unwrap().as_deref(),
+            Some(&b"file"[..])
+        );
+        assert_eq!(pause_interrupted(&tx).unwrap(), 1);
+        assert_eq!(get(&tx, file).unwrap().unwrap().status, Status::Paused);
+        assert_eq!(
+            get(&tx, magnet).unwrap().unwrap().status,
+            Status::Waiting(Ask::Files)
+        );
+
+        // 定下为别人占着的种子：不行；定下为自己的：编号留着
+        assert!(matches!(
+            settle(&tx, file, &torrent_spec(hash, m("专辑")), None, Some(b"placed")),
+            Err(Error::TorrentTaken(at)) if at == magnet
+        ));
+        settle(
+            &tx,
+            magnet,
+            &torrent_spec(hash, m("专辑")),
+            None,
+            Some(b"placed"),
+        )
+        .unwrap();
+        assert_eq!(task_with_torrent(&tx, hash).unwrap(), Some(magnet));
+        assert_eq!(
+            torrent_resume(&tx, magnet).unwrap(),
+            Resume {
+                data: b"placed".to_vec(),
+                trusted: true
+            }
+        );
+        let leftover: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT pending_torrent FROM task WHERE id = ?1",
+                [magnet.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftover, None);
+        settle(&tx, file, &cloud_spec(None, None), None, None).unwrap();
+        assert_eq!(task_with_torrent(&tx, other).unwrap(), None);
+        assert!(matches!(
+            get(&tx, file).unwrap().unwrap().spec.kind,
+            Kind::Cloud(_)
+        ));
+    }
+
+    /// 第 13 版加的约束逐条用违反它的写入测：状态与种类、在等什么、保存目录、任务目录、没定下时的种子续传数据、
+    /// 种子的编号、网页视频的插件、运行时长。合乎约束的各写法都写得进（说明拦下的正是违反的那一处）。
+    #[test]
+    fn pending_columns_must_agree() {
+        let mut store = Store::in_memory().unwrap();
+        let tx = store.transaction().unwrap();
+        let hash = "'0123456789abcdef0123456789abcdef01234567'";
+        let insert = |kind: &str, status: &str, columns: &str, values: &str| {
+            tx.execute(
+                &format!(
+                    "INSERT INTO task (kind, title, url, headers, status, created_at{columns})
+                     VALUES ('{kind}', 'x', 'https://a/b', '[]', '{status}', 1{values})"
+                ),
+                [],
+            )
+        };
+        let hls = ", preference, output_kind, live";
+        let hls_values = ", '{}', 'mp4', 0";
+        let web = ", web_extractor, web_video_id, web_video, web_container, web_path, work_dir";
+        let web_values = ", 'Youtube', 'x', '{}', 'mp4', '/m/v.mp4', '/m/v.mp4.hsdl'";
+        for (kind, status, columns, values) in [
+            (
+                "pending",
+                "preparing",
+                ", folder".to_owned(),
+                ", '/m'".to_owned(),
+            ),
+            (
+                "pending",
+                "waiting",
+                ", folder, ask".to_owned(),
+                ", '/m', 'page-login'".to_owned(),
+            ),
+            (
+                "pending",
+                "paused",
+                ", folder".to_owned(),
+                ", '/m'".to_owned(),
+            ),
+            (
+                "pending",
+                "failed",
+                ", folder, error, failure".to_owned(),
+                ", '/m', 'x', 'plugin'".to_owned(),
+            ),
+            (
+                "pending",
+                "paused",
+                ", folder, torrent_info_hash, pending_torrent".to_owned(),
+                format!(", '/m', {hash}, x'00'"),
+            ),
+            (
+                "web",
+                "paused",
+                format!("{web}, web_plugin, active_ms, finished_at"),
+                format!("{web_values}, 'yt-dlp', 5, NULL"),
+            ),
+        ] {
+            insert(kind, status, &columns, &values)
+                .unwrap_or_else(|error| panic!("{kind} {status}{columns}：{error}"));
+        }
+        tx.execute("DELETE FROM task", []).unwrap();
+        for (kind, status, columns, values) in [
+            // 准备中、等用户只用于还没定下的
+            ("hls", "preparing", hls.to_owned(), hls_values.to_owned()),
+            (
+                "hls",
+                "waiting",
+                format!("{hls}, ask"),
+                format!("{hls_values}, 'quality'"),
+            ),
+            // 还没定下的不会是运行中、已完成
+            (
+                "pending",
+                "running",
+                ", folder".to_owned(),
+                ", '/m'".to_owned(),
+            ),
+            (
+                "pending",
+                "done",
+                ", folder".to_owned(),
+                ", '/m'".to_owned(),
+            ),
+            // 等用户时一定写着在等什么，别的状态不写；写法要是认得的
+            (
+                "pending",
+                "waiting",
+                ", folder".to_owned(),
+                ", '/m'".to_owned(),
+            ),
+            (
+                "pending",
+                "paused",
+                ", folder, ask".to_owned(),
+                ", '/m', 'quality'".to_owned(),
+            ),
+            (
+                "pending",
+                "waiting",
+                ", folder, ask".to_owned(),
+                ", '/m', 'captcha'".to_owned(),
+            ),
+            // 保存目录必有且只用于还没定下的
+            ("pending", "paused", String::new(), String::new()),
+            (
+                "hls",
+                "paused",
+                format!("{hls}, folder"),
+                format!("{hls_values}, '/m'"),
+            ),
+            // 还没定下的没有任务目录
+            (
+                "pending",
+                "paused",
+                ", folder, work_dir".to_owned(),
+                ", '/m', '/m/a.hsdl'".to_owned(),
+            ),
+            // 种子的续传数据只在来源是种子的还没定下的任务上
+            (
+                "pending",
+                "paused",
+                ", folder, pending_torrent".to_owned(),
+                ", '/m', x'00'".to_owned(),
+            ),
+            (
+                "hls",
+                "paused",
+                format!("{hls}, pending_torrent"),
+                format!("{hls_values}, x'00'"),
+            ),
+            // 种子的编号只用于 BT 任务与还没定下的
+            (
+                "hls",
+                "paused",
+                format!("{hls}, torrent_info_hash"),
+                format!("{hls_values}, {hash}"),
+            ),
+            // 还没定下的不带 BT 任务的其余各列
+            (
+                "pending",
+                "paused",
+                ", folder, torrent_info_hash, torrent_root".to_owned(),
+                format!(", '/m', {hash}, '/m/a'"),
+            ),
+            // 网页视频的插件必有且只用于它
+            ("web", "paused", web.to_owned(), web_values.to_owned()),
+            (
+                "web",
+                "paused",
+                format!("{web}, web_plugin"),
+                format!("{web_values}, ''"),
+            ),
+            (
+                "hls",
+                "paused",
+                format!("{hls}, web_plugin"),
+                format!("{hls_values}, 'yt-dlp'"),
+            ),
+            // 运行时长不为负
+            (
+                "hls",
+                "paused",
+                format!("{hls}, active_ms"),
+                format!("{hls_values}, -1"),
+            ),
+        ] {
+            assert!(
+                insert(kind, status, &columns, &values).is_err(),
+                "{kind} {status}{columns}{values}"
+            );
+        }
+        // 一个种子至多在一个任务里
+        let held = ", folder, torrent_info_hash";
+        insert("pending", "paused", held, &format!(", '/m', {hash}")).unwrap();
+        assert!(insert("pending", "paused", held, &format!(", '/m', {hash}")).is_err());
+        // 设置：内置网页数 1 到 3，控制协议的令牌为 64 个小写十六进制数字
+        for bad in [
+            "web_pages = 0",
+            "web_pages = 4",
+            "confirm_before_start = 2",
+            "control_port = 0",
+            "control_token = 'abc'",
+        ] {
+            assert!(
+                tx.execute(&format!("UPDATE settings SET {bad} WHERE id = 1"), [])
+                    .is_err(),
+                "{bad}"
+            );
+        }
+        tx.execute(
+            &format!(
+                "UPDATE settings SET web_pages = 3, control_enabled = 1, control_port = 8765, control_token = '{}'",
+                "0f".repeat(32)
+            ),
+            [],
+        )
+        .unwrap();
     }
 }

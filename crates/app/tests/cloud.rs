@@ -14,8 +14,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use hs_dlx_app::pikpak::gcid::Gcid;
 use hs_dlx_app::{
-    CloudProgress, CloudProvider, Draft, DraftKind, Error, Event, FailureKind, Kind, Service,
-    Status, Store, TaskId,
+    CloudProgress, CloudProvider, Error, Event, FailureKind, Kind, Service, Status, Step, Store,
+    Task, TaskId,
 };
 use hs_m3u8_core::Url;
 use serde_json::{Value, json};
@@ -473,15 +473,28 @@ fn log_in(rt: &Runtime, service: &Service) {
     assert_eq!(service.pikpak_user().unwrap().as_deref(), Some("user-1"));
 }
 
-fn draft(folder: PathBuf) -> Draft {
-    Draft {
-        url: Url::parse(MAGNET).unwrap(),
-        headers: Vec::new(),
-        folder,
-        kind: DraftKind::Cloud {
-            provider: CloudProvider::PikPak,
-        },
-    }
+/// 粘贴磁力链接、存到 `folder`，在它取种子信息时交给 PikPak 云离线；返回定下的云离线任务。
+fn offload(rt: &Runtime, service: &Service, folder: PathBuf) -> Task {
+    let mut events = service.subscribe();
+    let mut pasted = rt.block_on(service.paste(MAGNET, &folder, 1)).unwrap();
+    let id = match pasted.pop() {
+        Some(Ok(task)) if pasted.is_empty() => task.id,
+        other => panic!("应建出一个任务：{other:?}"),
+    };
+    service.offload(id, CloudProvider::PikPak).unwrap();
+    rt.block_on(async {
+        loop {
+            match events.recv().await.expect("服务还在，事件通道不会关闭") {
+                Event::Changed { task } if task.id == id && task.spec.pending().is_none() => {
+                    return *task;
+                }
+                Event::Ended { id: at, status, .. } if at == id => {
+                    panic!("没定下就停了：{status:?}")
+                }
+                _ => {}
+            }
+        }
+    })
 }
 
 /// 等到任务 `id` 停下、状态写进存储，返回它的状态；中途的云离线进度交给 `on_progress`。
@@ -518,10 +531,7 @@ fn a_cloud_task_fetches_and_verifies_every_file() {
     let (service, mut events) = service(&dir, &base);
     log_in(&rt, &service);
 
-    let task = rt
-        .block_on(service.create(draft(folder.clone()), 1))
-        .unwrap()
-        .unwrap();
+    let task = offload(&rt, &service, folder.clone());
     assert_eq!(task.spec.title, "Show");
     let mut verified = false;
     let status = rt.block_on(ended(&mut events, task.id, |progress| {
@@ -559,10 +569,7 @@ fn a_file_that_does_not_match_its_gcid_is_removed() {
     ))));
     let (service, mut events) = service(&dir, &base);
     log_in(&rt, &service);
-    let task = rt
-        .block_on(service.create(draft(folder.clone()), 1))
-        .unwrap()
-        .unwrap();
+    let task = offload(&rt, &service, folder.clone());
     match rt.block_on(ended(&mut events, task.id, |_| {})) {
         Status::Failed(failure) => assert_eq!(failure.kind, FailureKind::Integrity),
         other => panic!("应以校验不符失败：{other:?}"),
@@ -582,10 +589,7 @@ fn discarding_a_paused_cloud_task_removes_what_it_fetched() {
     fake.lock().unwrap().hold_b = gate.clone();
     let (service, mut events) = service(&dir, &base);
     log_in(&rt, &service);
-    let task = rt
-        .block_on(service.create(draft(folder.clone()), 1))
-        .unwrap()
-        .unwrap();
+    let task = offload(&rt, &service, folder.clone());
     // 等到在下第二个文件（b.bin 挂着）时暂停：挂着的请求收不到响应，进度要到读超时才变，所以等服务器收到请求
     let requested = fake.lock().unwrap().b_requested.clone();
     rt.block_on(requested.notified());
@@ -602,20 +606,47 @@ fn discarding_a_paused_cloud_task_removes_what_it_fetched() {
     assert!(matches!(service.task(task.id), Err(Error::NotFound(_))));
 }
 
-/// 没登录时新建云离线任务报没登录，什么也不留。
+/// 没登录时交给网盘报没登录，任务照旧在取种子信息；定下了的任务、不是磁力链接的不能交。
 #[test]
-fn creating_a_cloud_task_needs_a_login() {
+fn offloading_needs_a_login_and_an_unsettled_magnet() {
     let dir = test_dir("no-login");
     let rt = runtime();
     let (base, _fake) = rt.block_on(start(remotes(None)));
     let (service, _events) = service(&dir, &base);
-    match rt
-        .block_on(service.create(draft(dir.join("out")), 1))
-        .unwrap()
-    {
+    let mut pasted = rt
+        .block_on(service.paste(MAGNET, &dir.join("out"), 1))
+        .unwrap();
+    let id = pasted.remove(0).unwrap().id;
+    match service.offload(id, CloudProvider::PikPak) {
         Err(Error::NotLoggedIn) => {}
         other => panic!("应报没登录：{other:?}"),
     }
+    let task = service.task(id).unwrap();
+    assert_eq!(task.status, Status::Preparing);
+    assert!(matches!(
+        service.stage(id).unwrap(),
+        Some(hs_dlx_app::Stage::Working(Step::Metadata(_)))
+    ));
+    // 同一条磁力链接已在这个任务里
+    let again = rt
+        .block_on(service.paste(MAGNET, &dir.join("out"), 2))
+        .unwrap();
+    assert!(
+        matches!(again.as_slice(), [Err(rejected)] if matches!(*rejected.reason, Error::TorrentTaken(at) if at == id)),
+        "{again:?}"
+    );
+
+    log_in(&rt, &service);
+    let cloud = service.offload(id, CloudProvider::PikPak).unwrap();
+    assert_eq!(cloud.status, Status::Preparing);
+    // 交出去之后种子不再占着：同一条磁力链接可以另建任务由本机下
+    let mut local = rt
+        .block_on(service.paste(MAGNET, &dir.join("out"), 3))
+        .unwrap();
+    let local = local.remove(0).unwrap().id;
+    assert!(service.offload(local, CloudProvider::PikPak).is_ok());
+    rt.block_on(service.discard(local)).unwrap().unwrap();
+    rt.block_on(service.discard(id)).unwrap().unwrap();
     assert!(service.tasks().unwrap().is_empty());
 }
 
@@ -633,10 +664,7 @@ fn a_submit_cut_off_after_the_server_answered_is_found_not_resent() {
     }
     let (service, mut events) = service(&dir, &base);
     log_in(&rt, &service);
-    let task = rt
-        .block_on(service.create(draft(dir.join("out")), 1))
-        .unwrap()
-        .unwrap();
+    let task = offload(&rt, &service, dir.join("out"));
     assert_eq!(
         rt.block_on(ended(&mut events, task.id, |_| {})),
         Status::Done
@@ -661,10 +689,7 @@ fn a_paused_cloud_task_resumes_after_reopening() {
     let id = {
         let (service, mut events) = service(&dir, &base);
         log_in(&rt, &service);
-        let task = rt
-            .block_on(service.create(draft(folder.clone()), 1))
-            .unwrap()
-            .unwrap();
+        let task = offload(&rt, &service, folder.clone());
         let requested = fake.lock().unwrap().b_requested.clone();
         rt.block_on(requested.notified());
         service.pause(task.id);
@@ -694,10 +719,7 @@ fn a_link_without_a_validator_resumes_by_the_vouched_identity() {
     fake.lock().unwrap().b_unverifiable = true;
     let (service, mut events) = service(&dir, &base);
     log_in(&rt, &service);
-    let task = rt
-        .block_on(service.create(draft(folder.clone()), 1))
-        .unwrap()
-        .unwrap();
+    let task = offload(&rt, &service, folder.clone());
     assert_eq!(
         rt.block_on(ended(&mut events, task.id, |_| {})),
         Status::Done
@@ -731,10 +753,7 @@ fn an_incomplete_cloud_file_fails_the_task() {
     fake.lock().unwrap().b_incomplete = true;
     let (service, mut events) = service(&dir, &base);
     log_in(&rt, &service);
-    let task = rt
-        .block_on(service.create(draft(dir.join("out")), 1))
-        .unwrap()
-        .unwrap();
+    let task = offload(&rt, &service, dir.join("out"));
     match rt.block_on(ended(&mut events, task.id, |_| {})) {
         Status::Failed(failure) => {
             assert_eq!(failure.kind, FailureKind::CloudFailed);
@@ -754,10 +773,7 @@ fn resuming_under_another_account_asks_for_the_right_one() {
     fake.lock().unwrap().hold_b = gate.clone();
     let (service, mut events) = service(&dir, &base);
     log_in(&rt, &service);
-    let task = rt
-        .block_on(service.create(draft(dir.join("out")), 1))
-        .unwrap()
-        .unwrap();
+    let task = offload(&rt, &service, dir.join("out"));
     let requested = fake.lock().unwrap().b_requested.clone();
     rt.block_on(requested.notified());
     service.pause(task.id);
@@ -791,10 +807,7 @@ fn files_in_the_recycle_bin_are_skipped() {
     fake.lock().unwrap().b_trashed = true;
     let (service, mut events) = service(&dir, &base);
     log_in(&rt, &service);
-    let task = rt
-        .block_on(service.create(draft(folder.clone()), 1))
-        .unwrap()
-        .unwrap();
+    let task = offload(&rt, &service, folder.clone());
     assert_eq!(
         rt.block_on(ended(&mut events, task.id, |_| {})),
         Status::Done
@@ -812,10 +825,7 @@ fn a_vanished_cloud_job_is_submitted_again_on_resume() {
     fake.lock().unwrap().jobs_hidden = true;
     let (service, mut events) = service(&dir, &base);
     log_in(&rt, &service);
-    let task = rt
-        .block_on(service.create(draft(dir.join("out")), 1))
-        .unwrap()
-        .unwrap();
+    let task = offload(&rt, &service, dir.join("out"));
     match rt.block_on(ended(&mut events, task.id, |_| {})) {
         Status::Failed(failure) => assert_eq!(failure.kind, FailureKind::CloudFailed),
         other => panic!("应以云端失败停下：{other:?}"),
@@ -846,10 +856,7 @@ fn an_unclear_submit_is_looked_up_again_before_resubmitting() {
     }
     let (service, mut events) = service(&dir, &base);
     log_in(&rt, &service);
-    let task = rt
-        .block_on(service.create(draft(dir.join("out")), 1))
-        .unwrap()
-        .unwrap();
+    let task = offload(&rt, &service, dir.join("out"));
     assert!(matches!(
         rt.block_on(ended(&mut events, task.id, |_| {})),
         Status::Failed(_)
@@ -891,10 +898,7 @@ fn logging_in_again_as_the_same_user_keeps_running_tasks() {
     }
     let (service, mut events) = service(&dir, &base);
     log_in(&rt, &service);
-    let task = rt
-        .block_on(service.create(draft(dir.join("out")), 1))
-        .unwrap()
-        .unwrap();
+    let task = offload(&rt, &service, dir.join("out"));
     let requested = fake.lock().unwrap().b_requested.clone();
     rt.block_on(requested.notified());
     log_in(&rt, &service);
@@ -915,10 +919,7 @@ fn folders_in_the_recycle_bin_are_skipped() {
     fake.lock().unwrap().sub_trashed = true;
     let (service, mut events) = service(&dir, &base);
     log_in(&rt, &service);
-    let task = rt
-        .block_on(service.create(draft(folder.clone()), 1))
-        .unwrap()
-        .unwrap();
+    let task = offload(&rt, &service, folder.clone());
     assert_eq!(
         rt.block_on(ended(&mut events, task.id, |_| {})),
         Status::Done
@@ -948,10 +949,7 @@ fn a_file_deleted_after_listing_is_skipped() {
         }
         let (service, mut events) = service(&dir, &base);
         log_in(&rt, &service);
-        let task = rt
-            .block_on(service.create(draft(folder.clone()), 1))
-            .unwrap()
-            .unwrap();
+        let task = offload(&rt, &service, folder.clone());
         let requested = fake.lock().unwrap().b_requested.clone();
         rt.block_on(requested.notified());
         {
@@ -986,10 +984,7 @@ fn a_failed_cloud_job_is_submitted_again_on_resume() {
     fake.lock().unwrap().jobs_failed = true;
     let (service, mut events) = service(&dir, &base);
     log_in(&rt, &service);
-    let task = rt
-        .block_on(service.create(draft(dir.join("out")), 1))
-        .unwrap()
-        .unwrap();
+    let task = offload(&rt, &service, dir.join("out"));
     match rt.block_on(ended(&mut events, task.id, |_| {})) {
         Status::Failed(failure) => {
             assert_eq!(failure.kind, FailureKind::CloudFailed);
@@ -1032,10 +1027,7 @@ fn an_unresumable_file_work_dir_is_started_over() {
     }
     let (service, mut events) = service(&dir, &base);
     log_in(&rt, &service);
-    let task = rt
-        .block_on(service.create(draft(folder.clone()), 1))
-        .unwrap()
-        .unwrap();
+    let task = offload(&rt, &service, folder.clone());
     let requested = fake.lock().unwrap().b_requested.clone();
     rt.block_on(requested.notified());
     service.pause(task.id);

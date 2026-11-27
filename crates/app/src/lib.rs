@@ -5,6 +5,7 @@ pub mod curl;
 mod diagnosis;
 mod error;
 mod failure;
+pub mod intake;
 mod naming;
 mod netcheck;
 mod preference;
@@ -26,19 +27,22 @@ pub use failure::{Failure, FailureKind, maybe_a_page};
 /// PikPak 的接口（登录、进度阶段、接口地址等界面要用的类型）。
 pub use hs_dlx_cloud::pikpak;
 pub use hs_dlx_ytdlp as ytdlp;
+pub use intake::{Intake, Rejected};
 pub use naming::{file_name, task_title, title_of};
 pub use netcheck::{NetCheck, NetItem, NetworkReport};
 pub use preference::StoredPreference;
 pub use proxy_probe::{ProxyLogin, ProxyProbeError, ProxyProtocol, ProxyWanted};
 pub use service::{
-    CloudPhase, CloudProgress, Downloaded, Event, Events, MetadataFetch, MetadataHandle,
-    PikPakLogin, Resolved, Service, UpdateDownload, WebConfig, WebProgress, WebState,
+    Answer, CloudPhase, CloudProgress, Downloaded, Event, Events, Handle, MetadataFetch,
+    MetadataHandle, Offer, PikPakLogin, Recognized, Resolved, Service, Stage, Step, UpdateDownload,
+    WebConfig, WebProgress, WebState,
 };
 pub use settings::{Seeding, Settings, Theme};
 pub use store::Store;
 pub use task::{
-    CloudFile, CloudProvider, CloudSpec, Draft, DraftKind, Expected, FileSpec, Finished, HlsSpec,
-    Kind, OutputKind, OutputSpec, Status, Task, TaskId, TaskSpec, TorrentSpec, WebSpec,
+    Ask, CloudFile, CloudProvider, CloudSpec, Draft, DraftKind, Expected, FileSpec, Finished,
+    HlsSpec, Kind, OutputKind, OutputSpec, PageAsk, PendingSpec, Status, Task, TaskId, TaskSpec,
+    TorrentSpec, WebSpec,
 };
 pub use torrent::{
     MetadataProgress, SavedTorrent, SeedEnd, TorrentFile, TorrentInfo, TorrentNetwork,

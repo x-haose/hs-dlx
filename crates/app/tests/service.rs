@@ -1,18 +1,22 @@
 //! 任务服务的端到端测试：真实的 SQLite 文件、测试内的本地 HLS 与文件服务（分片取自 tests/fixtures/media/ts_a）。
-//! 服务自带 tokio 运行时，在测试自己的运行时外面建、外面丢弃；等事件与本地服务在测试的运行时里。
+//! 任务都经粘贴建（[`Handle::paste`]），要选的经 [`Handle::choose`] 选。服务自带 tokio 运行时，在测试自己的运行时
+//! 外面建、外面丢弃；等事件与本地服务在测试的运行时里。
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use axum::extract::State;
-use axum::http::{StatusCode, Uri};
+use axum::http::{StatusCode, Uri, header};
+use axum::response::{IntoResponse as _, Response};
 use hs_dlx_app::{
-    Draft, DraftKind, Error, Event, Expected, FailureKind, Kind, OutputKind, OutputSpec, Service,
-    Status, Store, TaskId,
+    Answer, Ask, Error, Event, FailureKind, Kind, Offer, OutputKind, OutputSpec, Recognized,
+    Service, Stage, Status, Step, Store, Task, TaskId,
 };
-use hs_m3u8_core::hls::Preference;
+use hs_m3u8_core::hls::{AudioChoice, Preference};
 use hs_m3u8_core::{Saved, Url};
 use tokio::runtime::Runtime;
 use tokio::sync::{Notify, mpsc};
@@ -20,8 +24,9 @@ use tokio::sync::{Notify, mpsc};
 const PLAYLIST: &str =
     "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\nseg0.ts\n#EXTINF:1,\nseg1.ts\n#EXT-X-ENDLIST\n";
 
-/// 本地 HLS 与文件服务：index.m3u8 与 ts_a 的两个分片，一个文件 file.bin（[`FILE`]，不支持范围请求）；`gate` 打开前
-/// seg1.ts 的请求挂着不回。
+/// 本地 HLS 与文件服务：index.m3u8 与 ts_a 的两个分片，两档都指向它的主播放列表 master.m3u8，一个文件 report.pdf
+/// （[`FILE`] 字节，不支持范围请求），一个网页 page；`gate` 打开前 seg1.ts 与 gated.m3u8（内容同 index.m3u8）的请求挂着
+/// 不回。changing.bin 第一次请求回 [`FILE`] 字节，之后少回一个字节。
 struct Server {
     base: Url,
     gate: Arc<Gate>,
@@ -54,15 +59,38 @@ impl Gate {
 struct Files {
     bodies: Arc<HashMap<String, Vec<u8>>>,
     gate: Arc<Gate>,
+    /// changing.bin 被请求了几次
+    changing: Arc<AtomicUsize>,
 }
 
-async fn serve(State(files): State<Files>, uri: Uri) -> Result<Vec<u8>, StatusCode> {
+async fn serve(State(files): State<Files>, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
-    if path == "seg1.ts" {
+    if matches!(path, "seg1.ts" | "gated.m3u8") {
         files.gate.pass().await;
     }
-    files.bodies.get(path).cloned().ok_or(StatusCode::NOT_FOUND)
+    match path {
+        "page" => (
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            "<html><body>没有视频</body></html>",
+        )
+            .into_response(),
+        "changing.bin" => {
+            let mut body = file_body();
+            if files.changing.fetch_add(1, Ordering::SeqCst) > 0 {
+                body.pop();
+            }
+            body.into_response()
+        }
+        _ => match files.bodies.get(path) {
+            Some(body) => body.clone().into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        },
+    }
 }
+
+const MASTER: &str = "#EXTM3U\n\
+    #EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360\nindex.m3u8?low\n\
+    #EXT-X-STREAM-INF:BANDWIDTH=2400000,RESOLUTION=1280x720\nindex.m3u8\n";
 
 impl Server {
     async fn start(gate_open: bool) -> Server {
@@ -70,6 +98,8 @@ impl Server {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/media/ts_a");
         let bodies = HashMap::from([
             ("index.m3u8".to_owned(), PLAYLIST.as_bytes().to_vec()),
+            ("gated.m3u8".to_owned(), PLAYLIST.as_bytes().to_vec()),
+            ("master.m3u8".to_owned(), MASTER.as_bytes().to_vec()),
             (
                 "seg0.ts".to_owned(),
                 std::fs::read(fixtures.join("seg0.ts")).unwrap(),
@@ -78,7 +108,7 @@ impl Server {
                 "seg1.ts".to_owned(),
                 std::fs::read(fixtures.join("seg1.ts")).unwrap(),
             ),
-            ("file.bin".to_owned(), file_body()),
+            ("report.pdf".to_owned(), file_body()),
         ]);
         let gate = Arc::new(Gate::default());
         if gate_open {
@@ -87,6 +117,7 @@ impl Server {
         let files = Files {
             bodies: Arc::new(bodies),
             gate: gate.clone(),
+            changing: Arc::default(),
         };
         let app = axum::Router::new().fallback(serve).with_state(files);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -96,31 +127,14 @@ impl Server {
     }
 }
 
-/// file.bin 的字节数。
+/// report.pdf 的字节数。
 const FILE: usize = 300_007;
 
-/// file.bin 的内容。
+/// report.pdf 的内容。
 fn file_body() -> Vec<u8> {
     (0..FILE as u32)
         .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
         .collect()
-}
-
-/// 下载 file.bin 的草稿：服务器给的文件名为 `name`，新建前看到的总字节数为 `length`。
-fn file_draft(server: &Server, folder: PathBuf, name: &str, length: u64) -> Draft {
-    Draft {
-        url: server.base.join("file.bin").unwrap(),
-        headers: Vec::new(),
-        folder,
-        kind: DraftKind::File {
-            name: Some(name.to_owned()),
-            expected: Expected {
-                length: Some(length),
-                ..Expected::default()
-            },
-            chunk_size: None,
-        },
-    }
 }
 
 /// 每个测试独立的空目录。
@@ -135,28 +149,57 @@ fn test_dir(name: &str) -> PathBuf {
     dir
 }
 
-fn draft(url: Url, folder: PathBuf) -> Draft {
-    Draft {
-        url,
-        headers: Vec::new(),
-        folder,
-        kind: DraftKind::Hls {
-            title: None,
-            preference: Preference::default(),
-            output: OutputKind::Mp4,
-            live: false,
-        },
-    }
-}
-
 /// HLS 任务 `task` 的输出。
-fn output(task: &hs_dlx_app::Task) -> OutputSpec {
+fn output(task: &Task) -> OutputSpec {
     task.spec.hls().expect("测试只建 HLS 任务").output.clone()
 }
 
-/// 新建任务并等它存进存储。
-fn create(rt: &Runtime, service: &Service, draft: Draft) -> hs_dlx_app::Task {
-    rt.block_on(service.create(draft, 1)).unwrap().unwrap()
+/// 粘贴 `text`、存到 `folder`，返回建出的那一个任务（准备中）。
+fn paste(rt: &Runtime, service: &Service, text: &str, folder: &Path) -> Task {
+    let mut pasted = rt.block_on(service.paste(text, folder, 1)).unwrap();
+    match pasted.pop() {
+        Some(Ok(task)) if pasted.is_empty() => task,
+        other => panic!("应建出一个任务：{other:?}（另有 {} 行）", pasted.len()),
+    }
+}
+
+/// 等到任务 `id` 定下、开始下载，返回定下后的任务。
+async fn settled(events: &mut mpsc::UnboundedReceiver<Event>, id: TaskId) -> Task {
+    loop {
+        match events.recv().await.expect("服务还在，事件通道不会关闭") {
+            Event::Changed { task } if task.id == id && task.spec.pending().is_none() => {
+                return *task;
+            }
+            Event::Ended { id: at, status, .. } if at == id => panic!("没定下就停了：{status:?}"),
+            _ => {}
+        }
+    }
+}
+
+/// 等到任务 `id` 停下等用户，返回给出的可选项。
+async fn asked(events: &mut mpsc::UnboundedReceiver<Event>, id: TaskId) -> Offer {
+    loop {
+        match events.recv().await.expect("服务还在，事件通道不会关闭") {
+            Event::Stage { id: at, stage } if at == id => {
+                if let Stage::Asking(offer) = *stage {
+                    return offer;
+                }
+            }
+            Event::Ended {
+                id: at,
+                status: status @ (Status::Failed(_) | Status::Paused),
+                ..
+            } if at == id => panic!("没等到可选项就停了：{status:?}"),
+            _ => {}
+        }
+    }
+}
+
+/// 粘贴 `url`、存到 `folder`，等它定下、开始下载（没有要选的），返回定下后的任务。
+fn start(rt: &Runtime, service: &Service, url: &Url, folder: &Path) -> Task {
+    let mut events = service.subscribe();
+    let id = paste(rt, service, url.as_str(), folder).id;
+    rt.block_on(settled(&mut events, id))
 }
 
 fn service(store: &Path) -> (Service, mpsc::UnboundedReceiver<Event>) {
@@ -178,12 +221,12 @@ fn service(store: &Path) -> (Service, mpsc::UnboundedReceiver<Event>) {
     .unwrap()
 }
 
-/// 等到任务 `id` 停下，返回它的状态与没写进存储的原因；中途的进度事件交给 `on_progress`。
+/// 等到任务 `id` 停下（停下等用户的不算），返回它的状态与没写进存储的原因；中途的进度事件交给 `on_progress`。
 async fn stopped(
     events: &mut mpsc::UnboundedReceiver<Event>,
     id: TaskId,
     mut on_progress: impl FnMut(&hs_m3u8_core::Progress),
-) -> (Status, Option<Error>) {
+) -> (Status, Option<String>) {
     loop {
         match events.recv().await.expect("服务还在，事件通道不会关闭") {
             Event::Progress { id: at, progress } if at == id => on_progress(&progress),
@@ -192,8 +235,25 @@ async fn stopped(
                 status,
                 unsaved,
                 ..
-            } if at == id => return (status, unsaved),
+            } if at == id && !matches!(status, Status::Waiting(_)) => return (status, unsaved),
             _ => {}
+        }
+    }
+}
+
+/// 等到任务 `id` 停下等用户、状态写进存储，返回它的状态。
+async fn stopped_waiting(events: &mut mpsc::UnboundedReceiver<Event>, id: TaskId) -> Status {
+    loop {
+        if let Event::Ended {
+            id: at,
+            status,
+            unsaved,
+            ..
+        } = events.recv().await.expect("服务还在，事件通道不会关闭")
+            && at == id
+        {
+            assert!(unsaved.is_none(), "没写进存储：{unsaved:?}");
+            return status;
         }
     }
 }
@@ -238,10 +298,11 @@ fn a_task_downloads_and_is_recorded_as_done() {
     let server = rt.block_on(Server::start(true));
     let (service, mut events) = service(&dir.join("tasks.sqlite"));
 
-    let task = create(
+    let task = start(
         &rt,
         &service,
-        draft(server.base.join("index.m3u8").unwrap(), folder.clone()),
+        &server.base.join("index.m3u8").unwrap(),
+        &folder,
     );
     assert_eq!(task.spec.title, "index");
     assert_eq!(output(&task), OutputSpec::Mp4(folder.join("index.mp4")));
@@ -255,6 +316,7 @@ fn a_task_downloads_and_is_recorded_as_done() {
     let result = done.result.expect("完成时记下写出的结果");
     assert!(result.bytes > 0 && result.duration.is_some(), "{result:?}");
     assert_eq!(done.total, Some(2));
+    assert!(done.finished_at.is_some() && !done.active.is_zero());
     assert!(matches!(
         service.resume(task.id),
         Err(Error::AlreadyDone(_))
@@ -279,10 +341,11 @@ fn a_paused_task_resumes_after_reopening() {
     let server = rt.block_on(Server::start(false));
     let id = {
         let (service, mut events) = service(&store);
-        let id = create(
+        let id = start(
             &rt,
             &service,
-            draft(server.base.join("index.m3u8").unwrap(), folder.clone()),
+            &server.base.join("index.m3u8").unwrap(),
+            &folder,
         )
         .id;
         let mut paused = false;
@@ -340,8 +403,8 @@ fn the_same_link_twice_gets_separate_outputs() {
     let (service, _events) = service(&dir.join("tasks.sqlite"));
     let url = server.base.join("index.m3u8").unwrap();
 
-    let first = create(&rt, &service, draft(url.clone(), folder.clone()));
-    let second = create(&rt, &service, draft(url, folder.clone()));
+    let first = start(&rt, &service, &url, &folder);
+    let second = start(&rt, &service, &url, &folder);
 
     assert_eq!(output(&first), OutputSpec::Mp4(folder.join("index.mp4")));
     assert_eq!(output(&second), OutputSpec::Mp4(folder.join("index 2.mp4")));
@@ -359,10 +422,11 @@ fn discarding_a_running_task_removes_it() {
     let rt = runtime();
     let server = rt.block_on(Server::start(false));
     let (service, mut events) = service(&dir.join("tasks.sqlite"));
-    let id = create(
+    let id = start(
         &rt,
         &service,
-        draft(server.base.join("index.m3u8").unwrap(), folder.clone()),
+        &server.base.join("index.m3u8").unwrap(),
+        &folder,
     )
     .id;
     rt.block_on(first_segment(&mut events, id));
@@ -388,18 +452,46 @@ fn discarding_a_running_task_removes_it() {
     assert!(service.tasks().unwrap().is_empty());
 }
 
-/// 保存目录不是绝对路径的拒收，什么也不存。
+/// 保存目录不是绝对路径的拒收，什么也不存；不是链接的一行不收，别的行照建。建了任务的事件在它的其他事件之前。
 #[test]
-fn a_relative_folder_is_refused() {
+fn lines_that_cannot_become_tasks_are_refused_one_by_one() {
     let dir = test_dir("relative");
     let rt = runtime();
+    let server = rt.block_on(Server::start(true));
     let (service, _events) = service(&dir.join("tasks.sqlite"));
-    let url = Url::parse("http://127.0.0.1:9/index.m3u8").unwrap();
+    let url = server.base.join("index.m3u8").unwrap();
     let refused = rt
-        .block_on(service.create(draft(url, PathBuf::from("out")), 1))
+        .block_on(service.paste(url.as_str(), Path::new("out"), 1))
         .unwrap();
-    assert!(matches!(refused, Err(Error::InvalidInput(_))));
+    assert!(
+        matches!(refused.as_slice(), [Err(rejected)] if matches!(*rejected.reason, Error::InvalidInput(_))),
+        "{refused:?}"
+    );
     assert!(service.tasks().unwrap().is_empty());
+
+    let mut events = service.subscribe();
+    let pasted = rt
+        .block_on(service.paste(&format!("这不是链接\n{url}\n"), &dir.join("out"), 1))
+        .unwrap();
+    let [Err(rejected), Ok(task)] = pasted.as_slice() else {
+        panic!("{pasted:?}");
+    };
+    assert_eq!(rejected.text, "这不是链接");
+    assert_eq!(
+        (task.status.clone(), task.spec.title.as_str()),
+        (Status::Preparing, "index")
+    );
+    assert_eq!(
+        task.spec.pending().map(|pending| pending.folder.clone()),
+        Some(dir.join("out"))
+    );
+    let first = rt.block_on(events.recv()).unwrap();
+    assert!(
+        matches!(&first, Event::Added { task: added } if added.id == task.id),
+        "{first:?}"
+    );
+    rt.block_on(settled(&mut events, task.id));
+    rt.block_on(service.discard(task.id)).unwrap().unwrap();
 }
 
 /// 任务停下时存储被别的连接占着：结束状态没写进去，事件里带着原因，服务记着它、列任务时按它返回；存储放开后关闭服务
@@ -413,10 +505,11 @@ fn an_ending_that_cannot_be_saved_is_saved_later() {
     let server = rt.block_on(Server::start(false));
     let id = {
         let (service, mut events) = service(&store);
-        let id = create(
+        let id = start(
             &rt,
             &service,
-            draft(server.base.join("index.m3u8").unwrap(), folder.clone()),
+            &server.base.join("index.m3u8").unwrap(),
+            &folder,
         )
         .id;
         rt.block_on(first_segment(&mut events, id));
@@ -427,7 +520,7 @@ fn an_ending_that_cannot_be_saved_is_saved_later() {
         server.gate.open();
         let (status, unsaved) = rt.block_on(stopped(&mut events, id, |_| {}));
         assert_eq!(status, Status::Done);
-        assert!(matches!(unsaved, Some(Error::Store(_))), "{unsaved:?}");
+        assert!(unsaved.is_some());
         drop(holding);
         let task = service.tasks().unwrap().remove(0);
         assert_eq!(task.status, Status::Done);
@@ -449,7 +542,7 @@ fn closing_pauses_running_tasks() {
     let server = rt.block_on(Server::start(false));
     let (service, mut events) = service(&dir.join("tasks.sqlite"));
     let url = server.base.join("index.m3u8").unwrap();
-    let id = create(&rt, &service, draft(url.clone(), folder.clone())).id;
+    let id = start(&rt, &service, &url, &folder).id;
     rt.block_on(first_segment(&mut events, id));
 
     service.close().unwrap();
@@ -458,39 +551,63 @@ fn closing_pauses_running_tasks() {
     assert_eq!(task.status, Status::Paused);
     assert!(folder.join("index.hsdl").is_dir());
     assert!(matches!(service.resume(id), Err(Error::Closed)));
-    let refused = rt.block_on(service.create(draft(url, folder), 1)).unwrap();
-    assert!(matches!(refused, Err(Error::Closed)), "{refused:?}");
+    let refused = rt
+        .block_on(service.paste(url.as_str(), &folder, 1))
+        .unwrap();
+    assert!(
+        matches!(refused.as_slice(), [Err(rejected)] if matches!(*rejected.reason, Error::Closed)),
+        "{refused:?}"
+    );
 }
 
-/// 新建时提交被别的连接挡住（它持着读事务）：报存储错误，已开始的任务取消、它建出的任务目录删掉，存储里没有它。
+/// 定下时提交被别的连接挡住（它持着读事务）：任务以失败停下、照旧没定下，已开始的下载取消、它建出的任务目录删掉；
+/// 存储放开后继续，从头准备、下完。
 #[test]
-fn a_create_that_cannot_commit_leaves_nothing() {
-    let dir = test_dir("create-uncommitted");
+fn a_settling_that_cannot_commit_leaves_the_task_unsettled() {
+    let dir = test_dir("settle-uncommitted");
     let folder = dir.join("out");
     let store = dir.join("tasks.sqlite");
     let rt = runtime();
     let server = rt.block_on(Server::start(false));
-    let (service, _events) = service(&store);
+    let (service, mut events) = service(&store);
+    // 探测挂在服务器上的时候占住存储
+    let id = paste(
+        &rt,
+        &service,
+        server.base.join("gated.m3u8").unwrap().as_str(),
+        &folder,
+    )
+    .id;
     let mut other = rusqlite::Connection::open(&store).unwrap();
     let reading = other.transaction().unwrap();
     let count: i64 = reading
         .query_row("SELECT count(*) FROM task", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(count, 0);
+    assert_eq!(count, 1);
+    server.gate.open();
 
-    let created = rt
-        .block_on(service.create(
-            draft(server.base.join("index.m3u8").unwrap(), folder.clone()),
-            1,
-        ))
-        .unwrap();
-    assert!(matches!(created, Err(Error::Store(_))), "{created:?}");
+    let (status, unsaved) = rt.block_on(stopped(&mut events, id, |_| {}));
+    assert!(
+        matches!(&status, Status::Failed(failure) if failure.kind == FailureKind::Other),
+        "{status:?}"
+    );
+    // 失败的状态这时也写不进，记着待补写
+    assert!(unsaved.is_some());
     drop(reading);
-    // 关闭时等不要了的任务收尾（取消、删任务目录）
-    service.close().unwrap();
+    let task = service.task(id).unwrap();
+    assert_eq!(task.status, status);
+    assert!(task.spec.pending().is_some() && task.work_dir.is_none());
 
-    assert!(service.tasks().unwrap().is_empty());
-    assert!(!folder.join("index.hsdl").exists());
+    service.resume(id).unwrap();
+    assert_eq!(rt.block_on(ended(&mut events, id, |_| {})), Status::Done);
+    let done = service.task(id).unwrap();
+    assert_eq!(output(&done), OutputSpec::Mp4(folder.join("gated.mp4")));
+    // 没定下的那一次没留下任务目录
+    let left: Vec<_> = std::fs::read_dir(&folder)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(left, ["gated.mp4"]);
 }
 
 /// 任务目录里有不是本库写的文件时放弃删不干净：任务留在列表里、记为放弃没做完（不能继续）、报出留下的东西；拿走那个
@@ -502,10 +619,11 @@ fn a_discard_that_leaves_the_work_dir_keeps_the_task() {
     let rt = runtime();
     let server = rt.block_on(Server::start(false));
     let (service, mut events) = service(&dir.join("tasks.sqlite"));
-    let id = create(
+    let id = start(
         &rt,
         &service,
-        draft(server.base.join("index.m3u8").unwrap(), folder.clone()),
+        &server.base.join("index.m3u8").unwrap(),
+        &folder,
     )
     .id;
     rt.block_on(first_segment(&mut events, id));
@@ -532,10 +650,10 @@ fn a_discard_that_leaves_the_work_dir_keeps_the_task() {
     assert!(!folder.join("index.hsdl").exists());
 }
 
-/// 同一地址同时新建两次（取名都在插入之前）：插入时后一个撞上前一个占用的路径，重新取名，两个各用各的输出。保存目录的
+/// 同一地址同时粘贴两次（取名都在定下之前）：定下时后一个撞上前一个占用的路径，重新取名，两个各用各的输出。保存目录的
 /// 写法不规整（带 `.`）也照样认出已有任务占用的路径。
 #[test]
-fn concurrent_creates_get_separate_outputs() {
+fn concurrent_pastes_get_separate_outputs() {
     let dir = test_dir("concurrent");
     let folder = dir.join("out");
     let rt = runtime();
@@ -543,10 +661,25 @@ fn concurrent_creates_get_separate_outputs() {
     let (service, _events) = service(&dir.join("tasks.sqlite"));
     let url = server.base.join("index.m3u8").unwrap();
 
-    let first = service.create(draft(url.clone(), folder.clone()), 1);
-    let second = service.create(draft(url.clone(), folder.join(".")), 1);
-    let (first, second) = rt.block_on(async { (first.await, second.await) });
-    let (first, second) = (first.unwrap().unwrap(), second.unwrap().unwrap());
+    let mut events = service.subscribe();
+    let first = service.paste(url.as_str(), &folder, 1);
+    let second = service.paste(url.as_str(), &folder.join("."), 1);
+    let (first, second) = rt.block_on(async {
+        let (mut first, mut second) = (first.await.unwrap(), second.await.unwrap());
+        let ids = [first.remove(0).unwrap().id, second.remove(0).unwrap().id];
+        // 两个任务定下的先后不定：各等到自己的那一次
+        let mut settled: Vec<Task> = Vec::new();
+        while settled.len() < 2 {
+            if let Event::Changed { task } = events.recv().await.unwrap()
+                && ids.contains(&task.id)
+                && task.spec.pending().is_none()
+                && settled.iter().all(|seen| seen.id != task.id)
+            {
+                settled.push(*task);
+            }
+        }
+        (settled.remove(0), settled.remove(0))
+    });
     let mut outputs = vec![output(&first), output(&second)];
     outputs.sort_by_key(|output| format!("{output:?}"));
     assert_eq!(
@@ -570,10 +703,11 @@ fn writing_recorded_content_of_a_download_fails_visibly() {
     let rt = runtime();
     let server = rt.block_on(Server::start(false));
     let (service, mut events) = service(&dir.join("tasks.sqlite"));
-    let id = create(
+    let id = start(
         &rt,
         &service,
-        draft(server.base.join("index.m3u8").unwrap(), folder.clone()),
+        &server.base.join("index.m3u8").unwrap(),
+        &folder,
     )
     .id;
     rt.block_on(first_segment(&mut events, id));
@@ -606,10 +740,11 @@ fn a_paused_task_can_switch_to_local_hls() {
     let rt = runtime();
     let server = rt.block_on(Server::start(false));
     let (service, mut events) = service(&dir.join("tasks.sqlite"));
-    let id = create(
+    let id = start(
         &rt,
         &service,
-        draft(server.base.join("index.m3u8").unwrap(), folder.clone()),
+        &server.base.join("index.m3u8").unwrap(),
+        &folder,
     )
     .id;
     rt.block_on(first_segment(&mut events, id));
@@ -691,14 +826,15 @@ fn the_proxy_setting_applies_to_probes_and_new_tasks() {
     assert!(probed.unwrap().is_err());
     assert_eq!(seen.lock().unwrap().len(), 1, "{:?}", seen.lock().unwrap());
     assert!(seen.lock().unwrap()[0].contains(playlist.as_str()));
-    // 开始的任务也经代理
-    let task = create(&rt, &service, draft(playlist.clone(), dir.join("out")));
+    // 粘贴的任务认地址也经代理：被拒，以失败停下，还没定下
+    let task = paste(&rt, &service, playlist.as_str(), &dir.join("out"));
     let status = rt.block_on(ended(&mut events, task.id, |_| {}));
     assert!(
         matches!(&status, Status::Failed(f) if f.kind == FailureKind::Status(403)),
         "{status:?}"
     );
     assert_eq!(seen.lock().unwrap().len(), 2);
+    assert!(service.task(task.id).unwrap().spec.pending().is_some());
     drop(service);
 
     // 重开后照旧；改为直连后不再经代理
@@ -710,7 +846,7 @@ fn the_proxy_setting_applies_to_probes_and_new_tasks() {
     assert_eq!(seen.lock().unwrap().len(), 2);
 }
 
-/// 文件任务：文件名取服务器给的，下完装到保存目录、删掉任务目录，记下字节数；同名的第二个加编号。
+/// 文件任务：粘贴后直接开始，文件名由地址得出，下完装到保存目录、删掉任务目录，记下字节数；同名的第二个加编号。
 #[test]
 fn a_file_task_downloads_into_the_folder() {
     let dir = test_dir("file");
@@ -718,17 +854,15 @@ fn a_file_task_downloads_into_the_folder() {
     let rt = runtime();
     let server = rt.block_on(Server::start(true));
     let (service, mut events) = service(&dir.join("tasks.sqlite"));
+    let url = server.base.join("report.pdf").unwrap();
 
-    let task = create(
-        &rt,
-        &service,
-        file_draft(&server, folder.clone(), "报告.pdf", FILE as u64),
-    );
-    assert_eq!(task.spec.title, "报告.pdf");
+    let task = start(&rt, &service, &url, &folder);
+    assert_eq!(task.spec.title, "report.pdf");
     let Kind::File(file) = &task.spec.kind else {
-        panic!("新建的是文件任务");
+        panic!("定下的是文件任务");
     };
-    assert_eq!(file.path, folder.join("报告.pdf"));
+    assert_eq!(file.path, folder.join("report.pdf"));
+    assert_eq!(file.expected.length, Some(FILE as u64));
     let mut progressed = false;
     let status = rt.block_on(async {
         loop {
@@ -749,24 +883,23 @@ fn a_file_task_downloads_into_the_folder() {
     });
     assert_eq!(status, Status::Done);
     assert!(progressed, "下载中发了进度");
-    assert_eq!(std::fs::read(folder.join("报告.pdf")).unwrap(), file_body());
-    assert!(!folder.join("报告.pdf.hsdl").exists());
+    assert_eq!(
+        std::fs::read(folder.join("report.pdf")).unwrap(),
+        file_body()
+    );
+    assert!(!folder.join("report.pdf.hsdl").exists());
     let done = service.tasks().unwrap().remove(0);
     assert_eq!(done.result.map(|r| r.bytes), Some(FILE as u64));
 
-    let second = create(
-        &rt,
-        &service,
-        file_draft(&server, folder.clone(), "报告.pdf", FILE as u64),
-    );
-    assert_eq!(second.spec.title, "报告 2.pdf");
+    let second = start(&rt, &service, &url, &folder);
+    assert_eq!(second.spec.title, "report 2.pdf");
     assert_eq!(
         rt.block_on(ended(&mut events, second.id, |_| {})),
         Status::Done
     );
 }
 
-/// 第一次下载时地址回的与新建前看到的不是同一个文件（大小不同）：以「不是之前的文件」失败；放弃后不留东西。
+/// 第一次下载时地址回的与认地址时看到的不是同一个文件（大小不同）：以「不是之前的文件」失败；放弃后不留东西。
 #[test]
 fn a_file_that_changed_since_it_was_seen_fails_visibly() {
     let dir = test_dir("file-changed");
@@ -775,17 +908,18 @@ fn a_file_that_changed_since_it_was_seen_fails_visibly() {
     let server = rt.block_on(Server::start(true));
     let (service, mut events) = service(&dir.join("tasks.sqlite"));
 
-    let task = create(
+    let task = start(
         &rt,
         &service,
-        file_draft(&server, folder.clone(), "a.bin", FILE as u64 + 1),
+        &server.base.join("changing.bin").unwrap(),
+        &folder,
     );
     let status = rt.block_on(ended(&mut events, task.id, |_| {}));
     assert!(
         matches!(&status, Status::Failed(f) if f.kind == FailureKind::NotExpected),
         "{status:?}"
     );
-    assert!(!folder.join("a.bin").exists());
+    assert!(!folder.join("changing.bin").exists());
     // 停着的文件任务不能只写出已录的，也不能改存本地 HLS
     assert!(matches!(
         service.write_recorded(task.id),
@@ -797,5 +931,288 @@ fn a_file_that_changed_since_it_was_seen_fails_visibly() {
     ));
     let leftovers = rt.block_on(service.discard(task.id)).unwrap().unwrap();
     assert!(leftovers.is_empty(), "{leftovers:?}");
-    assert!(!folder.join("a.bin.hsdl").exists());
+    assert!(!folder.join("changing.bin.hsdl").exists());
+}
+
+/// 主播放列表有两档：停下等选画质，可选项在内存里、状态在存储里；对不上的选择不收。重开应用后还在等、可选项不在，
+/// 继续即重新准备、再停在同一处；选了一档即定下、下完。
+#[test]
+fn a_master_playlist_waits_for_a_quality_and_asks_again_after_reopening() {
+    let dir = test_dir("quality");
+    let folder = dir.join("out");
+    let store = dir.join("tasks.sqlite");
+    let rt = runtime();
+    let server = rt.block_on(Server::start(true));
+    let url = server.base.join("master.m3u8").unwrap();
+    let id = {
+        let (service, mut events) = service(&store);
+        let id = paste(&rt, &service, url.as_str(), &folder).id;
+        let offer = rt.block_on(asked(&mut events, id));
+        let Offer::Quality(probe) = &offer else {
+            panic!("两档的 HLS 等选画质：{offer:?}");
+        };
+        assert_eq!(probe.master.as_ref().unwrap().variants.len(), 2);
+        // 停下的状态随后写进存储
+        assert_eq!(
+            rt.block_on(stopped_waiting(&mut events, id)),
+            Status::Waiting(Ask::Quality)
+        );
+        let task = service.task(id).unwrap();
+        assert_eq!(task.status, Status::Waiting(Ask::Quality));
+        assert_eq!(service.stage(id).unwrap(), Some(Stage::Asking(offer)));
+        // 停下等用户不是在运行：暂停不起作用，也不能只从列表移除
+        service.pause(id);
+        assert_eq!(service.task(id).unwrap().status, task.status);
+        assert!(matches!(
+            rt.block_on(service.forget(id)).unwrap(),
+            Err(Error::NotFinished(_))
+        ));
+        for wrong in [
+            Answer::Install,
+            Answer::File {
+                folder: folder.clone(),
+            },
+            Answer::Hls {
+                preference: Preference::default(),
+                output: OutputKind::Mp4,
+                folder: PathBuf::from("out"),
+            },
+        ] {
+            assert!(
+                matches!(
+                    service.choose(id, wrong.clone()),
+                    Err(Error::InvalidInput(_))
+                ),
+                "{wrong:?}"
+            );
+        }
+        id
+    };
+
+    let (service, mut events) = service(&store);
+    assert_eq!(
+        service.task(id).unwrap().status,
+        Status::Waiting(Ask::Quality)
+    );
+    assert_eq!(service.stage(id).unwrap(), None);
+    let stale = Answer::Hls {
+        preference: Preference::default(),
+        output: OutputKind::Mp4,
+        folder: folder.clone(),
+    };
+    assert!(matches!(
+        service.choose(id, stale),
+        Err(Error::InvalidInput(_))
+    ));
+    assert_eq!(service.resume(id).unwrap().status, Status::Preparing);
+    let Offer::Quality(probe) = rt.block_on(asked(&mut events, id)) else {
+        panic!("重新准备后还是等选画质");
+    };
+    assert_eq!(
+        rt.block_on(stopped_waiting(&mut events, id)),
+        Status::Waiting(Ask::Quality)
+    );
+    let low = probe
+        .master
+        .as_ref()
+        .unwrap()
+        .variants
+        .iter()
+        .min_by_key(|variant| variant.bandwidth)
+        .unwrap();
+    let chosen = service
+        .choose(
+            id,
+            Answer::Hls {
+                preference: Preference {
+                    variant: low.choice(),
+                    audio: AudioChoice::Default,
+                },
+                output: OutputKind::Hls,
+                folder: folder.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(chosen.status, Status::Preparing);
+    assert_eq!(rt.block_on(ended(&mut events, id, |_| {})), Status::Done);
+    let done = service.task(id).unwrap();
+    assert_eq!(output(&done), OutputSpec::Hls(folder.join("master")));
+    assert!(folder.join("master").join("index.m3u8").is_file());
+    assert_eq!(service.stage(id).unwrap(), None);
+}
+
+/// 准备中暂停：停掉在做的那一步，状态为暂停、还没定下；继续即从头准备、下完。准备中关掉应用：重开后是暂停。准备中
+/// 放弃：直接删记录，磁盘上什么也没有。
+#[test]
+fn a_preparing_task_pauses_resumes_and_discards() {
+    let dir = test_dir("preparing");
+    let folder = dir.join("out");
+    let store = dir.join("tasks.sqlite");
+    let rt = runtime();
+    let server = rt.block_on(Server::start(false));
+    let url = server.base.join("gated.m3u8").unwrap();
+    let (kept, interrupted) = {
+        let (service, mut events) = service(&store);
+        let task = paste(&rt, &service, url.as_str(), &folder);
+        assert_eq!(
+            service.stage(task.id).unwrap(),
+            Some(Stage::Working(Step::Identifying))
+        );
+        // 准备中算在运行：不能再继续、改请求头
+        assert!(matches!(service.resume(task.id), Err(Error::Running(_))));
+        assert!(matches!(
+            service.set_headers(task.id, Vec::new()),
+            Err(Error::Running(_))
+        ));
+        service.pause(task.id);
+        assert_eq!(
+            rt.block_on(ended(&mut events, task.id, |_| {})),
+            Status::Paused
+        );
+        let paused = service.task(task.id).unwrap();
+        assert!(paused.spec.pending().is_some() && paused.active.is_zero());
+        assert_eq!(service.stage(task.id).unwrap(), None);
+        // 停着时可以改请求头
+        let referer = vec![("Referer".to_owned(), "https://example.com/".to_owned())];
+        service.set_headers(task.id, referer.clone()).unwrap();
+        assert_eq!(service.task(task.id).unwrap().spec.headers, referer);
+        // 另一个任务准备中时关掉应用
+        let interrupted = paste(&rt, &service, url.as_str(), &folder).id;
+        (task.id, interrupted)
+    };
+
+    let (service, mut events) = service(&store);
+    assert_eq!(service.task(interrupted).unwrap().status, Status::Paused);
+    service.resume(interrupted).unwrap();
+    let mut watching = service.subscribe();
+    assert_eq!(
+        rt.block_on(service.discard(interrupted)).unwrap().unwrap(),
+        []
+    );
+    assert!(matches!(service.task(interrupted), Err(Error::NotFound(_))));
+    rt.block_on(async {
+        loop {
+            if let Event::Removed { id } = watching.recv().await.unwrap() {
+                assert_eq!(id, interrupted);
+                break;
+            }
+        }
+    });
+    assert!(!folder.exists());
+
+    server.gate.open();
+    service.resume(kept).unwrap();
+    assert_eq!(rt.block_on(ended(&mut events, kept, |_| {})), Status::Done);
+    let done = service.task(kept).unwrap();
+    assert_eq!(done.spec.headers.len(), 1);
+    assert_eq!(output(&done), OutputSpec::Mp4(folder.join("gated.mp4")));
+}
+
+/// 设置里开了「开始前先停下确认」：没有要选的任务也停下，确认时可改保存目录与输出；换请求头即从头准备、再停在同一处。
+#[test]
+fn tasks_without_choices_wait_for_confirmation_when_asked_to() {
+    let dir = test_dir("confirm");
+    let rt = runtime();
+    let server = rt.block_on(Server::start(true));
+    let (service, mut events) = service(&dir.join("tasks.sqlite"));
+    service.set_confirm_before_start(true).unwrap();
+    assert!(service.settings().unwrap().confirm_before_start);
+
+    let file = paste(
+        &rt,
+        &service,
+        server.base.join("report.pdf").unwrap().as_str(),
+        &dir.join("out"),
+    )
+    .id;
+    let offer = rt.block_on(asked(&mut events, file));
+    assert!(
+        matches!(&offer, Offer::Confirm(Recognized::File(info)) if info.length == Some(FILE as u64)),
+        "{offer:?}"
+    );
+    rt.block_on(stopped_waiting(&mut events, file));
+    assert_eq!(service.task(file).unwrap().spec.title, "report.pdf");
+    let cookie = vec![("Cookie".to_owned(), "a=1".to_owned())];
+    assert_eq!(
+        service
+            .choose(file, Answer::Headers(cookie.clone()))
+            .unwrap()
+            .spec
+            .headers,
+        cookie
+    );
+    assert!(matches!(
+        rt.block_on(asked(&mut events, file)),
+        Offer::Confirm(Recognized::File(_))
+    ));
+    rt.block_on(stopped_waiting(&mut events, file));
+    let elsewhere = dir.join("elsewhere");
+    service
+        .choose(
+            file,
+            Answer::File {
+                folder: elsewhere.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(rt.block_on(ended(&mut events, file, |_| {})), Status::Done);
+    assert_eq!(
+        std::fs::read(elsewhere.join("report.pdf")).unwrap(),
+        file_body()
+    );
+    assert_eq!(service.task(file).unwrap().spec.headers, cookie);
+
+    let hls = paste(
+        &rt,
+        &service,
+        server.base.join("index.m3u8").unwrap().as_str(),
+        &dir.join("out"),
+    )
+    .id;
+    let offer = rt.block_on(asked(&mut events, hls));
+    assert!(
+        matches!(&offer, Offer::Confirm(Recognized::Hls(probe)) if probe.master.is_none() && !probe.live),
+        "{offer:?}"
+    );
+    rt.block_on(stopped_waiting(&mut events, hls));
+    service
+        .choose(
+            hls,
+            Answer::Hls {
+                preference: Preference::default(),
+                output: OutputKind::Both,
+                folder: elsewhere.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(rt.block_on(ended(&mut events, hls, |_| {})), Status::Done);
+    assert!(elsewhere.join("index.mp4").is_file());
+    assert!(elsewhere.join("index").join("index.m3u8").is_file());
+}
+
+/// 地址回的是网页而这个平台没有解析组件：以「回的是网页」失败，还没定下；每个订阅方都收到同样的事件。
+#[test]
+fn a_page_without_a_resolver_fails_visibly() {
+    let dir = test_dir("page");
+    let rt = runtime();
+    let server = rt.block_on(Server::start(true));
+    let (service, mut events) = service(&dir.join("tasks.sqlite"));
+    let mut second = service.subscribe();
+    let id = paste(
+        &rt,
+        &service,
+        server.base.join("page").unwrap().as_str(),
+        &dir.join("out"),
+    )
+    .id;
+    for events in [&mut events, &mut second] {
+        let status = rt.block_on(ended(events, id, |_| {}));
+        assert!(
+            matches!(&status, Status::Failed(f) if f.kind == FailureKind::Malformed),
+            "{status:?}"
+        );
+    }
+    assert!(service.task(id).unwrap().spec.pending().is_some());
+    // 没定下的任务没有只写出已录的
+    assert!(matches!(service.write_recorded(id), Err(Error::NotHls(_))));
 }

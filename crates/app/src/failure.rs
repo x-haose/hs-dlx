@@ -111,6 +111,8 @@ pub enum FailureKind {
     WebCookies,
     /// 网页视频：解析组件没装好或坏了，重新安装后再继续
     WebComponents,
+    /// 插件的进程起不来，或它的回应不合协议：停用这个插件（第三方的）或重装组件（yt-dlp）后再继续
+    Plugin,
     /// 其余（任务目录正被别的任务或没做完的放弃占着、本机建不出 HTTP 客户端、不经暂停的取消）
     Other,
 }
@@ -293,6 +295,7 @@ impl FailureKind {
             | FailureKind::WebDenied
             | FailureKind::WebBlocked
             | FailureKind::WebCookies
+            | FailureKind::Plugin
             | FailureKind::Other => true,
             FailureKind::WebGone
             | FailureKind::CloudApi
@@ -329,6 +332,7 @@ impl FailureKind {
             | FailureKind::WebGone
             | FailureKind::WebChanged
             | FailureKind::WebComponents
+            | FailureKind::Plugin
             | FailureKind::CloudLogin
             | FailureKind::CloudQuota
             | FailureKind::CloudFailed
@@ -384,6 +388,7 @@ impl FailureKind {
             FailureKind::WebBlocked => "web-blocked".into(),
             FailureKind::WebCookies => "web-cookies".into(),
             FailureKind::WebComponents => "web-components".into(),
+            FailureKind::Plugin => "plugin".into(),
             FailureKind::Other => "other".into(),
         }
     }
@@ -417,6 +422,7 @@ impl FailureKind {
             "web-blocked" => FailureKind::WebBlocked,
             "web-cookies" => FailureKind::WebCookies,
             "web-components" => FailureKind::WebComponents,
+            "plugin" => FailureKind::Plugin,
             "other" => FailureKind::Other,
             _ => FailureKind::Status(code.strip_prefix("status:")?.parse().ok()?),
         })
@@ -455,6 +461,7 @@ pub(crate) fn every() -> Vec<FailureKind> {
         FailureKind::WebBlocked,
         FailureKind::WebCookies,
         FailureKind::WebComponents,
+        FailureKind::Plugin,
         FailureKind::Other,
     ];
     for kind in &all {
@@ -486,6 +493,7 @@ pub(crate) fn every() -> Vec<FailureKind> {
             | FailureKind::WebBlocked
             | FailureKind::WebCookies
             | FailureKind::WebComponents
+            | FailureKind::Plugin
             | FailureKind::Other => {}
         }
     }

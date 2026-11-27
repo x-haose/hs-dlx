@@ -243,6 +243,10 @@ pub fn failure(kind: FailureKind) -> (String, &'static str) {
             "组件".into(),
             "网页视频的解析组件没装好或坏了：在设置里重新安装后继续",
         ),
+        FailureKind::Plugin => (
+            "插件".into(),
+            "插件的进程起不来或回应不合协议：停用这个插件或重装组件后继续",
+        ),
         FailureKind::Other => ("!".into(), "原因见错误信息"),
     }
 }

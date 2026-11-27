@@ -36,7 +36,7 @@ pub(super) struct WebSettings {
     pub previous: Option<String>,
     /// 最近一次操作没成的原因
     pub error: Option<String>,
-    /// 后台最近一次查新版没成的原因（见 [`hs_dlx_app::Service::web_auto_check`]）
+    /// 后台最近一次查新版没成的原因（见 [`hs_dlx_app::Handle::web_auto_check`]）
     pub auto_check: Option<String>,
 }
 

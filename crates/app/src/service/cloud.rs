@@ -330,7 +330,7 @@ impl Shared {
             && error.kind() != std::io::ErrorKind::NotFound
         {
             // 输出都已校验过，留下的空目录不影响结果
-            let _closed = self.events.send(Event::Orphaned {
+            self.events.send(Event::Orphaned {
                 paths: vec![work_dir],
                 reason: format!("删不掉：{error}"),
             });
@@ -508,10 +508,16 @@ impl Shared {
             .await
             .map_err(Stop::store)?;
             let work_dir = naming::file_work_dir(&root);
-            match self.write(|tx| store::set_cloud_root(tx, id, &root, &work_dir, &files)) {
-                Ok(()) => {
+            let rooted = self.write(|tx| {
+                store::set_cloud_root(tx, id, &root, &work_dir, &files)?;
+                store::get(tx, id)?.ok_or(Error::NotFound(id))
+            });
+            match rooted {
+                Ok(task) => {
                     // 标题换成了根名
-                    let _closed = self.events.send(Event::Renamed { id });
+                    self.events.send(Event::Changed {
+                        task: Box::new(task),
+                    });
                     return Ok((root, work_dir, files));
                 }
                 Err(Error::PathTaken(path))
@@ -576,8 +582,7 @@ impl Shared {
                 control.progress(),
                 finished.clone(),
                 move |progress: FileProgress| {
-                    // 接收端随界面关闭而丢弃时没有谁要
-                    let _closed = events.send(Event::CloudProgress {
+                    events.send(Event::CloudProgress {
                         id: at.id,
                         progress: Box::new(CloudProgress::Fetching {
                             index: at.index,
@@ -661,8 +666,7 @@ impl Shared {
         let events = self.events.clone();
         let checked: Result<String, u64> = tokio::task::spawn_blocking(move || {
             gcid_of(&path, size, &cancelled, |checked| {
-                // 接收端随界面关闭而丢弃时没有谁要
-                let _closed = events.send(Event::CloudProgress {
+                events.send(Event::CloudProgress {
                     id: at.id,
                     progress: Box::new(CloudProgress::Verifying {
                         index: at.index,
@@ -840,8 +844,7 @@ impl Shared {
     }
 
     fn cloud_progress(&self, id: TaskId, progress: CloudProgress) {
-        // 接收端随界面关闭而丢弃时没有谁要
-        let _closed = self.events.send(Event::CloudProgress {
+        self.events.send(Event::CloudProgress {
             id,
             progress: Box::new(progress),
         });

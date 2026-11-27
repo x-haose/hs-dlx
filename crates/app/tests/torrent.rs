@@ -9,8 +9,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hs_dlx_app::{
-    CheckItem, CheckLevel, Draft, DraftKind, Error, Event, SeedEnd, Seeding, Service, Status,
-    Store, TaskId, TorrentInfo, TorrentNetwork, TorrentPhase, TorrentProgress,
+    Answer, Ask, CheckItem, CheckLevel, Draft, DraftKind, Error, Event, Offer, SeedEnd, Seeding,
+    Service, Stage, Status, Store, Task, TaskId, TorrentInfo, TorrentNetwork, TorrentPhase,
+    TorrentProgress,
 };
 use hs_dlx_torrent::{
     AddOptions, CreateOptions, Session, SessionConfig, State, TorrentId, create_torrent,
@@ -159,6 +160,83 @@ fn fetch(rt: &Runtime, service: &Service, uri: &str) -> Vec<u8> {
     .unwrap()
 }
 
+/// 粘贴磁力链接或种子文件的地址 `uri`、存到 `folder`，等它取到种子信息、停下选文件，返回任务的编号与种子信息。
+fn paste(rt: &Runtime, service: &Service, uri: &str, folder: &Path) -> (TaskId, TorrentInfo) {
+    let mut events = service.subscribe();
+    let mut pasted = rt.block_on(service.paste(uri, folder, 1)).unwrap();
+    let id = match pasted.pop() {
+        Some(Ok(task)) if pasted.is_empty() => task.id,
+        other => panic!("应建出一个任务：{other:?}"),
+    };
+    let waiting = async {
+        let mut info = None;
+        loop {
+            match events.recv().await.expect("服务还在，事件通道不会关闭") {
+                Event::Stage { id: at, stage } if at == id => {
+                    if let Stage::Asking(Offer::Files { info: offered, .. }) = *stage {
+                        info = Some(*offered);
+                    }
+                }
+                // 停下的状态写进存储之后才能选
+                Event::Ended {
+                    id: at,
+                    status,
+                    unsaved,
+                    ..
+                } if at == id => {
+                    assert_eq!((status, unsaved), (Status::Waiting(Ask::Files), None));
+                    return info.expect("停下选文件时给了种子信息");
+                }
+                _ => {}
+            }
+        }
+    };
+    let info = rt
+        .block_on(async { tokio::time::timeout(Duration::from_secs(30), waiting).await })
+        .expect("30 秒内没取到种子信息");
+    (id, info)
+}
+
+/// 粘贴 `uri`（见 [`paste`]），照 `pick` 从种子信息里选的文件开始下载；返回定下的任务与种子信息。
+fn start(
+    rt: &Runtime,
+    service: &Service,
+    uri: &str,
+    folder: &Path,
+    pick: impl FnOnce(&TorrentInfo) -> Vec<i32>,
+) -> (Task, TorrentInfo) {
+    let (id, info) = paste(rt, service, uri, folder);
+    let mut events = service.subscribe();
+    service
+        .choose(
+            id,
+            Answer::Files {
+                wanted: pick(&info),
+                folder: folder.to_path_buf(),
+            },
+        )
+        .unwrap();
+    let task = rt.block_on(async {
+        loop {
+            match events.recv().await.expect("服务还在，事件通道不会关闭") {
+                Event::Changed { task } if task.id == id && task.spec.pending().is_none() => {
+                    return *task;
+                }
+                Event::Ended { id: at, status, .. } if at == id => {
+                    panic!("没定下就停了：{status:?}")
+                }
+                _ => {}
+            }
+        }
+    });
+    (task, info)
+}
+
+/// 种子里的全部文件。
+fn all(info: &TorrentInfo) -> Vec<i32> {
+    info.files.iter().map(|file| file.index).collect()
+}
+
 fn draft(uri: &str, folder: &Path, resume: Vec<u8>, wanted: Vec<i32>) -> Draft {
     Draft {
         url: uri.parse().unwrap(),
@@ -187,7 +265,7 @@ async fn until(
                     status,
                     unsaved,
                     ..
-                } if at == id => {
+                } if at == id && !matches!(status, Status::Waiting(_)) => {
                     assert!(unsaved.is_none(), "没写进存储：{unsaved:?}");
                     return Some(status);
                 }
@@ -222,17 +300,13 @@ fn a_magnet_link_downloads_the_chosen_file() {
     service.set_seeding(Seeding::Off).unwrap();
 
     let uri = magnet(&id, &seeder);
-    let resume = fetch(&rt, &service, &uri);
-    let info = TorrentInfo::of(&resume).unwrap();
+    let (task, info) = start(&rt, &service, &uri, &folder, |info| {
+        vec![index_of(info, "a.bin")]
+    });
     assert_eq!(
         (info.name.as_str(), info.files.len(), info.done),
         ("album", 2, 0)
     );
-    let wanted = vec![index_of(&info, "a.bin")];
-    let task = rt
-        .block_on(service.create(draft(&uri, &folder, resume.clone(), wanted.clone()), 1))
-        .unwrap()
-        .unwrap();
     assert_eq!(task.spec.title, "album 2");
     assert_eq!(task.spec.torrent().unwrap().root, folder.join("album 2"));
     assert_eq!(task.spec.torrent().unwrap().info_hash, id.as_str());
@@ -253,11 +327,9 @@ fn a_magnet_link_downloads_the_chosen_file() {
     );
     assert!(!folder.join("album 2").join("b.bin").exists());
 
-    let again = rt
-        .block_on(service.create(draft(&uri, &folder, resume, wanted), 2))
-        .unwrap();
+    let again = rt.block_on(service.paste(&uri, &folder, 2)).unwrap();
     assert!(
-        matches!(again, Err(Error::TorrentTaken(at)) if at == task.id),
+        matches!(again.as_slice(), [Err(rejected)] if matches!(*rejected.reason, Error::TorrentTaken(at) if at == task.id)),
         "{again:?}"
     );
     // 再取同一个磁力链接的种子信息：说出占着它的任务，不加进会话
@@ -298,13 +370,7 @@ fn a_task_that_cannot_finish_keeps_what_it_has_until_discarded() {
     let (service, mut events) = service(&store);
 
     let uri = magnet(&id, &seeder);
-    let resume = fetch(&rt, &service, &uri);
-    let info = TorrentInfo::of(&resume).unwrap();
-    let all = info.files.iter().map(|file| file.index).collect();
-    let task = rt
-        .block_on(service.create(draft(&uri, &folder, resume, all), 1))
-        .unwrap()
-        .unwrap();
+    let (task, _) = start(&rt, &service, &uri, &folder, all);
     // a.bin 的 7 块，共 12 块
     let have = u64::from(A);
     let mut last = None;
@@ -503,13 +569,7 @@ fn a_finished_task_seeds_until_stopped_or_the_setting_says_so() {
     let (service, mut events) = service(&store);
 
     let uri = magnet(&id, &seeder);
-    let resume = fetch(&rt, &service, &uri);
-    let info = TorrentInfo::of(&resume).unwrap();
-    let all = info.files.iter().map(|file| file.index).collect();
-    let task = rt
-        .block_on(service.create(draft(&uri, &folder, resume, all), 1))
-        .unwrap()
-        .unwrap();
+    let (task, _) = start(&rt, &service, &uri, &folder, all);
     let status = rt.block_on(until(&mut events, task.id, |_| false));
     assert_eq!(status, Some(Status::Done));
     let progress = rt.block_on(seeding(&mut events, task.id));
@@ -590,15 +650,9 @@ fn the_part_file_stays_for_seeding_until_the_task_is_forgotten() {
     let (service, mut events) = service(&store);
 
     let uri = magnet(&id, &seeder);
-    let resume = fetch(&rt, &service, &uri);
-    let info = TorrentInfo::of(&resume).unwrap();
-    let task = rt
-        .block_on(service.create(
-            draft(&uri, &folder, resume, vec![index_of(&info, "a.bin")]),
-            1,
-        ))
-        .unwrap()
-        .unwrap();
+    let (task, info) = start(&rt, &service, &uri, &folder, |info| {
+        vec![index_of(info, "a.bin")]
+    });
     let status = rt.block_on(until(&mut events, task.id, |_| false));
     assert_eq!(status, Some(Status::Done));
     rt.block_on(seeding(&mut events, task.id));
@@ -758,12 +812,7 @@ fn public_trackers_go_to_bare_magnet_links_and_never_to_private_torrents() {
         !contains(&resume, &public.announce),
         "补的 tracker 存进了续传数据"
     );
-    let info = TorrentInfo::of(&resume).unwrap();
-    let all = info.files.iter().map(|file| file.index).collect();
-    let task = rt
-        .block_on(service.create(draft(&uri, &dir.join("downloads"), resume, all), 1))
-        .unwrap()
-        .unwrap();
+    let (task, _) = start(&rt, &service, &uri, &dir.join("downloads"), all);
     assert_eq!(
         rt.block_on(until(&mut events, task.id, |_| false)),
         Some(Status::Done)
@@ -820,13 +869,12 @@ fn public_trackers_go_to_bare_magnet_links_and_never_to_private_torrents() {
         .unwrap()
         .unwrap();
     assert!(info.private);
-    let all = info.files.iter().map(|file| file.index).collect();
+    drop(resume);
     let file = dir.join("private.torrent");
+    std::fs::write(&file, &torrent).unwrap();
     let url = Url::from_file_path(&file).unwrap();
-    let task = rt
-        .block_on(service.create(draft(url.as_str(), &dir.join("downloads"), resume, all), 2))
-        .unwrap()
-        .unwrap();
+    let (task, _) = start(&rt, &service, url.as_str(), &dir.join("downloads"), all);
+    assert_eq!(task.spec.url, url);
     assert_eq!(
         rt.block_on(until(&mut events, task.id, |_| false)),
         Some(Status::Done)
@@ -1074,4 +1122,75 @@ fn torrents_connect_through_the_socks_proxy() {
     assert!(problem.is_ok(), "没报出代理连不上：{problem:?}");
     drop(service);
     drop(seeder);
+}
+
+/// 磁力链接取到种子信息、停下选文件时关掉应用：重开后还在等，可选项由存着的种子信息得出（不重新取：做种的一方已
+/// 不在），选了即下不了也照样定下；同一条磁力链接仍占着。
+#[test]
+fn a_magnet_waiting_for_files_keeps_its_choices_across_reopening() {
+    let dir = test_dir("waiting-files");
+    let (seeder, id) = seed(&dir.join("seed"), false, false);
+    let folder = dir.join("downloads");
+    let store = dir.join("tasks.sqlite");
+    let rt = runtime();
+    let uri = magnet(&id, &seeder);
+    let (task, info) = {
+        let (service, _events) = service(&store);
+        paste(&rt, &service, &uri, &folder)
+    };
+    drop(seeder);
+
+    let (service, mut events) = service(&store);
+    assert_eq!(
+        service.task(task).unwrap().status,
+        Status::Waiting(Ask::Files)
+    );
+    let restored = rt.block_on(async {
+        let waiting = async {
+            loop {
+                if let Event::Stage { id: at, stage } = events.recv().await.unwrap()
+                    && at == task
+                {
+                    return *stage;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), waiting).await
+    });
+    assert_eq!(
+        restored.expect("30 秒内没给出可选项"),
+        Stage::Asking(Offer::Files {
+            info: Box::new(info.clone()),
+            pikpak: false,
+        })
+    );
+    assert!(service.stage(task).unwrap().is_some());
+    let again = rt.block_on(service.paste(&uri, &folder, 2)).unwrap();
+    assert!(
+        matches!(again.as_slice(), [Err(rejected)] if matches!(*rejected.reason, Error::TorrentTaken(at) if at == task)),
+        "{again:?}"
+    );
+    let mut watching = service.subscribe();
+    service
+        .choose(
+            task,
+            Answer::Files {
+                wanted: all(&info),
+                folder: folder.clone(),
+            },
+        )
+        .unwrap();
+    let settled = rt.block_on(async {
+        loop {
+            if let Event::Changed { task: changed } = watching.recv().await.unwrap()
+                && changed.id == task
+                && changed.spec.pending().is_none()
+            {
+                return *changed;
+            }
+        }
+    });
+    assert_eq!(settled.spec.torrent().unwrap().root, folder.join("album"));
+    assert_eq!(settled.spec.title, "album");
+    rt.block_on(service.discard(task)).unwrap().unwrap();
 }

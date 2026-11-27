@@ -279,7 +279,7 @@ impl FileAmount {
     /// 列出文件时（网盘还在下）为 None。HLS 任务为 None（见 [`Amount`]）。
     pub fn of(row: &Row) -> Option<FileAmount> {
         match &row.task.spec.kind {
-            Kind::Hls(_) => None,
+            Kind::Pending(_) | Kind::Hls(_) => None,
             Kind::File(_) => Self::of_file(row),
             Kind::Torrent(_) => Self::of_torrent(row),
             Kind::Cloud(_) => Self::of_cloud(row),
@@ -424,6 +424,7 @@ pub fn saved_as(spec: &TaskSpec) -> &'static str {
             OutputSpec::Hls(_) => "本地 HLS",
             OutputSpec::Both { .. } => "MP4 与本地 HLS",
         },
+        Kind::Pending(_) => "还没定下",
         Kind::File(_) => "文件",
         Kind::Torrent(_) => "BT",
         Kind::Cloud(_) => "PikPak 云离线",
@@ -471,6 +472,8 @@ pub mod sample {
             result: None,
             write_only: false,
             seeding: false,
+            finished_at: None,
+            active: std::time::Duration::ZERO,
         };
         Row::new(task, Instant::now())
     }

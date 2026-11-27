@@ -14,7 +14,7 @@ use hs_m3u8_core::{CancellationToken, Engine, Proxy, Url};
 use tokio::sync::watch;
 use tokio_util::task::AbortOnDropHandle;
 
-use super::{Service, lock};
+use super::{Handle, lock};
 use crate::Error;
 use crate::store;
 use crate::web::{Choice, Freshness, Preference, choices};
@@ -239,6 +239,11 @@ impl Web {
         *installing = None;
     }
 
+    /// 组件的状态，随安装进度与结果变。
+    pub(super) fn state(&self) -> watch::Receiver<WebState> {
+        self.state.subscribe()
+    }
+
     /// 删掉不再用的组件（见 [`Components::sweep`]）；本平台没有组件时什么也不做。
     pub(super) async fn sweep(&self) {
         if let Some(components) = &self.components {
@@ -282,7 +287,7 @@ impl super::Shared {
         });
     }
 
-    /// 见 [`Service::update_web`]，经 `proxy`。
+    /// 见 [`Handle::update_web`]，经 `proxy`。
     pub(super) fn start_web_update(
         self: &Arc<Self>,
         version: String,
@@ -460,185 +465,10 @@ impl super::Shared {
     }
 }
 
-/// 启动后先查一次，之后每隔 `every`（只算醒着的时候）查一次渠道上的 yt-dlp，有更新的（跳过的除外）就换上；组件没装好、
-/// 正在装时等状态变了再查。查的结果记在 [`Web::auto_check`]。服务释放时结束。
-pub(super) async fn keep_web_current(shared: Weak<super::Shared>, every: Duration) {
-    loop {
-        let Some(strong) = shared.upgrade() else {
-            return;
-        };
-        let mut state = strong.web.state.subscribe();
-        let ready = matches!(
-            *state.borrow_and_update(),
-            WebState::Ready(_) | WebState::UpdateFailed { .. }
-        );
-        let checked = if ready {
-            match strong.newer_web().await {
-                Ok((Newer::Version(version), _)) => strong
-                    .settings()
-                    .and_then(|settings| strong.start_web_update(version, settings.proxy))
-                    .map(|()| true)
-                    .or_else(|error| match error {
-                        // 别处正好在装：等它装完再看
-                        Error::WebInstalling => Ok(false),
-                        Error::Closed => Err(None),
-                        error => Err(Some(error.to_string())),
-                    }),
-                Ok(_) => Ok(true),
-                Err(why) => Err(Some(why)),
-            }
-        } else {
-            Ok(false)
-        };
-        match checked {
-            // 在关闭
-            Err(None) => return,
-            Err(Some(why)) => {
-                strong.web.auto_check.send_replace(Some(why));
-            }
-            Ok(true) => {
-                strong.web.auto_check.send_replace(None);
-            }
-            Ok(false) => {
-                drop(strong);
-                // 发送端在 Shared 里：服务释放时这里随之返回，下一轮 upgrade 不到即结束
-                let _changed = state.changed().await;
-                continue;
-            }
-        }
-        // 等的时候不持有服务
-        drop(strong);
-        tokio::time::sleep(every).await;
-    }
-}
-
-impl Service {
-    /// 记下网页视频的 yt-dlp 渠道：之后的安装与更新照它。
-    pub fn set_web_channel(&self, channel: Channel) -> Result<(), Error> {
-        self.shared.write(|tx| store::set_web_channel(tx, channel))
-    }
-
-    /// 记下解析时从哪个浏览器的哪个用户资料读 Cookie（None 为不读）：之后的解析与任务开始、继续照它。用户资料的目录
-    /// 不是 UTF-8 时报 [`Error::InvalidInput`]。
-    pub fn set_web_browser(&self, browser: Option<CookieSource>) -> Result<(), Error> {
-        self.shared
-            .write(|tx| store::set_web_browser(tx, browser.as_ref()))
-    }
-
-    /// 这台机器上有数据目录、读得了的浏览器（见 [`Browser::installed`]）。
-    pub fn web_browsers(&self) -> Vec<Browser> {
-        Browser::installed()
-    }
-
-    /// 记下网页视频的画质取向：之后的解析照它挑画质选项。
-    pub fn set_web_preference(&self, preference: Preference) -> Result<(), Error> {
-        self.shared
-            .write(|tx| store::set_web_preference(tx, preference))
-    }
-
-    /// 经设置里的代理查设置里的渠道上最新的 yt-dlp：比装着的新时为它，不比装着的新（含切换渠道后在用的反而更新）时为
-    /// None，版本号认不出时报 [`hs_dlx_ytdlp::Error::Index`]。组件没装好时报 [`Error::WebNotReady`]；句柄在任何执行器上
-    /// 都可等待。
-    pub fn check_web_update(
-        &self,
-    ) -> Result<AbortOnDropHandle<Result<Option<String>, hs_dlx_ytdlp::Error>>, Error> {
-        let web = &self.shared.web;
-        let current = web.version().ok_or(Error::WebNotReady)?;
-        let settings = self.settings()?;
-        let shared = self.shared.clone();
-        Ok(AbortOnDropHandle::new(self.runtime().spawn(async move {
-            let components = shared.web.components.as_ref().expect("装好了即有组件");
-            let latest = components
-                // 句柄释放即丢弃这个任务，不另取消
-                .latest(
-                    &settings.proxy,
-                    settings.web_channel,
-                    &CancellationToken::new(),
-                )
-                .await?;
-            let newer = is_newer(&latest, &current).ok_or_else(|| {
-                hs_dlx_ytdlp::Error::Index(format!(
-                    "认不出版本号：渠道上最新的是 {latest}，在用的是 {current}"
-                ))
-            })?;
-            Ok(newer.then_some(latest))
-        })))
-    }
-
-    /// 把 yt-dlp 换成 `version`（经设置里的代理），进度与结果见 [`Service::web_state`]：装好、自检过了才换上，在用的
-    /// 解析进程随之换成新的；没装成时照旧用原来的版本，状态回到它并带上原因。组件没装好时报 [`Error::WebNotReady`]，
-    /// 正在装时报 [`Error::WebInstalling`]。
-    pub fn update_web(&self, version: String) -> Result<(), Error> {
-        let proxy = self.settings()?.proxy;
-        self.shared.start_web_update(version, proxy)
-    }
-
-    /// 换回上一个 yt-dlp 版本（不联网，见 [`Components::rollback`]），结果见 [`Service::web_state`]：自检过了才换，在用
-    /// 的解析进程随之换成它；没换成时照旧用原来的，状态回到它并带上原因。组件没装好时报 [`Error::WebNotReady`]，正在装时
-    /// 报 [`Error::WebInstalling`]。
-    pub fn rollback_web(&self) -> Result<(), Error> {
-        let web = &self.shared.web;
-        let (cancel, before) = web.begin(&self.shared.closed, |state| {
-            Ok(WebState::Updating {
-                version: version_of(state).ok_or(Error::WebNotReady)?,
-                progress: InstallProgress {
-                    stage: Stage::Checking,
-                    bytes: 0,
-                    total: None,
-                },
-            })
-        })?;
-        let current = version_of(&before).expect("begin 核对过装好了");
-        let shared = self.shared.clone();
-        let _entered = self.runtime().enter();
-        self.shared.tracker.spawn(async move {
-            let web = &shared.web;
-            let components = web.components.as_ref().expect("装好了即有组件");
-            let next = match components.rollback(&cancel).await {
-                Ok(installed) => {
-                    let version = installed.version.clone();
-                    *lock(&web.extractor) = Some(Arc::new(Extractor::new(
-                        installed,
-                        web.cache.clone(),
-                        EXTRACT_TIMEOUT,
-                    )));
-                    WebState::Ready(version)
-                }
-                // 取消的不算失败：照原来的
-                Err(hs_dlx_ytdlp::Error::Cancelled) => before,
-                Err(error) => WebState::UpdateFailed {
-                    version: current,
-                    reason: format!("换回没成：{error}"),
-                },
-            };
-            web.settle(next);
-        });
-        Ok(())
-    }
-
-    /// 可换回的上一个 yt-dlp 版本（见 [`Service::rollback_web`]）；没装好或没有时为 None。
-    pub fn web_previous(&self) -> Option<String> {
-        lock(&self.shared.web.extractor)
-            .as_ref()
-            .and_then(|extractor| extractor.installed().previous.clone())
-    }
-
-    /// 后台最近一次查新的 yt-dlp 没成的原因（应用启动后先查一次，之后定期查，见 [`WebConfig::update_every`]）；查成了、
-    /// 还没查过时为 None。
-    pub fn web_auto_check(&self) -> watch::Receiver<Option<String>> {
-        self.shared.web.auto_check.subscribe()
-    }
-
-    /// 网页视频的组件的状态，随安装进度与结果变。
-    pub fn web_state(&self) -> watch::Receiver<WebState> {
-        self.shared.web.state.subscribe()
-    }
-
-    /// 安装网页视频的组件（经设置里的代理），进度与结果见 [`Service::web_state`]：没装、没装成时安装（已下的接着用）；
-    /// 坏了或装好了时重装（见 [`Components::repair`]），在用的解析进程随之换成新的；正在装时什么也不做。本平台没有组件时报
-    /// [`Error::WebUnavailable`]，读不出设置时报错。
-    pub fn install_web(&self) -> Result<(), Error> {
-        let web = &self.shared.web;
+impl super::Shared {
+    /// 见 [`Handle::install_web`]。
+    pub(super) fn install_web(self: &Arc<Self>) -> Result<(), Error> {
+        let web = &self.web;
         if web.components.is_none() {
             return Err(Error::WebUnavailable);
         }
@@ -647,9 +477,9 @@ impl Service {
         let repairing =
             |state: &WebState| !matches!(state, WebState::Missing | WebState::Failed(_));
         // 一开始就显示在装：到第一个字节之前（查 PyPI、解出随带的）也有好几秒
-        let begun = web.begin(&self.shared.closed, |state| {
+        let begun = web.begin(&self.closed, |state| {
             if repairing(state)
-                && lock(&self.shared.running)
+                && lock(&self.running)
                     .values()
                     .any(|running| matches!(running.control, super::Control::Web(_)))
             {
@@ -667,9 +497,9 @@ impl Service {
             Err(error) => return Err(error),
         };
         let repair = repairing(&before);
-        let shared = self.shared.clone();
-        let _entered = self.runtime().enter();
-        self.shared.tracker.spawn(async move {
+        let shared = self.clone();
+        let _entered = self.runtime.enter();
+        self.tracker.spawn(async move {
             let web = &shared.web;
             let components = web.components.as_ref().expect("上面核对过有组件");
             let state = web.state.clone();
@@ -757,19 +587,13 @@ impl Service {
         Ok(())
     }
 
-    /// 取消在做的安装；没在装时什么也不做。
-    pub fn cancel_web_install(&self) {
-        self.shared.web.cancel_install();
-    }
-
-    /// 经设置里的代理解析网页地址 `url`（带上请求头 `headers` 里的 Cookie，发往网页所在的可注册域名，与任务运行时
-    /// 一样），按设置里的取向给出画质选项。组件没装好时报 [`Error::WebNotReady`]，读不出设置时报错；句柄在任何执行器上都可等待，释放它即取消（解析进程随之杀掉）。只有
-    /// 通用解析器认得的地址报 [`ExtractError::Unsupported`]（转嗅探页找）。
-    pub fn resolve(
-        &self,
+    /// 解析网页地址 `url`（见 [`Handle::resolve`]）：返回的 future 被丢弃即取消，解析进程随之杀掉；在做的 yt-dlp 更新
+    /// 是另起的任务，照常做完。
+    pub(super) fn resolving(
+        self: &Arc<Self>,
         url: Url,
         headers: &[(String, String)],
-    ) -> Result<AbortOnDropHandle<Result<Resolved, ExtractError>>, Error> {
+    ) -> Result<impl Future<Output = Result<Resolved, ExtractError>> + Send + use<>, Error> {
         // 只带 Cookie：别的请求头解析不用（只有通用解析器认得的网页要转嗅探页，那里用得上 Referer 等），Cookie 的值照
         // 新建时校验，不在解析时悄悄丢掉
         let cookies: Vec<(String, String)> = headers
@@ -782,7 +606,7 @@ impl Service {
         }
         super::web_task::check_headers(&cookies)?;
         let headers = cookies.as_slice();
-        let extractor = lock(&self.shared.web.extractor)
+        let extractor = lock(&self.web.extractor)
             .clone()
             .ok_or(Error::WebNotReady)?;
         let settings = self.settings()?;
@@ -793,9 +617,8 @@ impl Service {
             generic: false,
             browser: settings.web_browser,
         };
-        let shared = self.shared.clone();
-        Ok(AbortOnDropHandle::new(self.runtime().spawn(async move {
-            // 句柄释放时任务被丢弃，解析进程随 Worker 的释放杀掉；在做的更新是另起的任务，照常做完
+        let shared = self.clone();
+        Ok(async move {
             let extract = |extractor: Arc<Extractor>| {
                 let (shared, request, proxy) = (shared.clone(), request.clone(), proxy.clone());
                 async move {
@@ -835,7 +658,206 @@ impl Service {
                 choices: found,
                 freshness,
             })
+        })
+    }
+}
+
+/// 启动后先查一次，之后每隔 `every`（只算醒着的时候）查一次渠道上的 yt-dlp，有更新的（跳过的除外）就换上；组件没装好、
+/// 正在装时等状态变了再查。查的结果记在 [`Web::auto_check`]。服务释放时结束。
+pub(super) async fn keep_web_current(shared: Weak<super::Shared>, every: Duration) {
+    loop {
+        let Some(strong) = shared.upgrade() else {
+            return;
+        };
+        let mut state = strong.web.state.subscribe();
+        let ready = matches!(
+            *state.borrow_and_update(),
+            WebState::Ready(_) | WebState::UpdateFailed { .. }
+        );
+        let checked = if ready {
+            match strong.newer_web().await {
+                Ok((Newer::Version(version), _)) => strong
+                    .settings()
+                    .and_then(|settings| strong.start_web_update(version, settings.proxy))
+                    .map(|()| true)
+                    .or_else(|error| match error {
+                        // 别处正好在装：等它装完再看
+                        Error::WebInstalling => Ok(false),
+                        Error::Closed => Err(None),
+                        error => Err(Some(error.to_string())),
+                    }),
+                Ok(_) => Ok(true),
+                Err(why) => Err(Some(why)),
+            }
+        } else {
+            Ok(false)
+        };
+        match checked {
+            // 在关闭
+            Err(None) => return,
+            Err(Some(why)) => {
+                strong.web.auto_check.send_replace(Some(why));
+            }
+            Ok(true) => {
+                strong.web.auto_check.send_replace(None);
+            }
+            Ok(false) => {
+                drop(strong);
+                // 发送端在 Shared 里：服务释放时这里随之返回，下一轮 upgrade 不到即结束
+                let _changed = state.changed().await;
+                continue;
+            }
+        }
+        // 等的时候不持有服务
+        drop(strong);
+        tokio::time::sleep(every).await;
+    }
+}
+
+impl Handle {
+    /// 记下网页视频的 yt-dlp 渠道：之后的安装与更新照它。
+    pub fn set_web_channel(&self, channel: Channel) -> Result<(), Error> {
+        self.shared.write(|tx| store::set_web_channel(tx, channel))
+    }
+
+    /// 记下解析时从哪个浏览器的哪个用户资料读 Cookie（None 为不读）：之后的解析与任务开始、继续照它。用户资料的目录
+    /// 不是 UTF-8 时报 [`Error::InvalidInput`]。
+    pub fn set_web_browser(&self, browser: Option<CookieSource>) -> Result<(), Error> {
+        self.shared
+            .write(|tx| store::set_web_browser(tx, browser.as_ref()))
+    }
+
+    /// 这台机器上有数据目录、读得了的浏览器（见 [`Browser::installed`]）。
+    pub fn web_browsers(&self) -> Vec<Browser> {
+        Browser::installed()
+    }
+
+    /// 记下网页视频的画质取向：之后的解析照它挑画质选项。
+    pub fn set_web_preference(&self, preference: Preference) -> Result<(), Error> {
+        self.shared
+            .write(|tx| store::set_web_preference(tx, preference))
+    }
+
+    /// 经设置里的代理查设置里的渠道上最新的 yt-dlp：比装着的新时为它，不比装着的新（含切换渠道后在用的反而更新）时为
+    /// None，版本号认不出时报 [`hs_dlx_ytdlp::Error::Index`]。组件没装好时报 [`Error::WebNotReady`]；句柄在任何执行器上
+    /// 都可等待。
+    pub fn check_web_update(
+        &self,
+    ) -> Result<AbortOnDropHandle<Result<Option<String>, hs_dlx_ytdlp::Error>>, Error> {
+        let web = &self.shared.web;
+        let current = web.version().ok_or(Error::WebNotReady)?;
+        let settings = self.settings()?;
+        let shared = self.shared.clone();
+        Ok(AbortOnDropHandle::new(self.runtime().spawn(async move {
+            let components = shared.web.components.as_ref().expect("装好了即有组件");
+            let latest = components
+                // 句柄释放即丢弃这个任务，不另取消
+                .latest(
+                    &settings.proxy,
+                    settings.web_channel,
+                    &CancellationToken::new(),
+                )
+                .await?;
+            let newer = is_newer(&latest, &current).ok_or_else(|| {
+                hs_dlx_ytdlp::Error::Index(format!(
+                    "认不出版本号：渠道上最新的是 {latest}，在用的是 {current}"
+                ))
+            })?;
+            Ok(newer.then_some(latest))
         })))
+    }
+
+    /// 把 yt-dlp 换成 `version`（经设置里的代理），进度与结果见 [`Handle::web_state`]：装好、自检过了才换上，在用的
+    /// 解析进程随之换成新的；没装成时照旧用原来的版本，状态回到它并带上原因。组件没装好时报 [`Error::WebNotReady`]，
+    /// 正在装时报 [`Error::WebInstalling`]。
+    pub fn update_web(&self, version: String) -> Result<(), Error> {
+        let proxy = self.settings()?.proxy;
+        self.shared.start_web_update(version, proxy)
+    }
+
+    /// 换回上一个 yt-dlp 版本（不联网，见 [`Components::rollback`]），结果见 [`Handle::web_state`]：自检过了才换，在用
+    /// 的解析进程随之换成它；没换成时照旧用原来的，状态回到它并带上原因。组件没装好时报 [`Error::WebNotReady`]，正在装时
+    /// 报 [`Error::WebInstalling`]。
+    pub fn rollback_web(&self) -> Result<(), Error> {
+        let web = &self.shared.web;
+        let (cancel, before) = web.begin(&self.shared.closed, |state| {
+            Ok(WebState::Updating {
+                version: version_of(state).ok_or(Error::WebNotReady)?,
+                progress: InstallProgress {
+                    stage: Stage::Checking,
+                    bytes: 0,
+                    total: None,
+                },
+            })
+        })?;
+        let current = version_of(&before).expect("begin 核对过装好了");
+        let shared = self.shared.clone();
+        let _entered = self.runtime().enter();
+        self.shared.tracker.spawn(async move {
+            let web = &shared.web;
+            let components = web.components.as_ref().expect("装好了即有组件");
+            let next = match components.rollback(&cancel).await {
+                Ok(installed) => {
+                    let version = installed.version.clone();
+                    *lock(&web.extractor) = Some(Arc::new(Extractor::new(
+                        installed,
+                        web.cache.clone(),
+                        EXTRACT_TIMEOUT,
+                    )));
+                    WebState::Ready(version)
+                }
+                // 取消的不算失败：照原来的
+                Err(hs_dlx_ytdlp::Error::Cancelled) => before,
+                Err(error) => WebState::UpdateFailed {
+                    version: current,
+                    reason: format!("换回没成：{error}"),
+                },
+            };
+            web.settle(next);
+        });
+        Ok(())
+    }
+
+    /// 可换回的上一个 yt-dlp 版本（见 [`Handle::rollback_web`]）；没装好或没有时为 None。
+    pub fn web_previous(&self) -> Option<String> {
+        lock(&self.shared.web.extractor)
+            .as_ref()
+            .and_then(|extractor| extractor.installed().previous.clone())
+    }
+
+    /// 后台最近一次查新的 yt-dlp 没成的原因（应用启动后先查一次，之后定期查，见 [`WebConfig::update_every`]）；查成了、
+    /// 还没查过时为 None。
+    pub fn web_auto_check(&self) -> watch::Receiver<Option<String>> {
+        self.shared.web.auto_check.subscribe()
+    }
+
+    /// 网页视频的组件的状态，随安装进度与结果变。
+    pub fn web_state(&self) -> watch::Receiver<WebState> {
+        self.shared.web.state.subscribe()
+    }
+
+    /// 安装网页视频的组件（经设置里的代理），进度与结果见 [`Handle::web_state`]：没装、没装成时安装（已下的接着用）；
+    /// 坏了或装好了时重装（见 [`Components::repair`]），在用的解析进程随之换成新的；正在装时什么也不做。本平台没有组件时报
+    /// [`Error::WebUnavailable`]，读不出设置时报错。
+    pub fn install_web(&self) -> Result<(), Error> {
+        self.shared.install_web()
+    }
+
+    /// 取消在做的安装；没在装时什么也不做。
+    pub fn cancel_web_install(&self) {
+        self.shared.web.cancel_install();
+    }
+
+    /// 经设置里的代理解析网页地址 `url`（带上请求头 `headers` 里的 Cookie，发往网页所在的可注册域名，与任务运行时
+    /// 一样），按设置里的取向给出画质选项。组件没装好时报 [`Error::WebNotReady`]，读不出设置时报错；句柄在任何执行器上都可等待，释放它即取消（解析进程随之杀掉）。只有
+    /// 通用解析器认得的地址报 [`ExtractError::Unsupported`]（转嗅探页找）。
+    pub fn resolve(
+        &self,
+        url: Url,
+        headers: &[(String, String)],
+    ) -> Result<AbortOnDropHandle<Result<Resolved, ExtractError>>, Error> {
+        let resolving = self.shared.resolving(url, headers)?;
+        Ok(AbortOnDropHandle::new(self.runtime().spawn(resolving)))
     }
 }
 

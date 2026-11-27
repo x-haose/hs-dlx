@@ -81,8 +81,10 @@ impl Tasks {
         self.rows.push(row);
         let (early, rest) = std::mem::take(&mut self.early)
             .into_iter()
-            .partition(|event| {
-                matches!(event, Event::Ended { id: at, .. } | Event::Renamed { id: at } if *at == id)
+            .partition(|event| match event {
+                Event::Ended { id: at, .. } => *at == id,
+                Event::Changed { task } => task.id == id,
+                _ => false,
             });
         self.early = rest;
         for event in early {
@@ -113,6 +115,8 @@ impl Tasks {
             return;
         }
         match &row.task.status {
+            // 还没定下的任务磁盘上没有东西可读
+            Status::Paused | Status::Failed(_) if row.task.spec.pending().is_some() => {}
             Status::Paused | Status::Failed(_) => self.inspect(id, false, cx),
             Status::Done => {
                 // HLS 为 MP4 与本地 HLS 目录，文件任务为文件，BT 为内容的根
@@ -124,6 +128,7 @@ impl Tasks {
                             target.hls().map(PathBuf::from),
                         )
                     }
+                    Kind::Pending(_) => unreachable!("完成的任务都已定下"),
                     Kind::File(file) => (None, Some(file.path.clone())),
                     Kind::Torrent(torrent) => (None, Some(torrent.root.clone())),
                     Kind::Cloud(cloud) => (None, cloud.root.clone()),
@@ -151,7 +156,10 @@ impl Tasks {
                 .detach();
             }
             // 放弃没做完的任务目录可能已删了一部分，读出来的不说明什么
-            Status::Running | Status::DiscardUnfinished => {}
+            Status::Preparing
+            | Status::Waiting(_)
+            | Status::Running
+            | Status::DiscardUnfinished => {}
         }
     }
 

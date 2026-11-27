@@ -1,6 +1,6 @@
 //! 检测 BT 用的网络：DHT（直连与经 BT 代理）、UDP 的 tracker、IPv6、监听与端口映射、外部连入，各下结论，再按「BT
 //! 现在经不经代理」给一句建议。只发握手类的包（DHT 的 ping 与 find_node、BEP 15 的 connect，事务号随机），不带任何
-//! 种子的信息哈希。探测与下结论分开：各探测函数量出 [`Measured`]（由 [`crate::Service::check_network`] 汇总），
+//! 种子的信息哈希。探测与下结论分开：各探测函数量出 [`Measured`]（由 [`crate::Handle::check_network`] 汇总），
 //! [`report`] 只照它下结论。
 
 use std::collections::hash_map::RandomState;

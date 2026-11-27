@@ -65,7 +65,8 @@ pub fn look(row: &Row) -> Look {
         Status::Running if row.task.spec.web().is_some() => running_web(row),
         Status::Running if row.task.spec.hls().is_none() => running_file(row),
         Status::Running => running(row, Amount::of(row).unwrap_or_default()),
-        Status::Paused => stopped(row, Stopped::Paused),
+        // 还没定下的任务在这一页没有自己的样子：准备中、等用户的按暂停画
+        Status::Paused | Status::Preparing | Status::Waiting(_) => stopped(row, Stopped::Paused),
         Status::Failed(failure) => stopped(row, Stopped::Failed(failure)),
         Status::Done if row.task.seeding => seeding_look(row),
         Status::Done => done_look(row),

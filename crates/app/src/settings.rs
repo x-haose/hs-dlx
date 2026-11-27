@@ -28,6 +28,9 @@ pub struct Settings {
     pub web_preference: crate::web::Preference,
     /// 解析网页视频时另从这个浏览器的这个用户资料读登录后的 Cookie；None 为不读
     pub web_browser: Option<hs_dlx_ytdlp::CookieSource>,
+    /// 没有要选的任务（单个文件、只有一档的 HLS、直播、单文件种子）开始前先停下确认（[`crate::Ask::Confirm`]）；为否
+    /// 时它们粘贴后直接开始，存到建任务时给的保存目录
+    pub confirm_before_start: bool,
 }
 
 impl Default for Settings {
@@ -43,6 +46,7 @@ impl Default for Settings {
             web_channel: hs_dlx_ytdlp::Channel::Stable,
             web_preference: crate::web::Preference::Compatible,
             web_browser: None,
+            confirm_before_start: false,
         }
     }
 }

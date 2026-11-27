@@ -1,5 +1,5 @@
 //! 填代理的一组输入：主机（默认本机）、端口、协议（默认连上去自己认）与可选的用户名、密码。保存时经
-//! [`hs_dlx_app::Service::identify_proxy`] 连上去核对，认出了才交出地址（[`ProxyEditorEvent::Identified`]），由所在的
+//! [`hs_dlx_app::Handle::identify_proxy`] 连上去核对，认出了才交出地址（[`ProxyEditorEvent::Identified`]），由所在的
 //! 一行存进设置。保存时主机框里是完整的代理地址（`socks5://u:p@host:1080` 之类）时拆进各框、协议照它写的，是
 //! `主机:端口` 时拆成两框（IPv6 地址除外）。存着的地址是 HTTP 或 SOCKS5 时协议显示为自动判断，换端口后重新认。
 

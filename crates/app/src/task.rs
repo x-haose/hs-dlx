@@ -27,7 +27,7 @@ impl std::fmt::Display for TaskId {
     }
 }
 
-/// 新建任务时用户给定的：输出路径由服务按它取（见 [`crate::Service::create`]）。
+/// 新建任务时用户给定的：输出路径由服务按它取（见 [`crate::Handle::create`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Draft {
     pub url: Url,
@@ -62,8 +62,8 @@ pub enum DraftKind {
     },
     /// BT：[`Draft::url`] 为磁力链接或种子文件的 `file:` 地址，没有请求头
     Torrent {
-        /// 种子的续传数据：种子文件转成的（[`crate::Service::open_torrent_file`]）或磁力链接取到的
-        /// （[`crate::Service::fetch_metadata`]）
+        /// 种子的续传数据：种子文件转成的（[`crate::Handle::open_torrent_file`]）或磁力链接取到的
+        /// （[`crate::Handle::fetch_metadata`]）
         resume: Vec<u8>,
         /// 要下的文件（[`crate::TorrentFile::index`]），至少一个
         wanted: Vec<i32>,
@@ -85,7 +85,7 @@ pub enum DraftKind {
     },
 }
 
-/// 新建任务时给定的内容，续传与续录照它重建请求；之后只有请求头可在任务停着时改（[`crate::Service::set_headers`]）。
+/// 新建任务时给定的内容，续传与续录照它重建请求；之后只有请求头可在任务停着时改（[`crate::Handle::set_headers`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskSpec {
     /// 列表里显示的名字：HLS 为输出的主名，文件为文件名，BT 为内容的根名，云离线为网盘给的名字（定下根之后为根名），
@@ -100,11 +100,20 @@ pub struct TaskSpec {
 /// 任务的种类及这种任务特有的内容。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Kind {
+    /// 还没定下是哪种任务：只有来源与保存目录，磁盘上没有它的东西
+    Pending(PendingSpec),
     Hls(HlsSpec),
     File(FileSpec),
     Torrent(TorrentSpec),
     Cloud(CloudSpec),
     Web(WebSpec),
+}
+
+/// 还没定下的任务的内容。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSpec {
+    /// 保存目录（绝对路径）：建任务时给的；定下时没另选保存目录的任务存到这里
+    pub folder: PathBuf,
 }
 
 /// HLS 任务特有的内容。
@@ -169,6 +178,13 @@ pub struct WebSpec {
     pub container: crate::web::Container,
     /// 输出：以文件名结尾的绝对路径
     pub path: PathBuf,
+    /// 解析它的插件的编号，重新解析时找同一个；随应用带的 yt-dlp 为 [`WebSpec::YT_DLP`]
+    pub plugin: String,
+}
+
+impl WebSpec {
+    /// 随应用带的 yt-dlp 作为解析插件的编号。
+    pub const YT_DLP: &'static str = "yt-dlp";
 }
 
 /// 提供云离线的网盘。
@@ -211,9 +227,11 @@ pub struct Expected {
 
 impl TaskSpec {
     /// 输出占用的路径（以文件名结尾的绝对路径）：HLS 为 MP4 与本地 HLS 目录中要的那些（MP4 在前），文件任务为文件，
-    /// BT 与定下了根的云离线任务为内容的根，还没定下根的云离线任务没有。首项是主要的那个：显示的文件名、所在的目录取它。
+    /// BT 与定下了根的云离线任务为内容的根，还没定下根的云离线任务与还没定下的任务没有。首项是主要的那个：显示的
+    /// 文件名、所在的目录取它。
     pub fn outputs(&self) -> Vec<&std::path::Path> {
         match &self.kind {
+            Kind::Pending(_) => Vec::new(),
             Kind::Hls(hls) => match &hls.output {
                 OutputSpec::Mp4(path) | OutputSpec::Hls(path) => vec![path],
                 OutputSpec::Both { mp4, hls } => vec![mp4, hls],
@@ -229,7 +247,9 @@ impl TaskSpec {
     pub fn hls(&self) -> Option<&HlsSpec> {
         match &self.kind {
             Kind::Hls(hls) => Some(hls),
-            Kind::File(_) | Kind::Torrent(_) | Kind::Cloud(_) | Kind::Web(_) => None,
+            Kind::Pending(_) | Kind::File(_) | Kind::Torrent(_) | Kind::Cloud(_) | Kind::Web(_) => {
+                None
+            }
         }
     }
 
@@ -237,7 +257,9 @@ impl TaskSpec {
     pub fn file(&self) -> Option<&FileSpec> {
         match &self.kind {
             Kind::File(file) => Some(file),
-            Kind::Hls(_) | Kind::Torrent(_) | Kind::Cloud(_) | Kind::Web(_) => None,
+            Kind::Pending(_) | Kind::Hls(_) | Kind::Torrent(_) | Kind::Cloud(_) | Kind::Web(_) => {
+                None
+            }
         }
     }
 
@@ -245,7 +267,7 @@ impl TaskSpec {
     pub fn torrent(&self) -> Option<&TorrentSpec> {
         match &self.kind {
             Kind::Torrent(torrent) => Some(torrent),
-            Kind::Hls(_) | Kind::File(_) | Kind::Cloud(_) | Kind::Web(_) => None,
+            Kind::Pending(_) | Kind::Hls(_) | Kind::File(_) | Kind::Cloud(_) | Kind::Web(_) => None,
         }
     }
 
@@ -253,7 +275,17 @@ impl TaskSpec {
     pub fn cloud(&self) -> Option<&CloudSpec> {
         match &self.kind {
             Kind::Cloud(cloud) => Some(cloud),
-            Kind::Hls(_) | Kind::File(_) | Kind::Torrent(_) | Kind::Web(_) => None,
+            Kind::Pending(_) | Kind::Hls(_) | Kind::File(_) | Kind::Torrent(_) | Kind::Web(_) => {
+                None
+            }
+        }
+    }
+
+    /// 还没定下的任务的内容；定下了的为 None。
+    pub fn pending(&self) -> Option<&PendingSpec> {
+        match &self.kind {
+            Kind::Pending(pending) => Some(pending),
+            Kind::Hls(_) | Kind::File(_) | Kind::Torrent(_) | Kind::Cloud(_) | Kind::Web(_) => None,
         }
     }
 
@@ -261,7 +293,9 @@ impl TaskSpec {
     pub fn web(&self) -> Option<&WebSpec> {
         match &self.kind {
             Kind::Web(web) => Some(web),
-            Kind::Hls(_) | Kind::File(_) | Kind::Torrent(_) | Kind::Cloud(_) => None,
+            Kind::Pending(_) | Kind::Hls(_) | Kind::File(_) | Kind::Torrent(_) | Kind::Cloud(_) => {
+                None
+            }
         }
     }
 }
@@ -286,19 +320,104 @@ impl OutputSpec {
     }
 }
 
-/// 任务在存储里的状态。运行中的细节（进度、阶段）不存，见 [`crate::Event`]。
+/// 任务在存储里的状态。运行中的细节（进度、阶段、准备到哪一步）不存，见 [`crate::Event`]。
+///
+/// [`Status::Preparing`]、[`Status::Waiting`] 的任务一定还没定下（[`Kind::Pending`]），[`Status::Running`]、
+/// [`Status::Done`] 的一定定下了，[`Status::Paused`]、[`Status::Failed`] 两种都有。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
+    /// 准备中：服务在认地址、解析、取种子信息，定下是哪种任务后接着下载
+    Preparing,
+    /// 准备到要用户决定的一步，停下等：在等什么。可选项只在内存里（[`crate::Handle::stage`]），重开应用后要
+    /// [`crate::Handle::resume`] 重新准备才有
+    Waiting(Ask),
     /// 在下载或录制
     Running,
-    /// 用户暂停；任务目录保留，继续时续传。应用异常退出时还在运行的，重开后也是这个状态
+    /// 用户暂停；任务目录保留，继续时续传（还没定下的从头准备）。应用异常退出时还在运行或准备中的，重开后也是这个状态
     Paused,
-    /// 以错误结束；任务目录保留
+    /// 以错误结束；任务目录保留。还没定下的继续时从头准备
     Failed(Failure),
     /// 已写出输出
     Done,
     /// 放弃了而没做完（中途出错、超时或应用退出）：任务目录可能已删了一部分，不能继续，只能再放弃
     DiscardUnfinished,
+}
+
+/// 准备中的任务停下来等用户做什么。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ask {
+    /// 选画质：HLS 的变体与音轨，或网页视频的一档
+    Quality,
+    /// 选种子里要下的文件
+    Files,
+    /// 网页里找到几条流，选一条
+    Stream,
+    /// 没有要选的，开始前确认保存目录与输出（设置里开了「开始前先停下确认」）
+    Confirm,
+    /// 要用户在网页里动手
+    Page(PageAsk),
+    /// 几个插件都认这个网址，选一个
+    Plugin,
+    /// 解析要用的组件没装好，等用户同意安装
+    Components,
+}
+
+/// 要用户在网页里做什么。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageAsk {
+    /// 过人机验证
+    Challenge,
+    /// 登录这个网站
+    Login,
+    /// 点播放：网页打开后没找到流
+    Play,
+}
+
+impl Ask {
+    /// 在存储里的写法（表上的 CHECK 列着全部写法）。
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Ask::Quality => "quality",
+            Ask::Files => "files",
+            Ask::Stream => "stream",
+            Ask::Confirm => "confirm",
+            Ask::Page(PageAsk::Challenge) => "page-challenge",
+            Ask::Page(PageAsk::Login) => "page-login",
+            Ask::Page(PageAsk::Play) => "page-play",
+            Ask::Plugin => "plugin",
+            Ask::Components => "components",
+        }
+    }
+
+    /// [`Ask::code`] 的反过来；认不出时为 None。
+    pub(crate) fn parse(code: &str) -> Option<Ask> {
+        Some(match code {
+            "quality" => Ask::Quality,
+            "files" => Ask::Files,
+            "stream" => Ask::Stream,
+            "confirm" => Ask::Confirm,
+            "page-challenge" => Ask::Page(PageAsk::Challenge),
+            "page-login" => Ask::Page(PageAsk::Login),
+            "page-play" => Ask::Page(PageAsk::Play),
+            "plugin" => Ask::Plugin,
+            "components" => Ask::Components,
+            _ => return None,
+        })
+    }
+
+    /// 全部取值：存储的测试逐个写入读回。
+    #[cfg(test)]
+    pub(crate) const EVERY: [Ask; 9] = [
+        Ask::Quality,
+        Ask::Files,
+        Ask::Stream,
+        Ask::Confirm,
+        Ask::Page(PageAsk::Challenge),
+        Ask::Page(PageAsk::Login),
+        Ask::Page(PageAsk::Play),
+        Ask::Plugin,
+        Ask::Components,
+    ];
 }
 
 /// 存储里的一个任务。
@@ -307,7 +426,7 @@ pub struct Task {
     pub id: TaskId,
     pub spec: TaskSpec,
     pub status: Status,
-    /// 任务目录（绝对路径），定下后不变。HLS 与文件任务新建时定下，为 None 时没有自己的任务目录：旧版本存储里已完成
+    /// 任务目录（绝对路径），定下后不变。还没定下的任务没有。HLS 与文件任务定下时一起定下，为 None 时没有自己的任务目录：旧版本存储里已完成
     /// 的，或与别的任务共用任务目录、迁移时让给了那个任务的（状态为失败），这样的任务不能继续，只能从列表移除。BT 任务
     /// 没有任务目录（内容直接下到保存目录，续传数据存在存储里），总是 None。云离线任务与内容的根
     /// （[`CloudSpec::root`]）一起定下，之前为 None；里面每个文件一个核心的任务目录
@@ -319,11 +438,15 @@ pub struct Task {
     pub total: Option<usize>,
     /// 完成时写出的结果；没完成时为 None
     pub result: Option<Finished>,
-    /// 最近一次运行是只写出已录的（[`crate::Service::write_recorded`] 置上，[`crate::Service::resume`] 清掉）：用户选了
+    /// 最近一次运行是只写出已录的（[`crate::Handle::write_recorded`] 置上，[`crate::Handle::resume`] 清掉）：用户选了
     /// 不再续录；文件任务总是 false
     pub write_only: bool,
     /// BT 任务在做种，或下次打开应用要接着做（只在已完成时）；别的任务总是 false
     pub seeding: bool,
+    /// 完成的时刻，Unix 秒；没完成时、与第 13 版之前完成的任务为 None
+    pub finished_at: Option<i64>,
+    /// 处于 [`Status::Running`] 的累计时长，每次停下时累加（准备中的不算）；第 13 版之前的各次运行不在内
+    pub active: std::time::Duration,
 }
 
 /// 完成时写出的结果，供之后显示。
