@@ -6,7 +6,7 @@ use gpui_kit::{Context, Div, FontWeight, ParentElement as _, Styled as _, Window
 use hs_dlx_app::Seeding;
 
 use super::{SettingsView, row};
-use crate::ui::{self, Tone};
+use crate::widgets::{self, Button, Kind, Toward};
 
 /// 做种的几种选择：名字与设置。「分享率 1.0 或 24 小时」为默认（见 [`Seeding::default`]）
 const SEEDING_CHOICES: [(&str, &str); 3] = [
@@ -62,19 +62,21 @@ impl SettingsView {
             .into_iter()
             .zip(choices)
             .map(|((id, label), value)| {
-                ui::chip(
+                widgets::chip(
                     id,
                     label,
                     self.seeding == value,
+                    Toward::Right,
                     cx.listener(move |this, _, _, cx| this.pick_seeding(value, cx)),
                 )
             });
         let upload = UPLOAD_CHOICES.into_iter().map(|(id, label, limit)| {
             let value = limit.and_then(NonZeroU32::new);
-            ui::chip(
+            widgets::chip(
                 id,
                 label,
                 self.upload_limit == value,
+                Toward::Right,
                 cx.listener(move |this, _, _, cx| this.pick_upload(value, cx)),
             )
         });
@@ -89,7 +91,7 @@ impl SettingsView {
                     .flex_col()
                     .gap(px(12.))
                     .child(div().flex().flex_wrap().gap(px(8.)).children(seeding))
-                    .children(self.seeding_error.clone().map(ui::error_text)),
+                    .children(self.seeding_error.clone().map(widgets::error_text)),
             ),
             row(
                 "上传限速",
@@ -173,16 +175,18 @@ impl SettingsView {
     pub(super) fn render_network_check(&self, cx: &mut Context<Self>) -> Div {
         let running = self.network_check.is_some();
         let mut content = div().flex().flex_col().gap(px(12.)).child(
-            div().flex().items_center().gap(px(12.)).child(ui::button(
-                "check-network",
-                if running {
-                    "在检测…"
-                } else {
-                    "检测网络"
-                },
-                Tone::Plain,
-                cx.listener(|this, _, _, cx| this.check_network(cx)),
-            )),
+            div().flex().items_center().gap(px(12.)).child(
+                Button::new(
+                    "check-network",
+                    if running {
+                        "在检测…"
+                    } else {
+                        "检测网络"
+                    },
+                    Kind::Secondary,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.check_network(cx))),
+            ),
         );
         match &self.network_report {
             Some(Ok(report)) => {
@@ -191,7 +195,7 @@ impl SettingsView {
                         report
                             .checks
                             .iter()
-                            .map(|check| ui::check_line(check.level, &check.text)),
+                            .map(|check| widgets::check_line(check.level, &check.text)),
                     )
                     .child(
                         div()
@@ -199,7 +203,7 @@ impl SettingsView {
                             .child(report.verdict.clone()),
                     );
             }
-            Some(Err(reason)) => content = content.child(ui::error_text(reason.clone())),
+            Some(Err(reason)) => content = content.child(widgets::error_text(reason.clone())),
             None => {}
         }
         row(
@@ -225,16 +229,18 @@ impl SettingsView {
             .flex()
             .flex_wrap()
             .gap(px(8.))
-            .child(ui::chip(
+            .child(widgets::chip(
                 "torrent-direct",
                 "直连",
                 !picked,
+                Toward::Right,
                 cx.listener(|this, _, window, cx| this.pick_torrent_proxy(false, window, cx)),
             ))
-            .child(ui::chip(
+            .child(widgets::chip(
                 "torrent-socks",
                 "经 SOCKS5 代理",
                 picked,
+                Toward::Right,
                 cx.listener(|this, _, window, cx| this.pick_torrent_proxy(true, window, cx)),
             ));
         let input = picked.then(|| {
@@ -243,10 +249,10 @@ impl SettingsView {
                 .flex_col()
                 .gap(px(8.))
                 .child(self.torrent_address.clone())
-                .child(ui::caption(
+                .child(widgets::caption(
                     "主机为 IPv4 地址或主机名；代理要转发 UDP（UDP ASSOCIATE），DHT 才经得了它",
                 ))
-                .children(unsaved.map(ui::caption))
+                .children(unsaved.map(widgets::caption))
         });
         row(
             "BT 代理",
@@ -257,8 +263,8 @@ impl SettingsView {
                 .gap(px(12.))
                 .child(chips)
                 .children(input)
-                .children(self.torrent_proxy_error.clone().map(ui::error_text))
-                .child(ui::caption(
+                .children(self.torrent_proxy_error.clone().map(widgets::error_text))
+                .child(widgets::caption(
                     "很多代理服务禁止 BT，可能限速或封号，做种的上传也走代理；经代理时外面连不进来；改了之后的连接经它，已连着的不断",
                 )),
         )

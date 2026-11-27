@@ -10,7 +10,7 @@ use hs_m3u8_core::{
 
 use crate::format;
 
-/// 一条信号的级别，决定卡片的描边颜色。
+/// 一条信号的级别：要留意与失败级别的在时间线上用警告色。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
     Info,

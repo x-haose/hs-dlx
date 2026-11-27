@@ -13,7 +13,7 @@ use hs_dlx_app::curl;
 use hs_m3u8_core::{Url, check_option_header};
 
 use crate::theme;
-use crate::ui::{self, TEXT_LINE};
+use crate::widgets;
 
 pub struct HeadersEditor {
     /// 这些请求头用于哪个地址：加入的 curl 命令要与它同源（见 [`curl::Request::check_target`]）
@@ -167,11 +167,11 @@ impl Render for HeadersEditor {
                 .px(px(12.))
                 .py(px(6.))
                 .rounded(px(10.))
-                .bg(theme::cell())
+                .bg(theme::wash())
                 .border_1()
-                .border_color(theme::deck_edge())
+                .border_color(theme::rule())
                 .text_size(px(12.))
-                .line_height(px(TEXT_LINE))
+                .line_height(px(widgets::TEXT_LINE))
                 .child(
                     div()
                         .flex_none()
@@ -183,7 +183,7 @@ impl Render for HeadersEditor {
                         .flex_1()
                         .min_w_0()
                         .truncate()
-                        .text_color(theme::muted())
+                        .text_color(theme::ink_3())
                         .child(shown(name, value)),
                 )
                 .child(
@@ -191,9 +191,9 @@ impl Render for HeadersEditor {
                         .id(("remove-header", i))
                         .flex_none()
                         .px(px(4.))
-                        .text_color(theme::muted())
+                        .text_color(theme::ink_3())
                         .cursor_pointer()
-                        .hover(|s| s.text_color(theme::text()))
+                        .hover(|s| s.text_color(theme::ink()))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.headers.remove(i);
                             cx.notify();
@@ -206,15 +206,14 @@ impl Render for HeadersEditor {
             .flex_col()
             .gap(px(8.))
             .children(rows)
-            .child(
-                ui::input_frame().child(Input::new(&self.input).appearance(false).on_paste({
+            .child(widgets::input_frame().child(
+                Input::new(&self.input).appearance(false).on_paste({
                     let editor = cx.entity().downgrade();
                     let input = self.input.clone();
                     move |item, window, cx| {
-                        let Some(text) = item
-                            .text()
-                            .filter(|text| curl::is_command(text) && ui::pastes_over(&input, cx))
-                        else {
+                        let Some(text) = item.text().filter(|text| {
+                            curl::is_command(text) && widgets::pastes_over(&input, cx)
+                        }) else {
                             return false;
                         };
                         // 视图已释放时照常粘贴
@@ -230,10 +229,10 @@ impl Render for HeadersEditor {
                             })
                             .is_ok()
                     }
-                })),
-            )
-            .children(self.error.clone().map(ui::error_text))
-            .children(dropped_note(&self.dropped).map(ui::caption))
+                }),
+            ))
+            .children(self.error.clone().map(widgets::error_text))
+            .children(dropped_note(&self.dropped).map(widgets::caption))
     }
 }
 

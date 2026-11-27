@@ -12,7 +12,7 @@ use gpui_kit::{
 
 use super::Shell;
 use crate::tasks::Tasks;
-use crate::ui::{self, TITLE_HEIGHT};
+use crate::ui::TITLE_HEIGHT;
 use crate::{format, ring, theme};
 
 /// 标志的小环（画到 [`ring::LOGO_ARC`]）的边长与环宽。
@@ -64,7 +64,7 @@ impl Shell {
                                     LOGO_WIDTH,
                                     ring::LOGO_ARC,
                                     theme::accent(),
-                                    theme::line(),
+                                    theme::outline(),
                                     window,
                                 );
                             },
@@ -90,30 +90,30 @@ impl Shell {
                             .text_size(px(13.))
                             .text_color(theme::accent())
                             .cursor_pointer()
-                            .hover(|s| s.text_color(theme::accent_pale()))
+                            .hover(|s| s.text_color(theme::ink()))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.open_updates(window, cx);
                             }))
                             .child(format!("新版本 {version}"))
                     }))
-                    .child(ui::num(
+                    .child(
                         div()
                             .flex()
                             .gap(px(18.))
                             .text_size(px(13.))
-                            .text_color(theme::soft())
+                            .text_color(theme::ink_2())
                             .children(activity)
                             .children(space.map(|(text, warn)| {
                                 div()
                                     .when(warn, |s| s.text_color(theme::warn()))
                                     .child(text)
                             })),
-                    ))
+                    )
                     .child(self.settings_button(cx)),
             )
     }
 
-    /// 设置的按钮：齿轮，设置页开着时发光。
+    /// 设置的按钮：齿轮，设置页开着时为主色、有底。
     fn settings_button(&self, cx: &Context<Self>) -> impl IntoElement {
         let on = self.settings.is_some();
         div()
@@ -128,14 +128,14 @@ impl Shell {
             .map(|button| {
                 if on {
                     button
-                        .border_color(theme::edge())
-                        .bg(theme::selected())
+                        .border_color(theme::outline())
+                        .bg(theme::hover())
                         .text_color(theme::accent())
                 } else {
                     button
                         .border_color(gpui_kit::transparent_black())
-                        .text_color(theme::muted())
-                        .hover(|s| s.bg(theme::selected()))
+                        .text_color(theme::ink_3())
+                        .hover(|s| s.bg(theme::hover()))
                 }
             })
             .on_click(cx.listener(|this, _, window, cx| this.toggle_settings(window, cx)))

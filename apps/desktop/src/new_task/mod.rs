@@ -9,7 +9,7 @@ mod figure;
 mod inspector;
 mod web;
 
-use self::figure::{FIGURE_HEIGHT, FIGURE_WIDTH};
+use self::figure::{FIGURE_HEIGHT, FIGURE_WIDTH, KEYS_HEIGHT};
 
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -39,7 +39,7 @@ use crate::ui::{self, GAP, INSPECTOR_MIN_WIDTH};
 /// 新建页的最小宽：整个同心环区域与收到最窄的检查面板（放得下一行「MP4 · 本地 HLS · 两者」三个选项）。
 pub const MIN_WIDTH: f32 = FIGURE_WIDTH + GAP + INSPECTOR_MIN_WIDTH;
 /// 新建页的最小高：放得下同心环区域、按键说明与粘贴栏的舞台。
-pub const MIN_HEIGHT: f32 = ui::stage_height(FIGURE_HEIGHT, ui::CAPTION_LINE);
+pub const MIN_HEIGHT: f32 = ui::stage_height(FIGURE_HEIGHT, KEYS_HEIGHT);
 
 /// 要探测的链接。
 #[derive(Clone)]

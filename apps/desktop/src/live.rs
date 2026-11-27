@@ -27,7 +27,12 @@ const HUB: f32 = 7.;
 
 /// 相邻会话交替的颜色。
 pub fn session_colors() -> [Hsla; 2] {
-    [theme::accent(), theme::session_alt()]
+    [theme::accent(), theme::ink()]
+}
+
+/// 录到的里不知道是哪个会话的部分（这次打开应用以前录的）的颜色。
+pub fn before_color() -> Hsla {
+    theme::alpha(theme::accent(), 0.45)
 }
 
 /// 这次打开应用以来看到的录制时间线：会话从哪里起、哪里缺了片。只在内存里，重开应用后从下一次进度重新记。
@@ -138,7 +143,7 @@ pub fn lap_of(at: Duration) -> (u64, f32) {
 pub struct Face<'a> {
     pub recorded: Duration,
     pub timeline: &'a Timeline,
-    /// 正在录：画指针，录到的格子发光
+    /// 正在录：画指针
     pub recording: bool,
 }
 
@@ -151,15 +156,11 @@ fn paint_lap(
     window: &mut Window,
 ) {
     let colors = session_colors();
-    let mut idle = Stroke::new(2., theme::line(), HALF);
-    let mut unknown = Stroke::new(2., theme::accent_dim(), HALF);
+    let mut idle = Stroke::new(2., theme::outline(), HALF);
+    let mut unknown = Stroke::new(2., before_color(), HALF);
     let mut lit: Vec<Stroke> = colors
         .iter()
         .map(|&color| Stroke::new(2., color, HALF))
-        .collect();
-    let mut halos: Vec<Stroke> = colors
-        .iter()
-        .map(|&color| Stroke::new(6., theme::alpha(color, 0.16), HALF + 1.))
         .collect();
     let start = lap.map(lap_start);
     for i in 0..TICKS {
@@ -167,13 +168,7 @@ fn paint_lap(
         let at = start.map(|start| start + LAP / TICKS as u32 * i as u32);
         match at {
             Some(at) if at < face.recorded => match face.timeline.session_index(at) {
-                Some(index) => {
-                    let k = index % colors.len();
-                    if face.recording {
-                        halos[k].tick(center, radius, rad);
-                    }
-                    lit[k].tick(center, radius, rad);
-                }
+                Some(index) => lit[index % colors.len()].tick(center, radius, rad),
                 None => unknown.tick(center, radius, rad),
             },
             _ => idle.tick(center, radius, rad),
@@ -181,20 +176,16 @@ fn paint_lap(
     }
     idle.paint(window);
     unknown.paint(window);
-    for stroke in halos.into_iter().chain(lit) {
+    for stroke in lit {
         stroke.paint(window);
     }
     if let Some(start) = start {
-        let mut halo = Stroke::new(8., theme::alpha(theme::warn(), 0.35), MISS_HALF + 1.);
         let mut miss = Stroke::new(3., theme::warn(), MISS_HALF);
         for &(at, _) in &face.timeline.misses {
             if at >= start && at < start + LAP {
-                let rad = angle(lap_of(at).1);
-                halo.tick(center, radius, rad);
-                miss.tick(center, radius, rad);
+                miss.tick(center, radius, angle(lap_of(at).1));
             }
         }
-        halo.paint(window);
         miss.paint(window);
     }
 }
@@ -209,12 +200,10 @@ pub fn paint(bounds: Bounds<Pixels>, face: &Face<'_>, window: &mut Window) {
         return;
     }
     let tip = on_circle(center, INNER - HALF - 4., angle(within));
-    for (width, color) in [(8., theme::alpha(theme::live(), 0.25)), (2., theme::live())] {
-        let mut hand = gpui_kit::PathBuilder::stroke(px(width));
-        hand.move_to(center);
-        hand.line_to(tip);
-        window.paint_path(hand.build().expect(TESSELLATED), color);
-    }
+    let mut hand = gpui_kit::PathBuilder::stroke(px(2.));
+    hand.move_to(center);
+    hand.line_to(tip);
+    window.paint_path(hand.build().expect(TESSELLATED), theme::live());
     let hub = Bounds::new(
         point(center.x - px(HUB), center.y - px(HUB)),
         size(px(2. * HUB), px(2. * HUB)),

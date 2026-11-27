@@ -5,7 +5,7 @@ use gpui_kit::{Context, Div, ParentElement as _, Styled as _, div, px};
 use super::{SettingsView, row};
 use crate::theme::{self, Theme};
 use crate::tray::Tray;
-use crate::ui;
+use crate::widgets::{self, Toward};
 
 impl SettingsView {
     /// 换外观：存进了才换，整个窗口随之重画。
@@ -24,10 +24,11 @@ impl SettingsView {
 
     pub(super) fn render_theme(&self, cx: &mut Context<Self>) -> Div {
         let chip = |id: &'static str, label: &'static str, value: Theme, cx: &mut Context<Self>| {
-            ui::chip(
+            widgets::chip(
                 id,
                 label,
                 theme::current() == value,
+                Toward::Right,
                 cx.listener(move |this, _, _, cx| this.pick_theme(value, cx)),
             )
         };
@@ -46,7 +47,7 @@ impl SettingsView {
                         .child(chip("theme-eclipse", "日蚀", Theme::Eclipse, cx))
                         .child(chip("theme-blood-moon", "血月", Theme::BloodMoon, cx)),
                 )
-                .children(self.theme_error.clone().map(ui::error_text)),
+                .children(self.theme_error.clone().map(widgets::error_text)),
         )
     }
 }

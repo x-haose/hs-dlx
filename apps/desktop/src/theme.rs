@@ -1,9 +1,13 @@
-//! 界面配色。底色由暗到亮分三层：窗口底色（中间的舞台直接在它上面；输入框也用它，在面板上显得凹下去）、面板（任务栏、
-//! 检查面板、整页面板）、面板里的卡片与读数格。颜色即含义：发光的主色为在进行与可操作，警告色为重试与要处理的问题，
-//! 直播色为录制，失败级别的信号另有一色。
+//! 界面配色：每套主题（[`Theme`]）一组角色，取值照设计稿的 `hs.css`。
 //!
-//! 主色、警告色与直播色随主题（[`Theme`]）：日蚀为青色与深蓝，血月为火红与暗红；中性的底色、线与字两套共用。主题是
-//! 整个应用的状态（只有一个窗口），启动时按设置由 [`set`] 定，在设置页换了之后要让窗口重画。
+//! 角色：窗口底色 [`bg`]；圆盘里面 [`moon`]；文字 [`ink`] 按透明度分三级（[`ink`]、[`ink_2`]、[`ink_3`]）；主色
+//! [`accent`]（进度、选中、每屏最该按的那一个）；[`deep`]（光的深处、做种）；[`core`](fn@core)（光最亮处）；警告色 [`warn`]
+//! （要处理的问题）；直播色 [`live`]（录制）。线与面都是 [`ink`] 的低透明度（[`rule`]、[`outline`]、[`wash`]），所以
+//! 中性色随主题：血月下底色、线、次要字都偏暖。
+//!
+//! 一个光源：界面上除背景的日冕外没有东西发光，没有外发光与内发光。
+//!
+//! 主题是整个应用的状态（只有一个窗口），启动时按设置由 [`set`] 定，在设置页换了之后要让窗口重画。
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -12,6 +16,44 @@ pub use hs_dlx_app::Theme;
 
 /// 当前主题：0 为日蚀，1 为血月。
 static CURRENT: AtomicU8 = AtomicU8::new(0);
+
+/// 一套主题的各个角色（sRGB，0xRRGGBB）。
+struct Palette {
+    bg: u32,
+    moon: u32,
+    /// 实心主色、直播色上的文字
+    on: u32,
+    ink: u32,
+    accent: u32,
+    deep: u32,
+    core: u32,
+    warn: u32,
+    live: u32,
+}
+
+const ECLIPSE: Palette = Palette {
+    bg: 0x04060A,
+    moon: 0x020306,
+    on: 0x04141A,
+    ink: 0xEEF1F6,
+    accent: 0x5BE7F5,
+    deep: 0x3A60FF,
+    core: 0xE4F9FF,
+    warn: 0xFFAC60,
+    live: 0xFF626A,
+};
+
+const BLOOD_MOON: Palette = Palette {
+    bg: 0x090504,
+    moon: 0x050302,
+    on: 0x200A04,
+    ink: 0xF7F0EA,
+    accent: 0xFF7C4A,
+    deep: 0xC42212,
+    core: 0xFFE4B8,
+    warn: 0xFFD870,
+    live: 0xFF609C,
+};
 
 /// 换主题；之后取的颜色都按它。
 pub fn set(theme: Theme) {
@@ -30,166 +72,98 @@ pub fn current() -> Theme {
     }
 }
 
-/// 按当前主题取 `eclipse` 或 `blood_moon` 里的一色。
-fn pick(eclipse: u32, blood_moon: u32) -> Hsla {
-    rgb(match current() {
-        Theme::Eclipse => eclipse,
-        Theme::BloodMoon => blood_moon,
-    })
-    .into()
+fn palette() -> &'static Palette {
+    match current() {
+        Theme::Eclipse => &ECLIPSE,
+        Theme::BloodMoon => &BLOOD_MOON,
+    }
 }
 
-/// 窗口底色：中间的舞台直接在它上面
-pub fn ground() -> Hsla {
-    rgb(0x05070B).into()
+fn color(hex: u32) -> Hsla {
+    rgb(hex).into()
 }
 
-/// 面板：任务栏、检查面板与整页面板的底色
-pub fn deck() -> Hsla {
-    rgb(0x0A0E16).into()
+/// 窗口底色；列表一栏与舞台直接铺在它上面
+pub fn bg() -> Hsla {
+    color(palette().bg)
 }
 
-/// 面板的描边
-pub fn deck_edge() -> Hsla {
-    rgb(0x18202E).into()
+/// 圆盘里面：比窗口底色更暗
+pub fn moon() -> Hsla {
+    color(palette().moon)
 }
 
-/// 面板里分隔标题栏、底栏与各段的细线
-pub fn hairline() -> Hsla {
-    rgb(0x141B28).into()
-}
-
-/// 读数格与面板里的卡片的底色
-pub fn cell() -> Hsla {
-    rgb(0x0C111B).into()
-}
-
-/// 读数格的标签、时间：最次一级、只作标注的字
-pub fn faint() -> Hsla {
-    rgb(0x737C94).into()
-}
-
-/// 刻度环中间的圆盘
-pub fn disc() -> Hsla {
-    rgb(0x080B12).into()
-}
-
-/// 可点的东西静止时的底色，以及悬停时稍微抬起的底色
-pub fn raised() -> Hsla {
-    rgb(0x0F131C).into()
-}
-
-/// 选中与按下前（悬停）的底色
-pub fn selected() -> Hsla {
-    rgb(0x111827).into()
-}
-
-/// 最暗的线：还没做的刻度、进度的底、普通级别的描边
-pub fn line() -> Hsla {
-    rgb(0x1A2030).into()
-}
-
-/// 可选、但没选中的环
-pub fn ring_idle() -> Hsla {
-    rgb(0x1E2636).into()
-}
-
-/// 悬停时的描边，与没选中项的标记
-pub fn hover_edge() -> Hsla {
-    rgb(0x2C3850).into()
-}
-
-/// 中间一档的线：面的轮廓、选中项的描边、引线
-pub fn edge() -> Hsla {
-    rgb(0x22304A).into()
-}
-
-/// 较亮的线：可点的东西的轮廓
-pub fn stroke() -> Hsla {
-    rgb(0x2A3346).into()
+/// 实心的主色、直播色上的文字
+pub fn on() -> Hsla {
+    color(palette().on)
 }
 
 /// 正文
-pub fn text() -> Hsla {
-    rgb(0xEDEFF5).into()
+pub fn ink() -> Hsla {
+    color(palette().ink)
 }
 
-/// 比正文稍暗的字：次一级但仍要读的
-pub fn soft() -> Hsla {
-    rgb(0xC9CEDB).into()
+/// 次一级的文字：来源、说明、没选中的选项
+pub fn ink_2() -> Hsla {
+    alpha(ink(), 0.72)
 }
 
-/// 次要文字；在 [`ground`] 上对比度约 6:1
-pub fn muted() -> Hsla {
-    rgb(0x8C93A6).into()
+/// 最次一级、只作标注的文字：小标题、读数的标签、时刻、占位字
+pub fn ink_3() -> Hsla {
+    alpha(ink(), 0.56)
 }
 
-/// 主色：进度、选中、每屏最该按的那一个
+/// 分隔线与容器的边：读数之间的竖线、分隔线、面板与输入框的描边
+pub fn rule() -> Hsla {
+    alpha(ink(), 0.1)
+}
+
+/// 可点的东西的描边（次按钮、选项、键帽），与进度环没走到的部分
+pub fn outline() -> Hsla {
+    alpha(ink(), 0.16)
+}
+
+/// 抬起的面：次按钮与粘贴栏的底
+pub fn wash() -> Hsla {
+    alpha(ink(), 0.05)
+}
+
+/// 悬停时的底
+pub fn hover() -> Hsla {
+    alpha(ink(), 0.08)
+}
+
+/// 输入框的底：比窗口底色凹下去一层
+pub fn sunken() -> Hsla {
+    alpha(gpui_kit::black(), 0.3)
+}
+
+/// 主色
 pub fn accent() -> Hsla {
-    pick(0x5BE7F5, 0xFF6A3D)
+    color(palette().accent)
 }
 
-/// 主色的浅一档：主色悬停时、写出阶段
-pub fn accent_pale() -> Hsla {
-    pick(0xA8F3FA, 0xFFC59E)
+/// 光的深处；做种的颜色
+pub fn deep() -> Hsla {
+    color(palette().deep)
 }
 
-/// 主色的暗一档：不在动的进度（暂停）、正在下的刻度
-pub fn accent_dim() -> Hsla {
-    pick(0x2C7F88, 0x8A2E18)
+/// 光最亮处
+pub fn core() -> Hsla {
+    color(palette().core)
 }
 
-/// 要处理的说明的底色
-pub fn warn_ground() -> Hsla {
-    rgb(0x140F08).into()
-}
-
-/// 主色实心上的文字
-pub fn on_accent() -> Hsla {
-    pick(0x04161A, 0x1F0A04)
-}
-
-/// 直播钟面上相邻会话交替的第二种颜色（第一种是主色）
-pub fn session_alt() -> Hsla {
-    rgb(0xE8ECF5).into()
-}
-
-/// 写出阶段已写出的部分
-pub fn written() -> Hsla {
-    rgb(0xE8ECF5).into()
-}
-
-/// 要留意的：重试、失败、要用户处理的提示；血月下为琥珀黄，与火红的主色分开
+/// 警告色：重试、失败、等用户处理；血月下为琥珀黄，与火红的主色分开
 pub fn warn() -> Hsla {
-    pick(0xFFA24C, 0xFFD25E)
+    color(palette().warn)
 }
 
 /// 直播录制；血月下偏玫红，与火红的主色分开
 pub fn live() -> Hsla {
-    pick(0xFF5A5F, 0xFF4D8A)
+    color(palette().live)
 }
 
-/// 不再需要注意的：已完成、作废的进度
-pub fn finished() -> Hsla {
-    rgb(0x3B4253).into()
-}
-
-/// 要留意级别的信号的字
-pub fn signal_warn() -> Hsla {
-    pick(0xFFC48C, 0xFFE29A)
-}
-
-/// 失败级别的信号的字
-pub fn signal_error() -> Hsla {
-    rgb(0xFF8A8D).into()
-}
-
-/// 要留意级别的描边：重试类信号与要用户关掉的提示
-pub fn warn_edge() -> Hsla {
-    rgb(0x5A3A18).into()
-}
-
-/// `color` 换成透明度 `alpha`（0 到 1），发光与半透明用。
+/// `color` 换成透明度 `alpha`（0 到 1）。
 pub fn alpha(color: Hsla, alpha: f32) -> Hsla {
     Hsla { a: alpha, ..color }
 }

@@ -5,8 +5,7 @@ use std::time::{Duration, Instant};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, Context, Div, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Task, div,
-    linear_color_stop, linear_gradient, px,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Task, div, px,
 };
 use hs_dlx_app::web::Container;
 use hs_dlx_app::{Check, FailureKind, TaskId};
@@ -19,8 +18,9 @@ use super::plan::{Action, Instead, Plan, stopped_plan};
 use super::{Shell, live_view};
 use crate::signals::{Level, Signal};
 use crate::tasks::{Amount, Disk, FileAmount, Row, main_output, resume_label, saved_as};
-use crate::ui::{self, GAP, INSPECTOR_MIN_WIDTH, Solid, Tone};
-use crate::{dial, disk_access, format, motion, ring, theme};
+use crate::ui::{self, GAP, INSPECTOR_MIN_WIDTH};
+use crate::widgets::{self, Button, Kind, Line, Size, Stat};
+use crate::{dial, disk_access, format, ring, theme};
 
 /// 在系统的文件管理器里显示输出：各平台的叫法。
 const REVEAL: &str = if cfg!(target_os = "macos") {
@@ -30,10 +30,6 @@ const REVEAL: &str = if cfg!(target_os = "macos") {
 } else {
     "在文件夹中显示"
 };
-/// 信号时间线：竖线离左边多远、最新几条不变淡、最新一条的节点呼吸一次多久。
-const SIGNAL_RAIL: f32 = 9.5;
-const SIGNAL_FRESH: usize = 3;
-const SIGNAL_BREATH: Duration = Duration::from_millis(2400);
 /// 任务页的最小宽：表盘与收到最窄的检查面板。
 pub(super) const MIN_WIDTH: f32 = ring::AREA + GAP + INSPECTOR_MIN_WIDTH;
 /// 任务页的最小高：放得下表盘与粘贴栏的舞台。
@@ -76,8 +72,8 @@ pub(super) struct Diagnosis {
 
 /// 检查面板底栏里的操作：最该按的一个与其余的。
 struct Foot {
-    primary: Option<Stateful<Div>>,
-    rest: Vec<Stateful<Div>>,
+    primary: Option<Button>,
+    rest: Vec<Button>,
 }
 
 impl Shell {
@@ -91,7 +87,6 @@ impl Shell {
         } else {
             let ticks = look.ticks;
             dial::dial(
-                look.color,
                 corona(row, &look, now),
                 dial::figure(move |bounds, window, _| {
                     ring::paint_ticks(bounds, ring::RADIUS, &ticks, window)
@@ -126,20 +121,20 @@ impl Shell {
                 .gap(px(10.))
                 .max_w_full()
                 .text_size(px(12.))
-                .text_color(theme::muted())
-                .child(ui::num(
+                .text_color(theme::ink_3())
+                .child(
                     div()
                         .min_w_0()
                         .truncate()
                         .child(format!("剪贴板：{}", bare_url(&url))),
-                ))
+                )
                 .child(
                     div()
                         .id("probe-clipboard-hint")
                         .flex_none()
                         .text_color(theme::accent())
                         .cursor_pointer()
-                        .hover(|s| s.text_color(theme::accent_pale()))
+                        .hover(|s| s.text_color(theme::ink()))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.probe_text(url.as_str(), window, cx)
                         }))
@@ -168,27 +163,7 @@ impl Shell {
             reads(row, now)
         };
         if !cells.is_empty() {
-            body.push(ui::reads(cells, None).into_any_element());
-        }
-        if !live && row.task.status == Status::Running {
-            body.push(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.))
-                    .child(ui::caption("速度 · 最近 60 秒"))
-                    .child(
-                        div()
-                            .px(px(10.))
-                            .py(px(8.))
-                            .rounded(px(10.))
-                            .bg(theme::ground())
-                            .border_1()
-                            .border_color(theme::edge())
-                            .child(ui::speed_matrix(row.rate.history(now).to_vec())),
-                    )
-                    .into_any_element(),
-            );
+            body.push(widgets::stats(cells, 2).into_any_element());
         }
         if live {
             body.push(live_view::legend(row).into_any_element());
@@ -200,7 +175,7 @@ impl Shell {
         let Foot { primary, rest } = self.foot(row, cx);
         let mut foot: Vec<AnyElement> = Vec::new();
         if let Some(hint) = look.hint {
-            foot.push(ui::note(hint, true).into_any_element());
+            foot.push(widgets::note(hint, true).into_any_element());
         }
         // 读不了浏览器的数据：失败的说明里已写了怎么开权限，这里给直达的按钮
         if matches!(&row.task.status, Status::Failed(failure) if failure.kind == FailureKind::WebCookies)
@@ -235,41 +210,36 @@ impl Shell {
             .as_ref()
             .filter(|diagnosis| diagnosis.id == id && diagnosis.run == run);
         let button = |label: &'static str| {
-            ui::button(
-                "diagnose",
-                label,
-                Tone::Plain,
-                cx.listener(move |this, _, _, cx| this.diagnose(id, run, cx)),
-            )
+            Button::new("diagnose", label, Kind::Secondary)
+                .on_click(cx.listener(move |this, _, _, cx| this.diagnose(id, run, cx)))
         };
-        let body: AnyElement = match shown.map(|diagnosis| &diagnosis.result) {
-            None => button("诊断网络与节点").into_any_element(),
-            Some(None) => ui::note("在诊断…", false).into_any_element(),
-            Some(Some(Err(reason))) => div()
-                .flex()
-                .flex_col()
-                .gap(px(8.))
-                .child(ui::error_text(reason.clone()))
-                .child(button("再诊断一次"))
-                .into_any_element(),
-            Some(Some(Ok(checks))) => div()
-                .flex()
-                .flex_col()
-                .gap(px(8.))
-                .children(
-                    checks
-                        .iter()
-                        .map(|check| ui::check_line(check.level, &check.text).into_any_element()),
-                )
-                .child(button("再诊断一次"))
-                .into_any_element(),
-        };
+        let body: AnyElement =
+            match shown.map(|diagnosis| &diagnosis.result) {
+                None => button("诊断网络与节点").into_any_element(),
+                Some(None) => widgets::note("在诊断…", false).into_any_element(),
+                Some(Some(Err(reason))) => div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(widgets::error_text(reason.clone()))
+                    .child(button("再诊断一次"))
+                    .into_any_element(),
+                Some(Some(Ok(checks))) => div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .children(checks.iter().map(|check| {
+                        widgets::check_line(check.level, &check.text).into_any_element()
+                    }))
+                    .child(button("再诊断一次"))
+                    .into_any_element(),
+            };
         Some(
             div()
                 .flex()
                 .flex_col()
                 .gap(px(8.))
-                .child(ui::caption("诊断"))
+                .child(widgets::caption("诊断"))
                 .child(body),
         )
     }
@@ -320,28 +290,21 @@ impl Shell {
                 .gap(px(12.))
                 .p(px(14.))
                 // 正在编辑：描边比别的卡片亮一档
-                .border_color(theme::edge())
-                .child(ui::caption("请求头"))
+                .border_color(theme::outline())
+                .child(widgets::caption("请求头"))
                 .child(editor.clone())
                 .child(
                     div()
                         .flex()
                         .gap(px(10.))
                         .child(
-                            ui::button(
-                                "save-headers",
-                                label,
-                                Tone::Glow,
-                                cx.listener(move |this, _, window, cx| {
+                            Button::new("save-headers", label, Kind::Primary)
+                                .on_click(cx.listener(move |this, _, window, cx| {
                                     this.save_headers(resume, window, cx)
-                                }),
-                            )
-                            .flex_1(),
+                                }))
+                                .flex_1(),
                         )
-                        .child(ui::button(
-                            "cancel-headers",
-                            "取消",
-                            Tone::Ghost,
+                        .child(Button::new("cancel-headers", "取消", Kind::Text).on_click(
                             cx.listener(|this, _, _, cx| {
                                 this.editing_headers = None;
                                 cx.notify();
@@ -378,7 +341,7 @@ impl Shell {
     }
 
     /// 暂停或失败的任务的操作（见 [`stopped_plan`]）：第一个是主操作（失败的为警告色），其余在下面一行。
-    fn stopped_foot(&self, row: &Row, discard: Stateful<Div>, cx: &Context<Self>) -> Foot {
+    fn stopped_foot(&self, row: &Row, discard: Button, cx: &Context<Self>) -> Foot {
         let id = row.task.id;
         let failed = matches!(row.task.status, Status::Failed(_));
         let plan = self.plan(row);
@@ -436,10 +399,20 @@ impl Shell {
                 Action::LocalTorrent => this.probe_text(link.as_str(), window, cx),
             });
             if index == 0 {
-                let solid = if failed { Solid::Amber } else { Solid::Glow };
-                primary = Some(ui::primary(key, label, detail, solid, true, on_click));
+                let kind = if failed { Kind::Warn } else { Kind::Primary };
+                primary = Some(
+                    Button::new(key, label, kind)
+                        .size(Size::Large)
+                        .w_full()
+                        .when_some(detail, |button, detail| button.detail(detail))
+                        .on_click(on_click),
+                );
             } else {
-                rest.push(ui::button(key, label, Tone::Plain, on_click).flex_1());
+                rest.push(
+                    Button::new(key, label, Kind::Secondary)
+                        .on_click(on_click)
+                        .flex_1(),
+                );
             }
         }
         rest.push(discard);
@@ -456,44 +429,25 @@ impl Shell {
         let id = row.task.id;
         let confirming = self.confirm_discard == Some(id);
         let discard = |cx: &Context<Self>| {
-            let button = ui::button(
-                "discard",
-                if confirming {
-                    "再点一次：删除已下的内容"
-                } else {
-                    "放弃任务"
-                },
-                if confirming { Tone::Plain } else { Tone::Ghost },
-                cx.listener(move |this, _, _, cx| this.discard(id, confirming, cx)),
-            );
-            // 确认时独占一行，写清后果
-            if confirming {
-                button
-                    .w_full()
-                    .border_color(theme::warn())
-                    .text_color(theme::warn())
+            let (label, kind) = if confirming {
+                ("再点一次：删除已下的内容", Kind::Warn)
             } else {
-                button
-            }
+                ("放弃任务", Kind::Text)
+            };
+            let button = Button::new("discard", label, kind)
+                .on_click(cx.listener(move |this, _, _, cx| this.discard(id, confirming, cx)));
+            // 确认时独占一行，写清后果
+            if confirming { button.w_full() } else { button }
         };
         let pause = |cx: &Context<Self>| {
-            ui::button(
-                "pause",
-                "暂停",
-                Tone::Plain,
-                cx.listener(move |this, _, _, cx| this.tasks.read(cx).pause(id)),
-            )
-            .flex_1()
+            Button::new("pause", "暂停", Kind::Secondary)
+                .on_click(cx.listener(move |this, _, _, cx| this.tasks.read(cx).pause(id)))
+                .flex_1()
         };
-        let forget = |tone: Tone, cx: &Context<Self>| {
-            ui::button(
-                "forget",
-                "从列表移除",
-                tone,
-                cx.listener(move |this, _, _, cx| {
-                    this.tasks.update(cx, |tasks, cx| tasks.forget(id, cx))
-                }),
-            )
+        let forget = |tone: Kind, cx: &Context<Self>| {
+            Button::new("forget", "从列表移除", tone).on_click(cx.listener(
+                move |this, _, _, cx| this.tasks.update(cx, |tasks, cx| tasks.forget(id, cx)),
+            ))
         };
         match &row.task.status {
             Status::DiscardUnfinished => Foot {
@@ -501,19 +455,22 @@ impl Shell {
                 rest: vec![discard(cx).flex_1()],
             },
             Status::Running if row.stoppable() => Foot {
-                primary: Some(ui::primary(
-                    "stop",
-                    "停止并写出",
-                    Amount::of(row).map(|amount| {
-                        format!("写出已录的 {}", format::clock(amount.duration)).into()
-                    }),
-                    Solid::Rec,
-                    true,
-                    cx.listener(move |this, _, _, cx| {
-                        this.tasks.read(cx).stop(id);
-                        cx.notify();
-                    }),
-                )),
+                primary: Some(
+                    Button::new("stop", "停止并写出", Kind::Primary)
+                        .size(Size::Large)
+                        .w_full()
+                        .fill(theme::live())
+                        .when_some(
+                            Amount::of(row).map(|amount| {
+                                format!("写出已录的 {}", format::clock(amount.duration))
+                            }),
+                            |button, detail| button.detail(detail),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.tasks.read(cx).stop(id);
+                            cx.notify();
+                        })),
+                ),
                 rest: vec![pause(cx), discard(cx)],
             },
             Status::Running => Foot {
@@ -529,7 +486,7 @@ impl Shell {
             {
                 Foot {
                     primary: None,
-                    rest: vec![forget(Tone::Plain, cx).flex_1()],
+                    rest: vec![forget(Kind::Secondary, cx).flex_1()],
                 }
             }
             Status::Paused | Status::Failed(_) => self.stopped_foot(row, discard(cx), cx),
@@ -540,49 +497,39 @@ impl Shell {
                     .as_ref()
                     .map_or((None, None), |p| (p.mp4.clone(), p.shown.clone()));
                 let primary = mp4.map(|mp4| {
-                    ui::primary(
-                        "play",
-                        "播放",
-                        Some(row.file_name.clone().into()),
-                        Solid::Glow,
-                        true,
-                        move |_, _, cx| cx.open_with_system(&mp4),
-                    )
+                    Button::new("play", "播放", Kind::Primary)
+                        .size(Size::Large)
+                        .w_full()
+                        .detail(row.file_name.clone())
+                        .on_click(move |_, _, cx| cx.open_with_system(&mp4))
                 });
                 let mut rest = Vec::new();
                 if let Some(shown) = shown {
                     rest.push(
-                        ui::button("reveal", REVEAL, Tone::Plain, move |_, _, cx| {
-                            cx.reveal_path(&shown)
-                        })
-                        .flex_1(),
+                        Button::new("reveal", REVEAL, Kind::Secondary)
+                            .on_click(move |_, _, cx| cx.reveal_path(&shown))
+                            .flex_1(),
                     );
                 }
                 // BT：做种时可停止做种，没在做种时可以再做；做种时从列表移除先停止做种
                 if row.task.spec.torrent().is_some() {
                     rest.push(if row.task.seeding {
-                        ui::button(
-                            "stop-seeding",
-                            "停止做种",
-                            Tone::Ghost,
-                            cx.listener(move |this, _, _, cx| {
+                        Button::new("stop-seeding", "停止做种", Kind::Text).on_click(cx.listener(
+                            move |this, _, _, cx| {
                                 this.tasks
                                     .update(cx, |tasks, cx| tasks.stop_seeding(id, cx));
                                 cx.notify();
-                            }),
-                        )
+                            },
+                        ))
                     } else {
-                        ui::button(
-                            "seed",
-                            "做种",
-                            Tone::Ghost,
-                            cx.listener(move |this, _, _, cx| {
+                        Button::new("seed", "做种", Kind::Text).on_click(cx.listener(
+                            move |this, _, _, cx| {
                                 this.tasks.update(cx, |tasks, cx| tasks.seed(id, cx))
-                            }),
-                        )
+                            },
+                        ))
                     });
                 }
-                rest.push(forget(Tone::Ghost, cx));
+                rest.push(forget(Kind::Text, cx));
                 Foot { primary, rest }
             }
         }
@@ -591,8 +538,7 @@ impl Shell {
 
 /// 检查面板的读数（直播录制的见 [`live_view::reads`]）：下载中为速度、剩余、已下与分片，写出中为已下与分片，停着的为
 /// 已下的片数与大小，完成的为时长、大小、画面与输出；还没有内容时为空。
-fn reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
-    let cell = |label: &'static str, value: String| (SharedString::from(label), value.into());
+fn reads(row: &Row, now: Instant) -> Vec<Stat> {
     if row.task.status == Status::Done {
         let Some(result) = row.task.result.as_ref() else {
             return Vec::new();
@@ -604,10 +550,10 @@ fn reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
                 .filter(|progress| progress.phase == TorrentPhase::Seeding)
         {
             return vec![
-                cell("上传", format!("{}/s", format::bytes(progress.upload_rate))),
-                cell("已上传", format::bytes(progress.uploaded)),
-                cell("分享率", format::ratio(progress.uploaded, progress.wanted)),
-                cell(
+                Stat::new("上传", format!("{}/s", format::bytes(progress.upload_rate))),
+                Stat::new("已上传", format::bytes(progress.uploaded)),
+                Stat::new("分享率", format::ratio(progress.uploaded, progress.wanted)),
+                Stat::new(
                     "节点",
                     // 两边都下完了的节点互相断开（libtorrent 的 close_redundant_connections），做种时连着的都是在下的
                     progress.peers.to_string(),
@@ -616,18 +562,18 @@ fn reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
         }
         let mut cells = Vec::new();
         if row.task.spec.hls().is_some() {
-            cells.push(cell(
+            cells.push(Stat::new(
                 "时长",
                 result
                     .duration
                     .map_or_else(|| "—".to_owned(), format::clock),
             ));
         }
-        cells.push(cell("大小", format::bytes(result.bytes)));
+        cells.push(Stat::new("大小", format::bytes(result.bytes)));
         if let Some((width, height)) = result.resolution {
-            cells.push(cell("画面", format!("{width}×{height}")));
+            cells.push(Stat::new("画面", format!("{width}×{height}")));
         }
-        cells.push(cell("保存为", saved_as(&row.task.spec).to_owned()));
+        cells.push(Stat::text("保存为", saved_as(&row.task.spec)));
         if let Some(skipped) = cloud_skipped(row) {
             cells.push(skipped);
         }
@@ -658,7 +604,10 @@ fn reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
     };
     match row.task.status {
         Status::Running if row.written_share().is_some() => {
-            vec![cell("已下", format::bytes(bytes)), cell("分片", segments)]
+            vec![
+                Stat::new("已下", format::bytes(bytes)),
+                Stat::new("分片", segments),
+            ]
         }
         Status::Running if total > 0 && !row.task.write_only => {
             let speed = format!("{}/s", format::bytes(row.rate.bytes_per_second(now) as u64));
@@ -667,24 +616,23 @@ fn reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
                 .remaining(now, total.saturating_sub(done))
                 .map_or_else(|| "—".to_owned(), format::duration);
             vec![
-                cell("速度", speed),
-                cell("剩余", left),
-                cell("已下", format::bytes(bytes)),
-                cell("分片", segments),
+                speed_stat(row, now, speed),
+                Stat::new("剩余", left),
+                Stat::new("已下", format::bytes(bytes)),
+                Stat::new("分片", segments),
             ]
         }
         Status::Running => Vec::new(),
         _ if done == 0 => Vec::new(),
         _ => vec![
-            cell("已下", format!("{segments} 片")),
-            cell("大小", format::bytes(bytes)),
+            Stat::new("已下", format!("{segments} 片")),
+            Stat::new("大小", format::bytes(bytes)),
         ],
     }
 }
 
 /// 文件任务的 [`reads`]（完成的除外）：在下时为速度、剩余、已下与连接数，停着的为已下与总大小；还没有内容时为空。
-fn file_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
-    let cell = |label: &'static str, value: String| (SharedString::from(label), value.into());
+fn file_reads(row: &Row, now: Instant) -> Vec<Stat> {
     let Some(amount) = FileAmount::of(row) else {
         return Vec::new();
     };
@@ -704,10 +652,10 @@ fn file_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
                     |left| format::duration(Duration::from_secs_f64(left as f64 / speed)),
                 );
             vec![
-                cell("速度", format!("{}/s", format::bytes(speed as u64))),
-                cell("剩余", left),
-                cell("已下", format::bytes(amount.bytes)),
-                cell(
+                speed_stat(row, now, format!("{}/s", format::bytes(speed as u64))),
+                Stat::new("剩余", left),
+                Stat::new("已下", format::bytes(amount.bytes)),
+                Stat::new(
                     "连接",
                     format!("{} / {}", progress.connections, progress.limit),
                 ),
@@ -716,15 +664,14 @@ fn file_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
         (Status::Running, _) => Vec::new(),
         _ if amount.bytes == 0 => Vec::new(),
         _ => vec![
-            cell("已下", format::bytes(amount.bytes)),
-            cell("大小", size),
+            Stat::new("已下", format::bytes(amount.bytes)),
+            Stat::new("大小", size),
         ],
     }
 }
 
 /// 网页视频任务的 [`reads`]（完成的除外）：下载时为速度、剩余、已下；别的时候为空（停着的已下要重新解析才知道）。
-fn web_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
-    let cell = |label: &'static str, value: String| (SharedString::from(label), value.into());
+fn web_reads(row: &Row, now: Instant) -> Vec<Stat> {
     let fetching = matches!(
         row.web_progress,
         Some(hs_dlx_app::WebProgress::Fetching { .. })
@@ -742,16 +689,15 @@ fn web_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
             |left| format::duration(Duration::from_secs_f64(left as f64 / speed)),
         );
     vec![
-        cell("速度", format!("{}/s", format::bytes(speed as u64))),
-        cell("剩余", left),
-        cell("已下", format::bytes(amount.bytes)),
+        speed_stat(row, now, format!("{}/s", format::bytes(speed as u64))),
+        Stat::new("剩余", left),
+        Stat::new("已下", format::bytes(amount.bytes)),
     ]
 }
 
 /// BT 任务的 [`reads`]（完成的除外）：在下时为速度、剩余、已下、要下的大小、节点数（其中做种的）与上传速度，停着的
 /// 为已下与要下的大小；还没有内容时为空。
-fn torrent_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
-    let cell = |label: &'static str, value: String| (SharedString::from(label), value.into());
+fn torrent_reads(row: &Row, now: Instant) -> Vec<Stat> {
     let Some(amount) = FileAmount::of(row) else {
         return Vec::new();
     };
@@ -767,35 +713,34 @@ fn torrent_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
                 "—".to_owned()
             };
             vec![
-                cell("速度", format!("{}/s", format::bytes(speed as u64))),
-                cell("剩余", left),
-                cell("已下", format::bytes(amount.bytes)),
-                cell("大小", format::bytes(wanted)),
-                cell(
+                speed_stat(row, now, format!("{}/s", format::bytes(speed as u64))),
+                Stat::new("剩余", left),
+                Stat::new("已下", format::bytes(amount.bytes)),
+                Stat::new("大小", format::bytes(wanted)),
+                Stat::new(
                     "节点",
                     format!("{}（做种 {}）", progress.peers, progress.seeds),
                 ),
-                cell("上传", format!("{}/s", format::bytes(progress.upload_rate))),
+                Stat::new("上传", format!("{}/s", format::bytes(progress.upload_rate))),
             ]
         }
         (Status::Running, None) => Vec::new(),
         _ if amount.bytes == 0 => Vec::new(),
         _ => vec![
-            cell("已下", format::bytes(amount.bytes)),
-            cell("大小", format::bytes(wanted)),
+            Stat::new("已下", format::bytes(amount.bytes)),
+            Stat::new("大小", format::bytes(wanted)),
         ],
     }
 }
 
 /// 云离线任务的 [`reads`]（完成的除外）：取回时为速度、剩余、已取回与文件数，网盘在下时为网盘的进度，停着的为已
 /// 取回与总大小；还没有内容时为空。
-fn cloud_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
+fn cloud_reads(row: &Row, now: Instant) -> Vec<Stat> {
     use hs_dlx_app::CloudProgress;
-    let cell = |label: &'static str, value: String| (SharedString::from(label), value.into());
     let amount = FileAmount::of(row);
     match (&row.task.status, &row.cloud_progress, &amount) {
         (Status::Running, Some(CloudProgress::Remote { percent, .. }), _) => {
-            vec![cell("网盘", format!("{percent}%"))]
+            vec![Stat::new("网盘", format!("{percent}%"))]
         }
         (Status::Running, Some(CloudProgress::Fetching { index, count, .. }), Some(amount)) => {
             let speed = row.rate.bytes_per_second(now);
@@ -807,17 +752,17 @@ fn cloud_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
                 "—".to_owned()
             };
             vec![
-                cell("速度", format!("{}/s", format::bytes(speed as u64))),
-                cell("剩余", left),
-                cell("已取回", format::bytes(amount.bytes)),
-                cell("文件", format!("{} / {count}", index + 1)),
+                speed_stat(row, now, format!("{}/s", format::bytes(speed as u64))),
+                Stat::new("剩余", left),
+                Stat::new("已取回", format::bytes(amount.bytes)),
+                Stat::new("文件", format!("{} / {count}", index + 1)),
             ]
         }
         (Status::Running, _, _) => Vec::new(),
         (_, _, Some(amount)) if amount.bytes > 0 => {
             let mut cells = vec![
-                cell("已取回", format::bytes(amount.bytes)),
-                cell("大小", format::bytes(amount.total.unwrap_or(0))),
+                Stat::new("已取回", format::bytes(amount.bytes)),
+                Stat::new("大小", format::bytes(amount.total.unwrap_or(0))),
             ];
             cells.extend(cloud_skipped(row));
             cells
@@ -827,17 +772,17 @@ fn cloud_reads(row: &Row, now: Instant) -> Vec<(SharedString, SharedString)> {
 }
 
 /// 云离线任务因用户在网盘上删了而跳过的文件数（不算进大小），没有时为 None。
-fn cloud_skipped(row: &Row) -> Option<(SharedString, SharedString)> {
+fn cloud_skipped(row: &Row) -> Option<Stat> {
     let Disk::Cloud(files) = &row.disk else {
         return None;
     };
     let skipped = files.iter().filter(|file| file.skipped).count();
-    (skipped > 0).then(|| {
-        (
-            "跳过".into(),
-            format!("{skipped} 个网盘上删了的文件").into(),
-        )
-    })
+    (skipped > 0).then(|| Stat::new("跳过", format!("{skipped} 个网盘上删了的文件")))
+}
+
+/// 速度的一格：`value` 为 `now` 时的速度，下面是最近 60 秒的折线。
+fn speed_stat(row: &Row, now: Instant, value: String) -> Stat {
+    Stat::new("速度", value).history(row.rate.history(now).to_vec())
 }
 
 /// 输出所在的目录：占着输出路径的东西就在里面；还没定下内容的根的云离线任务为它的保存目录。
@@ -852,127 +797,20 @@ fn folder_of(spec: &hs_dlx_app::TaskSpec) -> std::path::PathBuf {
     }
 }
 
-/// 信号：带框的时间线，最新的在最上面。左边一条竖线串起各条的节点。要留意与失败级别的各条整行带同色的淡底与描边，
-/// 节点是同色的空心圈；其余的节点是暗的空心圈，最新一条是一般级别时它的节点实心发光、缓缓呼吸。较早的（第
-/// [`SIGNAL_FRESH`] 条往后）变淡。每条下面一行是时刻与连续发生的次数。
+/// 信号：「信号」小标题下是时间线，最新的在最上面；要留意与失败级别的用警告色、可复制。
 fn signals(signals: &[Signal]) -> Div {
-    let accent = theme::accent();
-    let last = signals.len().saturating_sub(1);
-    let rows = signals.iter().rev().enumerate().map(|(index, signal)| {
-        let level = match signal.level {
-            Level::Info => None,
-            Level::Warn => Some(theme::signal_warn()),
-            Level::Error => Some(theme::signal_error()),
-        };
-        let newest = index == 0;
-        let breath = motion::breathe(SIGNAL_BREATH);
-        let node = div()
-            .absolute()
-            .left(px(SIGNAL_RAIL - 4.5))
-            .top(px(11.))
-            .size(px(9.))
-            .rounded_full()
-            .border_2()
-            .map(|node| match (level, newest) {
-                (Some(color), _) => node.bg(theme::ground()).border_color(color),
-                (None, true) => node
-                    .bg(accent)
-                    .border_color(accent)
-                    .shadow(ui::glow(accent, 10., breath)),
-                (None, false) => node.bg(theme::ground()).border_color(theme::accent_dim()),
-            });
-        // 竖线：第一条从节点往下，最后一条到节点为止
-        let rail = div()
-            .absolute()
-            .left(px(SIGNAL_RAIL - 0.5))
-            .w(px(1.))
-            .bg(theme::edge())
-            .map(|rail| match (index == 0, index == last) {
-                (true, true) => rail.h(px(0.)),
-                (true, false) => rail.top(px(14.)).bottom_0(),
-                (false, true) => rail.top_0().h(px(14.)),
-                (false, false) => rail.top_0().bottom_0(),
-            });
-        let when = if signal.repeat > 1 {
-            format!("{} · ×{}", signal.at, signal.repeat)
-        } else {
-            signal.at.clone()
-        };
-        div()
-            .relative()
-            .pl(px(26.))
-            .pr(px(8.))
-            .py(px(7.))
-            .rounded(px(10.))
-            .when_some(level, |row, color| {
-                row.bg(theme::alpha(color, 0.07))
-                    .border_1()
-                    .border_color(theme::alpha(color, 0.22))
-            })
-            .when(index >= SIGNAL_FRESH, |row| row.opacity(0.55))
-            .child(rail)
-            .child(node)
-            .child(
-                div()
-                    .text_size(px(12.5))
-                    .line_height(px(18.))
-                    .text_color(match (level, newest) {
-                        (Some(color), _) => color,
-                        (None, true) => theme::text(),
-                        (None, false) => theme::soft(),
-                    })
-                    .child(SharedString::from(signal.text.clone())),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .mt(px(2.))
-                    .child(ui::num(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(theme::faint())
-                            .child(when),
-                    ))
-                    // 警告与出错的给「复制」：报告问题时要完整的原文
-                    .when(level.is_some(), |line| {
-                        line.child(ui::copy_link(("copy-signal", index), signal.text.clone()))
-                    }),
-            )
-    });
     div()
         .flex()
         .flex_col()
-        .px(px(12.))
-        .pt(px(6.))
-        .pb(px(8.))
-        .rounded(px(14.))
-        .border_1()
-        .border_color(theme::edge())
-        .bg(linear_gradient(
-            180.,
-            linear_color_stop(theme::alpha(accent, 0.04), 0.),
-            linear_color_stop(theme::alpha(accent, 0.), 0.4),
+        .gap(px(8.))
+        .child(widgets::caption("信号"))
+        .child(widgets::record(
+            "copy-signal",
+            signals.iter().rev().map(|signal| Line {
+                at: signal.at.clone().into(),
+                text: signal.text.clone().into(),
+                repeat: signal.repeat,
+                warn: signal.level != Level::Info,
+            }),
         ))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .px(px(2.))
-                .pt(px(6.))
-                .pb(px(8.))
-                .child(ui::caption("信号"))
-                .child(ui::num(
-                    div()
-                        .px(px(7.))
-                        .rounded(px(8.))
-                        .bg(theme::alpha(gpui_kit::white(), 0.05))
-                        .text_size(px(11.))
-                        .text_color(theme::muted())
-                        .child(signals.len().to_string()),
-                )),
-        )
-        .children(rows)
 }

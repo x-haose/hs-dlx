@@ -3,11 +3,10 @@
 use std::path::Path;
 use std::time::Duration;
 
+use crate::widgets::Step;
 use hs_dlx_app::FailureKind;
 use hs_dlx_app::ytdlp::{InstallProgress, Stage};
 use hs_m3u8_core::VariantInfo;
-
-use crate::ui::Step;
 
 /// 在运行的任务数 `running` 与合计速度 `speed`（字节每秒）：「2 个进行中 · ↓ 18.4 MB/s」；没有在运行的任务时为 None。
 pub fn activity(running: usize, speed: f64) -> Option<String> {

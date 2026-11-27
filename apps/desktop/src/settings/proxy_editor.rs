@@ -12,7 +12,7 @@ use hs_dlx_app::{ProxyLogin, ProxyProbeError, ProxyProtocol, ProxyWanted};
 use hs_m3u8_core::Url;
 
 use crate::tasks::Tasks;
-use crate::ui::{self, Tone};
+use crate::widgets::{self, Button, Kind, Toward};
 
 /// 主机框一开始填的：代理软件多在本机。
 const LOCAL_HOST: &str = "127.0.0.1";
@@ -294,7 +294,7 @@ fn written(scheme: &str, host: &str, port: u16, login: Option<&ProxyLogin>) -> R
 impl Render for ProxyEditor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let field = |input: &Entity<InputState>| {
-            ui::input_frame()
+            widgets::input_frame()
                 .px(px(6.))
                 .child(Input::new(input).appearance(false))
         };
@@ -305,22 +305,25 @@ impl Render for ProxyEditor {
             .gap(px(8.))
             .child(field(&self.host).flex_1())
             .child(field(&self.port).w(px(96.)))
-            .child(ui::button(
-                "save-proxy",
-                if busy { "在核对…" } else { "保存" },
-                Tone::Glow,
-                cx.listener(|this, _, window, cx| {
+            .child(
+                Button::new(
+                    "save-proxy",
+                    if busy { "在核对…" } else { "保存" },
+                    Kind::Primary,
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
                     if this.identifying.is_none() {
                         this.save(window, cx);
                     }
-                }),
-            ));
+                })),
+            );
         let chip = |id: &'static str, label: String, choice: Choice, cx: &mut Context<Self>| {
             let selected = self.choice == choice;
-            ui::chip(
+            widgets::chip(
                 id,
                 label,
                 selected,
+                Toward::Right,
                 cx.listener(move |this, _, _, cx| this.pick(choice.clone(), cx)),
             )
         };
@@ -360,15 +363,14 @@ impl Render for ProxyEditor {
                 .child(field(&self.username).flex_1())
                 .child(field(&self.password).flex_1())
         } else {
-            div().flex().child(ui::button(
-                "proxy-login",
-                "要用户名与密码",
-                Tone::Ghost,
-                cx.listener(|this, _, _, cx| {
-                    this.login = true;
-                    cx.notify();
-                }),
-            ))
+            div().flex().child(
+                Button::new("proxy-login", "要用户名与密码", Kind::Text).on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.login = true;
+                        cx.notify();
+                    },
+                )),
+            )
         };
         div()
             .flex()
@@ -377,6 +379,6 @@ impl Render for ProxyEditor {
             .child(address)
             .children(protocols)
             .child(login)
-            .children(self.error.clone().map(ui::error_text))
+            .children(self.error.clone().map(widgets::error_text))
     }
 }

@@ -22,8 +22,8 @@ hs-dlx 桌面应用静态链接或随带了以下软件：
    改写过的文件为 crates/webview/src/lib.rs 与 crates/webview/src/linux.rs：改为依赖官方 wry，只留不用窗口合成时
    用到的部分。
 
-4. Space Grotesk 字体（© The Space Grotesk Project Authors，https://github.com/floriankarsten/space-grotesk），按 SIL
-   Open Font License 1.1 授权，全文见 OFL.txt。
+4. Geist 与 Geist Mono 字体 1.9.2（© The Geist Project Authors，https://github.com/vercel/geist-font），按 SIL Open
+   Font License 1.1 授权，全文见 OFL.txt。
 
 5. libtorrent 2.1.2（https://libtorrent.org，© Arvid Norberg 等），按 BSD 3-Clause 授权；静态链接，源码
    未作修改。它的许可证与其中收录的别人的代码（puff、ed25519、SHA-1、SHA-256 等）的声明全文见

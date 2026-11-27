@@ -13,7 +13,8 @@ use super::found::{Check, Found};
 use super::{MAX_FOUND, SUGGEST_AFTER, SniffEvent, SniffView};
 use crate::links::http_url;
 use crate::new_task::describe;
-use crate::ui::{self, Step, TEXT_LINE, Tone};
+use crate::ui;
+use crate::widgets::{self, Button, Kind, Stat, Step};
 use crate::{dial, format, ring, theme};
 
 /// 「这个页面」一栏的宽。
@@ -54,7 +55,7 @@ impl SniffView {
         };
         let rows: Vec<AnyElement> = if self.challenge {
             vec![
-                ui::note(
+                widgets::note(
                     "网站要先验证你是真人：在网页里完成验证，再点播放，找到的流会列在这里",
                     true,
                 )
@@ -62,7 +63,7 @@ impl SniffView {
             ]
         } else if self.found.is_empty() {
             vec![
-                ui::caption("在网页里登录、点了播放后，找到的流会列在这里").into_any_element(),
+                widgets::caption("在网页里登录、点了播放后，找到的流会列在这里").into_any_element(),
                 self.probe_opened(cx).into_any_element(),
             ]
         } else {
@@ -76,13 +77,9 @@ impl SniffView {
                 None,
                 heading,
                 Some(self.state().1.into()),
-                [ui::button(
-                    "hide-page",
-                    "收起网页",
-                    Tone::Plain,
-                    cx.listener(|this, _, _, cx| this.show_page(false, cx)),
-                )
-                .into_any_element()],
+                [Button::new("hide-page", "收起网页", Kind::Secondary)
+                    .on_click(cx.listener(|this, _, _, cx| this.show_page(false, cx)))
+                    .into_any_element()],
             ))
             .child(
                 div()
@@ -105,8 +102,8 @@ impl SniffView {
                     .pb(px(14.))
                     .children(self.failure_note())
                     .children(self.offers(cx))
-                    .children(self.notes().into_iter().map(ui::caption))
-                    .children(self.error.clone().map(ui::error_text)),
+                    .children(self.notes().into_iter().map(widgets::caption))
+                    .children(self.error.clone().map(widgets::error_text)),
             )
     }
 
@@ -114,17 +111,13 @@ impl SniffView {
     fn failure_note(&self) -> Option<Div> {
         self.failure
             .as_ref()
-            .map(|reason| ui::note(format!("{reason}：刷新后重新找"), true))
+            .map(|reason| widgets::note(format!("{reason}：刷新后重新找"), true))
     }
 
     /// 还没找到流时：打开的地址可能本身就是播放列表（缺请求头时源站回了网页），交回新建页改请求头。
-    fn probe_opened(&self, cx: &mut Context<Self>) -> gpui_kit::Stateful<Div> {
-        ui::button(
-            "probe-opened",
-            "当作播放列表探测",
-            Tone::Plain,
-            cx.listener(|this, _, _, cx| this.open_opened(cx)),
-        )
+    fn probe_opened(&self, cx: &mut Context<Self>) -> Button {
+        Button::new("probe-opened", "当作播放列表探测", Kind::Secondary)
+            .on_click(cx.listener(|this, _, _, cx| this.open_opened(cx)))
     }
 
     /// 网页加载到哪一步：状态点的颜色与说法。
@@ -156,51 +149,39 @@ impl SniffView {
         let mut actions = vec![ui::status(color, state).into_any_element()];
         if failed {
             actions.push(
-                ui::button(
-                    "reload",
-                    "刷新",
-                    Tone::Glow,
-                    cx.listener(|this, _, _, cx| {
+                Button::new("reload", "刷新", Kind::Primary)
+                    .on_click(cx.listener(|this, _, _, cx| {
                         this.navigate(wry::WebView::reload, "没能刷新", cx)
-                    }),
-                )
-                .into_any_element(),
+                    }))
+                    .into_any_element(),
             );
         }
         if self.webview.is_ok() {
             actions.push(
-                ui::button(
+                Button::new(
                     "show-page",
                     "打开网页",
                     if self.suggest() && !failed {
-                        Tone::Glow
+                        Kind::Primary
                     } else {
-                        Tone::Plain
+                        Kind::Secondary
                     },
-                    cx.listener(|this, _, _, cx| this.show_page(true, cx)),
                 )
+                .on_click(cx.listener(|this, _, _, cx| this.show_page(true, cx)))
                 .into_any_element(),
             );
         }
         if self.webview.is_ok() {
             actions.push(
-                ui::button(
-                    "page-as-web",
-                    "解析网页视频",
-                    Tone::Plain,
-                    cx.listener(|this, _, _, cx| this.open_page_as_web(cx)),
-                )
-                .into_any_element(),
+                Button::new("page-as-web", "解析网页视频", Kind::Secondary)
+                    .on_click(cx.listener(|this, _, _, cx| this.open_page_as_web(cx)))
+                    .into_any_element(),
             );
         }
         actions.push(
-            ui::button(
-                "close-sniff",
-                "关闭",
-                Tone::Ghost,
-                cx.listener(|_, _, _, cx| cx.emit(SniffEvent::Dismissed)),
-            )
-            .into_any_element(),
+            Button::new("close-sniff", "关闭", Kind::Text)
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(SniffEvent::Dismissed)))
+                .into_any_element(),
         );
         ui::page_head(
             Some(ui::rings(40., 3., 10.).into_any_element()),
@@ -227,7 +208,7 @@ impl SniffView {
                 .items_center()
                 .justify_center()
                 .gap(px(18.))
-                .child(ui::note(reason.clone(), true).max_w(px(440.)))
+                .child(widgets::note(reason.clone(), true).max_w(px(440.)))
                 .child(self.probe_opened(cx)),
             Ok(_) if self.found.is_empty() => column
                 .items_center()
@@ -254,7 +235,7 @@ impl SniffView {
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(format!("找到 {} 条视频流", self.found.len())),
                             )
-                            .child(ui::caption(if checking {
+                            .child(widgets::caption(if checking {
                                 "正在后台探测"
                             } else {
                                 "已在后台探测好"
@@ -273,7 +254,7 @@ impl SniffView {
                     )
             }
         };
-        column.children(self.error.clone().map(ui::error_text))
+        column.children(self.error.clone().map(widgets::error_text))
     }
 
     /// 还没找到流时表盘下面的说明：打不开时为原因。
@@ -311,8 +292,8 @@ impl SniffView {
             .child(
                 div()
                     .text_size(px(13.))
-                    .line_height(px(TEXT_LINE))
-                    .text_color(theme::muted())
+                    .line_height(px(widgets::TEXT_LINE))
+                    .text_color(theme::ink_3())
                     .child(line),
             )
     }
@@ -349,23 +330,23 @@ impl SniffView {
                     .left(px(inset))
                     .size(px(SCAN_DISC))
                     .rounded_full()
-                    .bg(theme::disc())
+                    .bg(theme::moon())
                     .border_1()
-                    .border_color(theme::hairline())
+                    .border_color(theme::rule())
                     .flex()
                     .flex_col()
                     .items_center()
                     .justify_center()
                     .gap(px(4.))
                     .when(animate, |disc| {
-                        disc.child(ui::num(
+                        disc.child(
                             div()
                                 .text_size(px(28.))
                                 .font_weight(FontWeight::BOLD)
                                 .child(format::clock(elapsed)),
-                        ))
+                        )
                     })
-                    .child(ui::caption(if self.load.shown.is_some() {
+                    .child(widgets::caption(if self.load.shown.is_some() {
                         "在找视频流"
                     } else {
                         "正在打开网页"
@@ -375,11 +356,12 @@ impl SniffView {
 
     /// 右边「这个页面」一栏：加载到哪一步、找到几条与网页经哪里出去，网页要做的事，与下载时带什么。
     fn render_about(&self, cx: &mut Context<Self>) -> Div {
-        let found = ("找到".into(), format!("{} 条", self.found.len()).into());
-        let egress = self
-            .lease
-            .as_ref()
-            .map(|lease| ("网络".into(), lease.egress().into()));
+        let mut reads = vec![Stat::new("找到", format!("{} 条", self.found.len()))];
+        reads.extend(
+            self.lease
+                .as_ref()
+                .map(|lease| Stat::text("网络", lease.egress())),
+        );
         div()
             .w(px(ABOUT_WIDTH))
             .flex_none()
@@ -388,18 +370,18 @@ impl SniffView {
             .gap(px(18.))
             .p(px(20.))
             .border_l_1()
-            .border_color(theme::hairline())
-            .child(ui::caption("这个页面"))
-            .child(ui::steps(self.steps()))
-            .child(ui::reads(vec![found], egress))
+            .border_color(theme::rule())
+            .child(widgets::caption("这个页面"))
+            .child(widgets::steps(self.steps(), theme::accent()))
+            .child(widgets::stats(reads, 1))
             .children(self.offers(cx))
-            .children(self.notes().into_iter().map(ui::caption))
+            .children(self.notes().into_iter().map(widgets::caption))
             .child(div().flex_1())
             .child(
                 div()
                     .text_size(px(12.5))
-                    .line_height(px(TEXT_LINE))
-                    .text_color(theme::muted())
+                    .line_height(px(widgets::TEXT_LINE))
+                    .text_color(theme::ink_3())
                     .child("下载时带上网页存下的 Cookie 与来源地址：要登录的网页，先打开网页登录"),
             )
     }
@@ -407,18 +389,18 @@ impl SniffView {
     /// 打开、加载、找流三步。
     fn steps(&self) -> Vec<(SharedString, Step)> {
         if self.webview.is_err() {
-            return vec![("打开网页".into(), Step::Failed)];
+            return vec![("打开网页".into(), Step::Stopped)];
         }
         let shown = self.load.shown.is_some();
         let failed = self.failure.is_some();
         let open = match (shown, failed) {
             (true, _) => Step::Done,
-            (false, true) => Step::Failed,
+            (false, true) => Step::Stopped,
             (false, false) => Step::Now,
         };
         let load = match (shown, failed, self.load.finished) {
             (false, _, _) => Step::Waiting,
-            (true, true, _) => Step::Failed,
+            (true, true, _) => Step::Stopped,
             (true, false, true) => Step::Done,
             (true, false, false) => Step::Now,
         };
@@ -527,23 +509,15 @@ impl SniffView {
         };
         let skipped =
             (found.skipped > 0).then(|| format!("没带 {} 个放不进请求头的 Cookie", found.skipped));
-        let open = |label: &'static str, tone: Tone, cx: &mut Context<Self>| {
+        let open = |label: &'static str, tone: Kind, cx: &mut Context<Self>| {
             let url = found.url.clone();
-            ui::button(
-                ("open-found", index),
-                label,
-                tone,
-                cx.listener(move |this, _, _, cx| this.open_found(index, &url, cx)),
-            )
+            Button::new(("open-found", index), label, tone)
+                .on_click(cx.listener(move |this, _, _, cx| this.open_found(index, &url, cx)))
         };
         let retry = |cx: &mut Context<Self>| {
             let url = found.url.clone();
-            ui::button(
-                ("retry-found", index),
-                "重试",
-                Tone::Plain,
-                cx.listener(move |this, _, _, cx| this.retry(Some((index, &url)), cx)),
-            )
+            Button::new(("retry-found", index), "重试", Kind::Secondary)
+                .on_click(cx.listener(move |this, _, _, cx| this.retry(Some((index, &url)), cx)))
         };
         let actions = match &found.check {
             Check::Waiting | Check::Running => Vec::new(),
@@ -553,21 +527,23 @@ impl SniffView {
                 } else {
                     "下载"
                 };
-                vec![open(label, if best { Tone::Glow } else { Tone::Plain }, cx)]
+                vec![open(
+                    label,
+                    if best { Kind::Primary } else { Kind::Secondary },
+                    cx,
+                )]
             }
             Check::Failed {
                 headers: Some(_), ..
-            } => vec![retry(cx), open("查看", Tone::Plain, cx)],
+            } => vec![retry(cx), open("查看", Kind::Secondary, cx)],
             Check::Failed { headers: None, .. } => vec![retry(cx)],
         };
         let detail = if compact {
-            ui::num(
-                div()
-                    .text_size(px(12.5))
-                    .text_color(theme::muted())
-                    .truncate()
-                    .child(tags.join("，")),
-            )
+            div()
+                .text_size(px(12.5))
+                .text_color(theme::ink_3())
+                .truncate()
+                .child(tags.join("，"))
         } else {
             div()
                 .flex()
@@ -598,23 +574,23 @@ impl SniffView {
                             .truncate()
                             .child(title_of(&found.url)),
                     )
-                    .child(ui::num(
+                    .child(
                         div()
                             .text_size(px(12.))
-                            .text_color(theme::faint())
+                            .text_color(theme::ink_3())
                             .truncate()
                             .child(SharedString::from(meta(&found.url))),
-                    ))
+                    )
                     .child(detail)
                     .children(failed.map(|reason| {
                         div()
                             .text_size(px(12.5))
-                            .line_height(px(TEXT_LINE))
+                            .line_height(px(widgets::TEXT_LINE))
                             .text_color(theme::warn())
                             .line_clamp(2)
                             .child(reason)
                     }))
-                    .children(skipped.map(ui::caption)),
+                    .children(skipped.map(widgets::caption)),
             )
             .child(div().flex().flex_none().gap(px(8.)).children(actions))
             .into_any_element()
@@ -623,18 +599,16 @@ impl SniffView {
 
 /// 流的一项探测结果（时长、几档清晰度、几条音轨、直播）。
 fn tag(text: String) -> Div {
-    ui::num(
-        div()
-            .h(px(22.))
-            .px(px(8.))
-            .flex()
-            .items_center()
-            .rounded(px(6.))
-            .bg(theme::selected())
-            .text_size(px(12.))
-            .text_color(theme::soft())
-            .child(text),
-    )
+    div()
+        .h(px(22.))
+        .px(px(8.))
+        .flex()
+        .items_center()
+        .rounded(px(6.))
+        .bg(theme::hover())
+        .text_size(px(12.))
+        .text_color(theme::ink_2())
+        .child(text)
 }
 
 /// 网页要做、没有放行的一件事与让用户接着做的按钮。
@@ -652,11 +626,11 @@ fn offer(
         .child(
             div()
                 .text_size(px(12.5))
-                .line_height(px(TEXT_LINE))
-                .text_color(theme::soft())
+                .line_height(px(widgets::TEXT_LINE))
+                .text_color(theme::ink_2())
                 .child(text),
         )
-        .child(ui::button(id, label, Tone::Plain, act))
+        .child(Button::new(id, label, Kind::Secondary).on_click(act))
 }
 
 /// 流的说明：主机与路径；带查询参数的标出（同一个地址常带不同的令牌，只看主机与路径分不出来）。

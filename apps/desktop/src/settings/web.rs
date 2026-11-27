@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use super::{SettingsView, row};
 use crate::disk_access;
 use crate::format;
-use crate::ui::{self, Tone};
+use crate::theme;
+use crate::widgets::{self, Button, Kind, Toward};
 
 /// 网页视频一组的状态。
 pub(super) struct WebSettings {
@@ -168,15 +169,13 @@ impl SettingsView {
         let line = div().flex().items_center().gap(px(8.));
         let state = match &self.web.state {
             WebState::Unavailable => {
-                line.child(ui::field("这个平台上用不了网页视频的解析").flex_1())
+                line.child(widgets::field("这个平台上用不了网页视频的解析").flex_1())
             }
             WebState::Missing | WebState::Failed(_) => {
-                line.child(ui::field("没装").flex_1()).child(ui::button(
-                    "web-install",
-                    "安装",
-                    Tone::Plain,
-                    cx.listener(|this, _, _, cx| this.install_web(cx)),
-                ))
+                line.child(widgets::field("没装").flex_1()).child(
+                    Button::new("web-install", "安装", Kind::Secondary)
+                        .on_click(cx.listener(|this, _, _, cx| this.install_web(cx))),
+                )
             }
             WebState::Installing(progress) => {
                 installing(line, format::web_install(progress), progress, cx)
@@ -191,49 +190,39 @@ impl SettingsView {
                 progress,
                 cx,
             ),
-            WebState::Broken(_) => line.child(ui::field("运行不了").flex_1()).child(ui::button(
-                "web-install",
-                "重装",
-                Tone::Plain,
-                cx.listener(|this, _, _, cx| this.install_web(cx)),
-            )),
+            WebState::Broken(_) => line.child(widgets::field("运行不了").flex_1()).child(
+                Button::new("web-install", "重装", Kind::Secondary)
+                    .on_click(cx.listener(|this, _, _, cx| this.install_web(cx))),
+            ),
             WebState::Ready(version) | WebState::UpdateFailed { version, .. } => {
-                let line = line.child(ui::field(format!("yt-dlp {version}")).flex_1());
+                let line = line.child(widgets::field(format!("yt-dlp {version}")).flex_1());
                 match (&self.web.latest, &self.web.checking) {
-                    (_, Some(_)) => line.child(ui::caption("在查…")),
+                    (_, Some(_)) => line.child(widgets::caption("在查…")),
                     (Some(Ok(Some(latest))), None) => {
                         let latest = latest.clone();
-                        line.child(ui::button(
-                            "web-update",
-                            format!("更新到 {latest}"),
-                            Tone::Plain,
-                            cx.listener(move |this, _, _, cx| this.update_web(latest.clone(), cx)),
-                        ))
+                        line.child(
+                            Button::new("web-update", format!("更新到 {latest}"), Kind::Secondary)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.update_web(latest.clone(), cx)
+                                })),
+                        )
                     }
-                    (Some(Ok(None)), None) => line.child(ui::caption("已是最新")),
-                    (None | Some(Err(_)), None) => line.child(ui::button(
-                        "web-check",
-                        "查新版",
-                        Tone::Ghost,
-                        cx.listener(|this, _, _, cx| this.check_web(cx)),
-                    )),
+                    (Some(Ok(None)), None) => line.child(widgets::caption("已是最新")),
+                    (None | Some(Err(_)), None) => line.child(
+                        Button::new("web-check", "查新版", Kind::Text)
+                            .on_click(cx.listener(|this, _, _, cx| this.check_web(cx))),
+                    ),
                 }
                 // 新版出了问题时换回更新前的
                 .children(self.web.previous.clone().map(|previous| {
-                    ui::button(
-                        "web-rollback",
-                        format!("换回 {previous}"),
-                        Tone::Ghost,
-                        cx.listener(|this, _, _, cx| this.rollback_web(cx)),
-                    )
+                    Button::new("web-rollback", format!("换回 {previous}"), Kind::Text)
+                        .on_click(cx.listener(|this, _, _, cx| this.rollback_web(cx)))
                 }))
                 // 文件坏了而进程还起得来时解析报错，没有别的办法认出：由用户重装
-                .child(ui::button(
-                    "web-reinstall",
-                    "重装",
-                    Tone::Ghost,
-                    cx.listener(|this, _, _, cx| this.install_web(cx)),
-                ))
+                .child(
+                    Button::new("web-reinstall", "重装", Kind::Text)
+                        .on_click(cx.listener(|this, _, _, cx| this.install_web(cx))),
+                )
             }
         };
         let failed = match (&self.web.state, &self.web.latest) {
@@ -258,9 +247,9 @@ impl SettingsView {
                 .flex_col()
                 .gap(px(12.))
                 .child(state)
-                .children(failed.map(ui::error_text))
-                .children(auto_check.map(ui::error_text))
-                .children(self.web.error.clone().map(ui::error_text)),
+                .children(failed.map(widgets::error_text))
+                .children(auto_check.map(widgets::error_text))
+                .children(self.web.error.clone().map(widgets::error_text)),
         )
     }
 
@@ -268,10 +257,11 @@ impl SettingsView {
     pub(super) fn render_web_channel(&self, cx: &mut Context<Self>) -> Div {
         let chip =
             |id: &'static str, label: &'static str, value: Channel, cx: &mut Context<Self>| {
-                ui::chip(
+                widgets::chip(
                     id,
                     label,
                     self.web.channel == value,
+                    Toward::Right,
                     cx.listener(move |this, _, _, cx| this.pick_channel(value, cx)),
                 )
             };
@@ -289,7 +279,7 @@ impl SettingsView {
                         .child(chip("web-stable", "稳定版", Channel::Stable, cx))
                         .child(chip("web-nightly", "每日构建", Channel::Nightly, cx)),
                 )
-                .child(ui::caption(
+                .child(widgets::caption(
                     "稳定版约每月一版；网站改版后的修复先到每日构建。切换渠道后有比在用的更新的版本才换，不换回更旧的",
                 )),
         )
@@ -374,10 +364,11 @@ impl SettingsView {
                 None => ("web-browser-none".to_owned(), "不读"),
                 Some(browser) => (format!("web-browser-{}", browser.code()), browser.label()),
             };
-            ui::chip(
+            widgets::chip(
                 id,
                 label,
                 self.web.shown == choice,
+                Toward::Right,
                 cx.listener(move |this, _, _, cx| this.pick_browser(choice, cx)),
             )
         });
@@ -399,7 +390,7 @@ impl SettingsView {
                 .gap(px(12.))
                 .child(div().flex().flex_wrap().gap(px(8.)).children(chips))
                 .children(self.render_listing(cx))
-                .child(ui::caption(platform)),
+                .child(widgets::caption(platform)),
         )
     }
 
@@ -416,14 +407,14 @@ impl SettingsView {
                         .flex_col()
                         .gap(px(8.))
                         .child(disk_access::card(browser))
-                        .child(ui::caption(format!(
+                        .child(widgets::caption(format!(
                             "重开后回到这里再点 {}（现在{}）",
                             browser.label(),
                             self.in_effect()
                         ))),
                 );
             }
-            Listing::Failed(reason) => return Some(ui::error_text(reason.clone())),
+            Listing::Failed(reason) => return Some(widgets::error_text(reason.clone())),
             Listing::Profiles(profiles) => profiles,
         };
         let saved = self
@@ -442,10 +433,11 @@ impl SettingsView {
                 None => profile.name.clone(),
             };
             let dir = profile.dir.clone();
-            ui::chip(
+            widgets::chip(
                 format!("web-profile-{index}"),
                 label,
                 saved == Some(&profile.dir),
+                Toward::Right,
                 cx.listener(move |this, _, _, cx| this.pick_profile(dir.clone(), cx)),
             )
         });
@@ -461,7 +453,7 @@ impl SettingsView {
                 self.in_effect()
             )),
         };
-        let hint = hint.map(ui::caption);
+        let hint = hint.map(widgets::caption);
         Some(
             div()
                 .flex()
@@ -498,10 +490,11 @@ impl SettingsView {
     pub(super) fn render_web_preference(&self, cx: &mut Context<Self>) -> Div {
         let chip =
             |id: &'static str, label: &'static str, value: Preference, cx: &mut Context<Self>| {
-                ui::chip(
+                widgets::chip(
                     id,
                     label,
                     self.web.preference == value,
+                    Toward::Right,
                     cx.listener(move |this, _, _, cx| this.pick_preference(value, cx)),
                 )
             };
@@ -519,7 +512,7 @@ impl SettingsView {
                         .child(chip("web-compatible", "兼容优先", Preference::Compatible, cx))
                         .child(chip("web-quality", "画质优先", Preference::Quality, cx)),
                 )
-                .child(ui::caption(
+                .child(widgets::caption(
                     "兼容优先：同一清晰度先选 H.264 + AAC，各平台自带的播放器都能放；画质优先多为 AV1 或 VP9",
                 )),
         )
@@ -560,13 +553,15 @@ fn installing(
         .flex()
         .flex_col()
         .gap(px(8.))
-        .child(ui::steps(format::web_install_steps(progress)))
-        .child(line.child(ui::field(label).flex_1()).child(ui::button(
-            "web-cancel-install",
-            "取消",
-            Tone::Ghost,
-            cx.listener(|this, _, _, cx| {
-                this.tasks.read(cx).service().cancel_web_install();
-            }),
-        )))
+        .child(widgets::steps(
+            format::web_install_steps(progress),
+            theme::accent(),
+        ))
+        .child(line.child(widgets::field(label).flex_1()).child(
+            Button::new("web-cancel-install", "取消", Kind::Text).on_click(cx.listener(
+                |this, _, _, cx| {
+                    this.tasks.read(cx).service().cancel_web_install();
+                },
+            )),
+        ))
 }

@@ -4,9 +4,7 @@
 //! 文件读到后）为大小、要下的文件、保存位置与开始。磁力链接在这几步都可以改用 PikPak 云离线。地址是网页时：yt-dlp
 //! 解析中只写请求经哪里走，组件没装时为安装与进度，解析出来后为时长、上传者、画质选项、保存位置与开始（见 web.rs）。
 
-use gpui_kit::{
-    AnyElement, Context, Div, IntoElement, ParentElement as _, SharedString, Styled as _, div, px,
-};
+use gpui_kit::{AnyElement, Context, Div, IntoElement, ParentElement as _, Styled as _, div, px};
 use gpui_kit::{InteractiveElement as _, StatefulInteractiveElement as _};
 use hs_dlx_app::{Failure, FailureKind, MetadataProgress, OutputKind};
 use hs_m3u8_core::{FileInfo, Probe};
@@ -18,7 +16,8 @@ const NO_PEERS_HINT: std::time::Duration = std::time::Duration::from_secs(60);
 use crate::disk_access;
 use crate::format;
 use crate::theme;
-use crate::ui::{self, Solid, Step, Tone};
+use crate::ui;
+use crate::widgets::{self, Button, Kind, Size, Stat, Step, Toward};
 
 impl NewTask {
     pub(super) fn render_inspector(&self, cx: &mut Context<Self>) -> Div {
@@ -35,17 +34,20 @@ impl NewTask {
                 title,
                 host,
                 self.reads_with_route(Vec::new()),
-                [self.cancel(Tone::Plain, cx)],
+                [self.cancel(Kind::Secondary, cx)],
             ),
             Probing::Failed(_) if self.page_check == PageCheck::Opening => ui::inspector(
                 title,
                 host,
-                [ui::steps([
-                    ("取到的不是播放列表".into(), Step::Done),
-                    ("在网页里打开，看是不是网页".into(), Step::Now),
-                ])
+                [widgets::steps(
+                    [
+                        ("取到的不是播放列表".into(), Step::Done),
+                        ("在网页里打开，看是不是网页".into(), Step::Now),
+                    ],
+                    theme::accent(),
+                )
                 .into_any_element()],
-                [self.cancel(Tone::Plain, cx)],
+                [self.cancel(Kind::Secondary, cx)],
             ),
             Probing::Failed(failure) => self.failed_inspector(title, host, failure, cx),
             Probing::Ready(probe) => self.ready_inspector(title, host, probe, cx),
@@ -54,7 +56,7 @@ impl NewTask {
                 title,
                 host,
                 self.reads_with_route(Vec::new()),
-                [self.cancel(Tone::Plain, cx)],
+                [self.cancel(Kind::Secondary, cx)],
             ),
             Probing::NeedsWeb(state) => self.needs_web_inspector(title, host, state, cx),
             Probing::Web(choice) => self.web_inspector(title, host, choice, cx),
@@ -62,43 +64,36 @@ impl NewTask {
     }
 
     /// 退出新建页的按钮，独占底栏一行。
-    pub(super) fn cancel(&self, tone: Tone, cx: &mut Context<Self>) -> AnyElement {
-        ui::button(
-            "cancel",
-            "取消",
-            tone,
-            cx.listener(|_, _, _, cx| cx.emit(NewTaskEvent::Dismissed)),
-        )
-        .w_full()
-        .into_any_element()
+    pub(super) fn cancel(&self, tone: Kind, cx: &mut Context<Self>) -> AnyElement {
+        Button::new("cancel", "取消", tone)
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(NewTaskEvent::Dismissed)))
+            .w_full()
+            .into_any_element()
     }
 
     /// 「网络」一格：这个地址的请求经哪个代理或为什么直连；代理用不了时为「用不了」与原因。还没读到系统代理时为 None。
-    fn route(&self) -> Option<((SharedString, SharedString), Option<String>)> {
+    fn route(&self) -> Option<(Stat, Option<String>)> {
         let (value, broken) = match self.route.as_ref()? {
             Route::Proxy(proxy, source) => (format!("经 {proxy}（{source}）"), None),
             Route::Direct(why) => (format!("直连 · {why}"), None),
             Route::Broken(why) => ("用不了".to_owned(), Some(why.clone())),
         };
-        Some((("网络".into(), value.into()), broken))
+        Some((Stat::text("网络", value), broken))
     }
 
-    /// 读数格 `cells`，后面接一格占满一行的「网络」（读到系统代理之后），代理用不了时下面写原因。
-    /// 两样都没有时为 None。
-    pub(super) fn reads_with_route(
-        &self,
-        cells: Vec<(SharedString, SharedString)>,
-    ) -> Option<AnyElement> {
+    /// 读数 `cells`，后面接一格「网络」（读到系统代理之后），代理用不了时下面写原因。两样都没有时为 None。
+    pub(super) fn reads_with_route(&self, mut cells: Vec<Stat>) -> Option<AnyElement> {
         let (route, broken) = self.route().unzip();
-        if cells.is_empty() && route.is_none() {
+        cells.extend(route);
+        if cells.is_empty() {
             return None;
         }
         let shown = div()
             .flex()
             .flex_col()
             .gap(px(8.))
-            .child(ui::reads(cells, route))
-            .children(broken.flatten().map(ui::error_text))
+            .child(widgets::stats(cells, 2))
+            .children(broken.flatten().map(widgets::error_text))
             .into_any_element();
         Some(shown)
     }
@@ -120,9 +115,9 @@ impl NewTask {
         let login = needs_login && !self.from_sniff;
         let again = headers || failure.kind.retry_helps();
         let mut body =
-            vec![ui::error_note("copy-failure", failure.message.clone()).into_any_element()];
+            vec![widgets::error_note("copy-failure", failure.message.clone()).into_any_element()];
         if !needs_login {
-            body.push(ui::note(format::failure(failure.kind).1, false).into_any_element());
+            body.push(widgets::note(format::failure(failure.kind).1, false).into_any_element());
         }
         // 读不了浏览器的数据：失败的说明里已写了怎么开权限，这里给直达的按钮
         if failure.kind == FailureKind::WebCookies && self.tasks.read(cx).cookies_denied().is_some()
@@ -130,7 +125,7 @@ impl NewTask {
             body.extend(disk_access::button().map(IntoElement::into_any_element));
         }
         if let PageCheck::NotPage(note) = &self.page_check {
-            body.push(ui::note(note.clone(), false).into_any_element());
+            body.push(widgets::note(note.clone(), false).into_any_element());
         }
         if needs_login {
             let how = if self.from_sniff {
@@ -138,7 +133,7 @@ impl NewTask {
             } else {
                 "在打开的网页里登录，回到视频页后点顶上的「解析网页视频」；或在设置的「网页视频 → 登录信息」里选你常用的浏览器（已选的在它里面登录这个网站），再点重新探测"
             };
-            body.push(ui::note(how.to_owned(), false).into_any_element());
+            body.push(widgets::note(how.to_owned(), false).into_any_element());
         }
         body.extend(self.reads_with_route(Vec::new()));
         if headers {
@@ -150,80 +145,66 @@ impl NewTask {
         if login {
             let url = self.url.clone();
             foot.push(
-                ui::primary(
-                    "login",
-                    "到网页里登录",
-                    None,
-                    Solid::Amber,
-                    true,
-                    cx.listener(move |_, _, _, cx| cx.emit(NewTaskEvent::Sniff(url.clone()))),
-                )
-                .into_any_element(),
+                Button::new("login", "到网页里登录", Kind::Warn)
+                    .size(Size::Large)
+                    .w_full()
+                    .on_click(
+                        cx.listener(move |_, _, _, cx| cx.emit(NewTaskEvent::Sniff(url.clone()))),
+                    )
+                    .into_any_element(),
             );
         } else if needs_login {
             // 从嗅探页来的：退出新建页即回到嗅探页
             foot.push(
-                ui::primary(
-                    "back-to-page",
-                    "回到网页里登录",
-                    None,
-                    Solid::Amber,
-                    true,
-                    cx.listener(|_, _, _, cx| cx.emit(NewTaskEvent::Dismissed)),
-                )
-                .into_any_element(),
+                Button::new("back-to-page", "回到网页里登录", Kind::Warn)
+                    .size(Size::Large)
+                    .w_full()
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(NewTaskEvent::Dismissed)))
+                    .into_any_element(),
             );
         } else if again {
             foot.push(
-                ui::primary(
-                    "reprobe",
-                    "重新探测",
-                    None,
-                    Solid::Amber,
-                    true,
-                    cx.listener(|this, _, window, cx| this.reprobe(window, cx)),
-                )
-                .into_any_element(),
+                Button::new("reprobe", "重新探测", Kind::Warn)
+                    .size(Size::Large)
+                    .w_full()
+                    .on_click(cx.listener(|this, _, window, cx| this.reprobe(window, cx)))
+                    .into_any_element(),
             );
         }
         let mut row = Vec::new();
         if needs_login && again {
             row.push(
-                ui::button(
-                    "reprobe",
-                    "重新探测",
-                    Tone::Plain,
-                    cx.listener(|this, _, window, cx| this.reprobe(window, cx)),
-                )
-                .flex_1()
-                .into_any_element(),
+                Button::new("reprobe", "重新探测", Kind::Secondary)
+                    .on_click(cx.listener(|this, _, window, cx| this.reprobe(window, cx)))
+                    .flex_1()
+                    .into_any_element(),
             );
         }
         if !self.from_sniff && !needs_login {
             let url = self.url.clone();
             row.push(
-                ui::button(
+                Button::new(
                     "sniff",
                     if failure.kind == FailureKind::WebBlocked {
                         "到网页里登录"
                     } else {
                         "在网页里找视频流"
                     },
-                    Tone::Plain,
-                    cx.listener(move |_, _, _, cx| cx.emit(NewTaskEvent::Sniff(url.clone()))),
+                    Kind::Secondary,
                 )
+                .on_click(cx.listener(move |_, _, _, cx| cx.emit(NewTaskEvent::Sniff(url.clone()))))
                 .flex_1()
                 .into_any_element(),
             );
         }
         // 没有别的按钮时「返回」独占一行，描边
         let alone = row.is_empty();
-        let back = ui::button(
+        let back = Button::new(
             "dismiss",
             "返回",
-            if alone { Tone::Plain } else { Tone::Ghost },
-            cx.listener(|_, _, _, cx| cx.emit(NewTaskEvent::Dismissed)),
-        );
+            if alone { Kind::Secondary } else { Kind::Text },
+        )
+        .on_click(cx.listener(|_, _, _, cx| cx.emit(NewTaskEvent::Dismissed)));
         row.push(if alone { back.flex_1() } else { back }.into_any_element());
         foot.push(div().flex().gap(px(10.)).children(row).into_any_element());
         ui::inspector(title, host, body, foot)
@@ -237,26 +218,24 @@ impl NewTask {
         info: &FileInfo,
         cx: &mut Context<Self>,
     ) -> Div {
-        let cells: Vec<(SharedString, SharedString)> = vec![
-            (
-                "大小".into(),
+        let cells: Vec<Stat> = vec![
+            Stat::new(
+                "大小",
                 info.length
-                    .map_or_else(|| "不知道".to_owned(), format::bytes)
-                    .into(),
+                    .map_or_else(|| "不知道".to_owned(), format::bytes),
             ),
-            (
-                "类型".into(),
+            Stat::text(
+                "类型",
                 info.content_type
                     .clone()
-                    .unwrap_or_else(|| "不知道".to_owned())
-                    .into(),
+                    .unwrap_or_else(|| "不知道".to_owned()),
             ),
-            (
-                "续传".into(),
+            Stat::text(
+                "续传",
                 if info.accepts_ranges {
-                    "支持，可多个连接".into()
+                    "支持，可多个连接"
                 } else {
-                    "不支持，中断后从头下".into()
+                    "不支持，中断后从头下"
                 },
             ),
         ];
@@ -275,22 +254,20 @@ impl NewTask {
         let mut foot: Vec<AnyElement> = self
             .error
             .clone()
-            .map(|error| ui::error_text(error).into_any_element())
+            .map(|error| widgets::error_text(error).into_any_element())
             .into_iter()
             .collect();
         foot.push(
-            ui::primary(
-                "start",
-                headline,
-                Some(detail.into()),
-                Solid::Glow,
-                !self.creating,
-                cx.listener(|this, _, window, cx| this.start(window, cx)),
-            )
-            .into_any_element(),
+            Button::new("start", headline, Kind::Primary)
+                .size(Size::Large)
+                .w_full()
+                .detail(detail)
+                .disabled(self.creating)
+                .on_click(cx.listener(|this, _, window, cx| this.start(window, cx)))
+                .into_any_element(),
         );
         if !self.creating {
-            foot.push(self.cancel(Tone::Ghost, cx));
+            foot.push(self.cancel(Kind::Text, cx));
         }
         ui::inspector(title, host, body, foot)
     }
@@ -306,21 +283,18 @@ impl NewTask {
         let mut body = Vec::new();
         if self.url.scheme() == "magnet" {
             body.push(
-                ui::reads(
-                    vec![("节点".into(), progress.peers.to_string().into())],
-                    None,
-                )
-                .into_any_element(),
+                widgets::stats(vec![Stat::new("节点", progress.peers.to_string())], 2)
+                    .into_any_element(),
             );
             body.push(
-                ui::note("没有节点有这个种子时会一直找，可随时取消", false).into_any_element(),
+                widgets::note("没有节点有这个种子时会一直找，可随时取消", false).into_any_element(),
             );
             if let Some(error) = &progress.tracker_error {
-                body.push(ui::note(format!("tracker 报错：{error}"), true).into_any_element());
+                body.push(widgets::note(format!("tracker 报错：{error}"), true).into_any_element());
             }
             if let Some(error) = &progress.public_trackers_error {
                 body.push(
-                    ui::note(
+                    widgets::note(
                         format!("公共 tracker 列表没取到，隔一阵再取：{error}"),
                         true,
                     )
@@ -328,11 +302,11 @@ impl NewTask {
                 );
             }
             if let Some(problem) = &progress.proxy_problem {
-                body.push(ui::note(format!("BT 代理：{problem}"), true).into_any_element());
+                body.push(widgets::note(format!("BT 代理：{problem}"), true).into_any_element());
             }
             if progress.peers == 0 && self.since.elapsed() >= NO_PEERS_HINT {
                 body.push(
-                    ui::note(
+                    widgets::note(
                         "一直找不到节点时，可到设置里的「网络检测」看是哪里不通",
                         false,
                     )
@@ -341,7 +315,7 @@ impl NewTask {
             }
         }
         let mut foot = self.cloud_offer(cx);
-        foot.push(self.cancel(Tone::Plain, cx));
+        foot.push(self.cancel(Kind::Secondary, cx));
         ui::inspector(title, host, body, foot)
     }
 
@@ -354,17 +328,13 @@ impl NewTask {
         let mut offer: Vec<AnyElement> = self
             .error
             .clone()
-            .map(|error| ui::error_text(error).into_any_element())
+            .map(|error| widgets::error_text(error).into_any_element())
             .into_iter()
             .collect();
         offer.push(
-            ui::button(
-                "cloud",
-                "改用 PikPak 云离线",
-                Tone::Plain,
-                cx.listener(|this, _, _, cx| this.start_cloud(cx)),
-            )
-            .into_any_element(),
+            Button::new("cloud", "改用 PikPak 云离线", Kind::Secondary)
+                .on_click(cx.listener(|this, _, _, cx| this.start_cloud(cx)))
+                .into_any_element(),
         );
         offer
     }
@@ -378,24 +348,20 @@ impl NewTask {
         cx: &mut Context<Self>,
     ) -> Div {
         let body = [
-            ui::error_note("copy-failure", failure.message.clone()).into_any_element(),
-            ui::note(format::failure(failure.kind).1, false).into_any_element(),
+            widgets::error_note("copy-failure", failure.message.clone()).into_any_element(),
+            widgets::note(format::failure(failure.kind).1, false).into_any_element(),
         ];
         let mut foot = self.cloud_offer(cx);
         if failure.kind.retry_helps() {
             foot.push(
-                ui::primary(
-                    "retry",
-                    "再试一次",
-                    None,
-                    Solid::Amber,
-                    true,
-                    cx.listener(|this, _, window, cx| this.reprobe(window, cx)),
-                )
-                .into_any_element(),
+                Button::new("retry", "再试一次", Kind::Warn)
+                    .size(Size::Large)
+                    .w_full()
+                    .on_click(cx.listener(|this, _, window, cx| this.reprobe(window, cx)))
+                    .into_any_element(),
             );
         }
-        foot.push(self.cancel(Tone::Plain, cx));
+        foot.push(self.cancel(Kind::Secondary, cx));
         ui::inspector(title, host, body, foot)
     }
 
@@ -409,25 +375,25 @@ impl NewTask {
     ) -> Div {
         let (count, bytes) = choice.selected();
         let total: u64 = choice.info.files.iter().map(|file| file.size).sum();
-        let cells: Vec<(SharedString, SharedString)> = vec![
-            (
-                "大小".into(),
-                format!("{} / {}", format::bytes(bytes), format::bytes(total)).into(),
+        let cells: Vec<Stat> = vec![
+            Stat::new(
+                "大小",
+                format!("{} / {}", format::bytes(bytes), format::bytes(total)),
             ),
-            (
-                "文件".into(),
-                format!("{count} / {} 个", choice.info.files.len()).into(),
-            ),
+            Stat::new("文件", format!("{count} / {} 个", choice.info.files.len())),
         ];
-        let mut body = vec![ui::reads(cells, None).into_any_element()];
+        let mut body = vec![widgets::stats(cells, 2).into_any_element()];
         if choice.info.private {
-            body.push(ui::note("私有种子：只经种子里的 tracker 找节点", false).into_any_element());
+            body.push(
+                widgets::note("私有种子：只经种子里的 tracker 找节点", false).into_any_element(),
+            );
         }
         let all = count == choice.info.files.len();
-        let toggle_all = ui::chip(
+        let toggle_all = widgets::chip(
             "select-all",
             if all { "全不选" } else { "全选" },
             false,
+            Toward::Left,
             cx.listener(move |this, _, _, cx| this.select_all(!all, cx)),
         )
         .into_any_element();
@@ -467,33 +433,27 @@ impl NewTask {
         let mut foot: Vec<AnyElement> = self
             .error
             .clone()
-            .map(|error| ui::error_text(error).into_any_element())
+            .map(|error| widgets::error_text(error).into_any_element())
             .into_iter()
             .collect();
         foot.push(
-            ui::primary(
-                "start",
-                headline,
-                Some(format!("{count} 个文件 · {}", format::bytes(bytes)).into()),
-                Solid::Glow,
-                !self.creating && count > 0,
-                cx.listener(|this, _, window, cx| this.start(window, cx)),
-            )
-            .into_any_element(),
+            Button::new("start", headline, Kind::Primary)
+                .size(Size::Large)
+                .w_full()
+                .detail(format!("{count} 个文件 · {}", format::bytes(bytes)))
+                .disabled(self.creating || count == 0)
+                .on_click(cx.listener(|this, _, window, cx| this.start(window, cx)))
+                .into_any_element(),
         );
         if !self.creating && self.url.scheme() == "magnet" {
             foot.push(
-                ui::button(
-                    "cloud",
-                    "改用 PikPak 云离线",
-                    Tone::Plain,
-                    cx.listener(|this, _, _, cx| this.start_cloud(cx)),
-                )
-                .into_any_element(),
+                Button::new("cloud", "改用 PikPak 云离线", Kind::Secondary)
+                    .on_click(cx.listener(|this, _, _, cx| this.start_cloud(cx)))
+                    .into_any_element(),
             );
         }
         if !self.creating {
-            foot.push(self.cancel(Tone::Ghost, cx));
+            foot.push(self.cancel(Kind::Text, cx));
         }
         ui::inspector(title, host, body, foot)
     }
@@ -506,13 +466,11 @@ impl NewTask {
                 .flex()
                 .items_center()
                 .gap(px(8.))
-                .child(ui::field(format::path(&self.folder, self.home.as_deref())).flex_1())
-                .child(ui::button(
-                    "folder",
-                    "更改",
-                    Tone::Plain,
-                    cx.listener(|this, _, _, cx| this.change_folder(cx)),
-                ))
+                .child(widgets::field(format::path(&self.folder, self.home.as_deref())).flex_1())
+                .child(
+                    Button::new("folder", "更改", Kind::Secondary)
+                        .on_click(cx.listener(|this, _, _, cx| this.change_folder(cx))),
+                )
                 .into_any_element()],
         )
     }
@@ -556,29 +514,28 @@ impl NewTask {
             .find(|(_, _, _, on)| *on)
             .map(|(_, name, _, _)| name.clone());
 
-        let mut cells: Vec<(SharedString, SharedString)> = vec![if probe.live {
-            ("类型".into(), "直播".into())
+        let mut cells: Vec<Stat> = vec![if probe.live {
+            Stat::new("类型", "直播")
         } else {
-            ("时长".into(), format::clock(duration).into())
+            Stat::new("时长", format::clock(duration))
         }];
-        cells.push((
-            "清晰度".into(),
-            master
-                .map_or_else(|| "单一".to_owned(), |m| format!("{} 档", m.variants.len()))
-                .into(),
+        cells.push(Stat::new(
+            "清晰度",
+            master.map_or_else(|| "单一".to_owned(), |m| format!("{} 档", m.variants.len())),
         ));
         let separate = master.map_or(0, |m| m.audio.iter().filter(|a| a.separate).count());
         if separate > 0 {
-            cells.push(("音轨".into(), format!("{separate} 条").into()));
+            cells.push(Stat::new("音轨", format!("{separate} 条")));
         }
         let mut body: Vec<AnyElement> = self.reads_with_route(cells).into_iter().collect();
 
         if !audio_options.is_empty() {
             let chips = audio_options.into_iter().map(|(index, _, label, on)| {
-                ui::chip(
+                widgets::chip(
                     ("audio", index),
                     label,
                     on,
+                    Toward::Left,
                     cx.listener(move |this, _, _, cx| {
                         this.audio = Some(index);
                         cx.notify();
@@ -589,10 +546,11 @@ impl NewTask {
             body.push(group("音轨", [chips_row(chips)]).into_any_element());
         }
         let outputs = [OutputKind::Mp4, OutputKind::Hls, OutputKind::Both].map(|kind| {
-            ui::chip(
+            widgets::chip(
                 output_label(kind),
                 output_label(kind),
                 self.output == kind,
+                Toward::Left,
                 cx.listener(move |this, _, _, cx| {
                     this.output = kind;
                     cx.notify();
@@ -632,23 +590,21 @@ impl NewTask {
         let mut foot: Vec<AnyElement> = self
             .error
             .clone()
-            .map(|error| ui::error_text(error).into_any_element())
+            .map(|error| widgets::error_text(error).into_any_element())
             .into_iter()
             .collect();
         foot.push(
-            ui::primary(
-                "start",
-                headline,
-                Some(detail.join(" · ").into()),
-                Solid::Glow,
-                !self.creating,
-                cx.listener(|this, _, window, cx| this.start(window, cx)),
-            )
-            .into_any_element(),
+            Button::new("start", headline, Kind::Primary)
+                .size(Size::Large)
+                .w_full()
+                .detail(detail.join(" · "))
+                .disabled(self.creating)
+                .on_click(cx.listener(|this, _, window, cx| this.start(window, cx)))
+                .into_any_element(),
         );
         // 开始了就不能取消，任务建成后照常出现在任务栏里
         if !self.creating {
-            foot.push(self.cancel(Tone::Ghost, cx));
+            foot.push(self.cancel(Kind::Text, cx));
         }
         ui::inspector(title, host, body, foot)
     }
@@ -677,10 +633,10 @@ fn file_row(at: usize, path: &str, size: u64, wanted: bool) -> gpui_kit::Statefu
     let mark = if wanted {
         mark.bg(theme::accent())
             .border_color(theme::accent())
-            .text_color(theme::ground())
+            .text_color(theme::bg())
             .child("✓")
     } else {
-        mark.border_color(theme::edge())
+        mark.border_color(theme::outline())
     };
     div()
         .id(("torrent-file", at))
@@ -691,7 +647,7 @@ fn file_row(at: usize, path: &str, size: u64, wanted: bool) -> gpui_kit::Statefu
         .py(px(6.))
         .rounded(px(8.))
         .cursor_pointer()
-        .hover(|s| s.bg(theme::raised()))
+        .hover(|s| s.bg(theme::wash()))
         .child(mark)
         .child(
             div()
@@ -699,20 +655,16 @@ fn file_row(at: usize, path: &str, size: u64, wanted: bool) -> gpui_kit::Statefu
                 .min_w_0()
                 .truncate()
                 .text_size(px(13.))
-                .text_color(if wanted {
-                    theme::text()
-                } else {
-                    theme::muted()
-                })
+                .text_color(if wanted { theme::ink() } else { theme::ink_3() })
                 .child(path.to_owned()),
         )
-        .child(ui::num(
+        .child(
             div()
                 .flex_none()
                 .text_size(px(12.))
-                .text_color(theme::muted())
+                .text_color(theme::ink_3())
                 .child(format::bytes(size)),
-        ))
+        )
 }
 
 /// 带小标题的一组。
@@ -721,7 +673,7 @@ pub(super) fn group(title: &'static str, children: impl IntoIterator<Item = AnyE
         .flex()
         .flex_col()
         .gap(px(10.))
-        .child(ui::caption(title))
+        .child(widgets::caption(title))
         .children(children)
 }
 

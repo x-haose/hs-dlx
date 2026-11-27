@@ -238,7 +238,7 @@ impl Backdrop {
             height: (f32::from(viewport.size.height) * scale).round() as u32,
             scale,
             corona,
-            ground: srgb(theme::ground()),
+            ground: srgb(theme::bg()),
             panel: measured.panel.map(|bounds| {
                 [bounds.left(), bounds.top(), bounds.right(), bounds.bottom()].map(f32::from)
             }),
@@ -337,7 +337,7 @@ fn srgb(color: gpui_kit::Hsla) -> [f32; 3] {
 }
 
 /// 面板底的圆角：面板的圆角减去 1 点的描边（面板底铺在描边里面）。
-const PANEL_RADIUS: f32 = crate::ui::DECK_RADIUS - 1.;
+const PANEL_RADIUS: f32 = crate::widgets::CONTAINER_RADIUS - 1.;
 
 /// 窗口最底层：铺上最新的一帧（按它的逻辑大小从左上角铺，窗口刚改大小时露出的部分是窗口底色）。它在所有表盘与面
 /// 板之前布局，借这一步把上一帧量到的位置交给 [`Backdrop::tick`]、开始量这一帧。
@@ -411,7 +411,7 @@ pub fn panel_floor() -> impl IntoElement {
                     .is_some_and(|panel| same(panel, bounds))
             });
             if !covered {
-                window.paint_quad(fill(bounds, theme::ground()).corner_radii(px(PANEL_RADIUS)));
+                window.paint_quad(fill(bounds, theme::bg()).corner_radii(px(PANEL_RADIUS)));
             }
         },
     )

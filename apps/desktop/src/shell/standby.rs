@@ -1,12 +1,12 @@
-//! 没有任务时的待机页：舞台是垫着引导线的表盘，彗尾慢慢扫、背光起伏（逐帧重画见 [`Shell::sync_standby`]）；粘贴栏
-//! 获得焦点时背光提亮，框里是可探测的链接时整圈点亮、圆盘写认出了什么。检查面板是新任务照着开始的设置；剪贴板里有
+//! 没有任务时的待机页：舞台是表盘，彗尾慢慢扫（逐帧重画见 [`Shell::sync_standby`]）；粘贴栏里是可探测的链接时整圈
+//! 点亮、圆盘写认出了什么。检查面板是新任务照着开始的设置；剪贴板里有
 //! 链接时，底栏的主操作是探测它。
 
-use std::f32::consts::{PI, TAU};
+use std::f32::consts::PI;
 
 use gpui_kit::{
     AnyElement, Context, Div, FontWeight, IntoElement, ParentElement as _, PathBuilder,
-    Styled as _, Window, canvas, div, point, px,
+    Styled as _, canvas, div, point, px,
 };
 use hs_dlx_scene::Mode;
 use hs_m3u8_core::{Proxy, bare_url};
@@ -14,48 +14,26 @@ use hs_m3u8_core::{Proxy, bare_url};
 use super::Shell;
 use crate::links;
 use crate::tasks::Tasks;
-use crate::ui::{self, Solid};
+use crate::ui;
+use crate::widgets::{self, Button, Kind, Size, Stat};
 use crate::{dial, format, ring, theme};
 
-/// 背光起伏一次的秒数。
-const BREATH: f32 = 6.;
-/// 背光起伏的幅度，与输入时、认出链接时提亮多少（都是加在 [`dial::LIGHT_STRENGTH`] 上的强度）。
-const BREATH_DEPTH: f32 = 0.025;
-const LIFT_TYPING: f32 = 0.03;
-const LIFT_LINK: f32 = 0.07;
 /// 「支持的链接」里小图形的边长。
 const KIND_ICON: f32 = 28.;
 
 impl Shell {
-    pub(super) fn render_standby(
-        &self,
-        tasks: &Tasks,
-        window: &Window,
-        cx: &Context<Self>,
-    ) -> (Div, Div) {
+    pub(super) fn render_standby(&self, tasks: &Tasks, cx: &Context<Self>) -> (Div, Div) {
         let dock = self.dock.read(cx);
         let link = links::target(&dock.text(cx));
-        let animate = !cx.reduce_motion();
-        let elapsed = self.standby_since.elapsed();
-        let breath = if animate {
-            (elapsed.as_secs_f32() * TAU / BREATH).sin() * BREATH_DEPTH
-        } else {
-            0.
-        };
-        let lift = match (&link, dock.typing(window, cx)) {
-            (Some(_), _) => LIFT_LINK,
-            (None, true) => LIFT_TYPING,
-            (None, false) => 0.,
-        };
-        let head = if animate {
-            dial::head(elapsed, dial::STANDBY_TURN)
+        let head = if !cx.reduce_motion() {
+            dial::head(self.standby_since.elapsed(), dial::STANDBY_TURN)
         } else {
             0.
         };
         let charged = link.is_some();
         let figure = dial::figure(move |bounds, window, _| {
             if charged {
-                let ticks = ring::Ticks::full(ring::COMET_TICKS, theme::accent(), true);
+                let ticks = ring::Ticks::full(ring::COMET_TICKS, theme::accent());
                 ring::paint_ticks(bounds, ring::RADIUS, &ticks, window)
             } else {
                 ring::paint_comet(bounds, ring::RADIUS, head, theme::accent(), window)
@@ -87,13 +65,7 @@ impl Shell {
                 "m3u8 地址、网页、文件或磁力链接",
             ),
         };
-        let figure = dial::lit_dial(
-            theme::accent(),
-            dial::LIGHT_STRENGTH + breath + lift,
-            Mode::Standby,
-            figure,
-            readout,
-        );
+        let figure = dial::dial(Mode::Standby, figure, readout);
         let stage = ui::stage(ring::AREA, figure, None, self.dock.clone());
         (stage, self.standby_inspector(tasks, cx))
     }
@@ -112,15 +84,13 @@ impl Shell {
             Err(reason) => ("读不出", Some(format!("读不出设置：{reason}"))),
         };
         let mut body = vec![
-            ui::reads(
+            widgets::stats(
                 vec![
-                    ("可用空间".into(), free.into()),
-                    ("网络".into(), network.into()),
+                    Stat::new("可用空间", free),
+                    Stat::text("网络", network),
+                    Stat::text("保存到", format::path(tasks.folder(), self.home.as_deref())),
                 ],
-                Some((
-                    "保存到".into(),
-                    format::path(tasks.folder(), self.home.as_deref()).into(),
-                )),
+                2,
             )
             .into_any_element(),
         ];
@@ -128,14 +98,14 @@ impl Shell {
             [no_space, unreadable]
                 .into_iter()
                 .flatten()
-                .map(|reason| ui::error_text(reason).into_any_element()),
+                .map(|reason| widgets::error_text(reason).into_any_element()),
         );
         body.push(
             div()
                 .flex()
                 .flex_col()
                 .gap(px(12.))
-                .child(ui::caption("支持的链接"))
+                .child(widgets::caption("支持的链接"))
                 .child(kind(
                     ui::rings(KIND_ICON, 2.5, 14.).into_any_element(),
                     "m3u8 地址",
@@ -158,18 +128,18 @@ impl Shell {
                 ))
                 .into_any_element(),
         );
-        let foot = self.clipboard.clone().map(|url| {
-            let shown = bare_url(&url).to_string();
-            ui::primary(
-                "probe-clipboard",
-                "探测剪贴板里的链接",
-                Some(shown.into()),
-                Solid::Glow,
-                true,
-                cx.listener(move |this, _, window, cx| this.probe_text(url.as_str(), window, cx)),
-            )
-            .into_any_element()
-        });
+        let foot =
+            self.clipboard.clone().map(|url| {
+                let shown = bare_url(&url).to_string();
+                Button::new("probe-clipboard", "探测剪贴板里的链接", Kind::Primary)
+                    .size(Size::Large)
+                    .w_full()
+                    .detail(shown)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.probe_text(url.as_str(), window, cx)
+                    }))
+                    .into_any_element()
+            });
         ui::inspector("新任务", "照这些设置开始，在设置里改", body, foot)
     }
 }
@@ -192,7 +162,7 @@ fn kind(icon: AnyElement, name: &'static str, does: &'static str) -> Div {
             .child(
                 div()
                     .text_size(px(12.5))
-                    .text_color(theme::muted())
+                    .text_color(theme::ink_3())
                     .child(does),
             ),
     )
@@ -215,7 +185,7 @@ fn file_icon() -> AnyElement {
             let path = path
                 .build()
                 .expect("几条线段的描边，顶点远低于曲面细分的上限");
-            window.paint_path(path, theme::hover_edge());
+            window.paint_path(path, theme::alpha(theme::ink(), 0.24));
         },
     )
     .size(px(KIND_ICON))
@@ -246,7 +216,7 @@ fn magnet_icon() -> AnyElement {
             let path = path
                 .build()
                 .expect("几十个顶点的描边，远低于曲面细分的上限");
-            window.paint_path(path, theme::hover_edge());
+            window.paint_path(path, theme::alpha(theme::ink(), 0.24));
         },
     )
     .size(px(KIND_ICON))
@@ -256,7 +226,12 @@ fn magnet_icon() -> AnyElement {
 
 /// 网页的小图形：圆角方框里两道横线。
 fn page_icon() -> AnyElement {
-    let bar = |width: f32| div().h(px(2.)).w(px(width)).bg(theme::hover_edge());
+    let bar = |width: f32| {
+        div()
+            .h(px(2.))
+            .w(px(width))
+            .bg(theme::alpha(theme::ink(), 0.24))
+    };
     div()
         .size(px(KIND_ICON))
         .flex_none()
@@ -266,7 +241,7 @@ fn page_icon() -> AnyElement {
         .p(px(6.))
         .rounded(px(7.))
         .border_2()
-        .border_color(theme::hover_edge())
+        .border_color(theme::alpha(theme::ink(), 0.24))
         .child(bar(12.))
         .child(bar(8.))
         .into_any_element()

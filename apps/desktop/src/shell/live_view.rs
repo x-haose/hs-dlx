@@ -12,7 +12,7 @@ use super::look::Look;
 use crate::live::{self, Face};
 use crate::ring::{AREA, angle};
 use crate::tasks::Row;
-use crate::ui::{self, CAPTION_LINE, TEXT_LINE};
+use crate::widgets::{self, CAPTION_LINE, Stat, TEXT_LINE};
 use crate::{dial, format, theme};
 
 /// 钟面上 00、15、30、45 分标记的半径。
@@ -42,7 +42,7 @@ pub(super) fn figure(row: &Row, look: &Look) -> Div {
             .top(px(half + y - CAPTION_LINE / 2.))
             .w(px(MARK_WIDTH))
             .text_center()
-            .child(ui::num(ui::caption(text)))
+            .child(widgets::caption(text))
     });
     // 第三行：录制中写当前的会话；停着的写状态的说明（失败的原因、放弃的情况；会话在概况里）
     let third = if recording {
@@ -58,7 +58,7 @@ pub(super) fn figure(row: &Row, look: &Look) -> Div {
     } else {
         look.line.clone()
     };
-    dial::face(theme::live())
+    dial::face()
         .child(
             canvas(
                 |_, _, _| {},
@@ -88,32 +88,31 @@ pub(super) fn figure(row: &Row, look: &Look) -> Div {
                 // 与窗口同色的底：指针扫到下半圈时从字后面过，不压字
                 .py(px(4.))
                 .rounded(px(12.))
-                .bg(theme::ground())
+                .bg(theme::bg())
                 .child(
                     div()
                         .text_size(px(12.))
                         .line_height(px(CAPTION_LINE))
-                        .font_weight(FontWeight::BOLD)
                         .text_color(look.color)
                         .child(look.state.clone()),
                 )
-                .child(ui::num(
+                .child(
                     div()
                         .text_size(px(36.))
                         .line_height(px(40.))
-                        .font_weight(FontWeight::BOLD)
+                        .font_weight(FontWeight::LIGHT)
                         .child(look.big.clone()),
-                ))
-                .child(ui::num(
+                )
+                .child(
                     div()
                         .w_full()
                         .text_size(px(12.))
                         .line_height(px(CAPTION_LINE))
-                        .text_color(theme::muted())
+                        .text_color(theme::ink_2())
                         .text_center()
                         .truncate()
                         .child(SharedString::from(third)),
-                )),
+                ),
         )
         .children(note(&row.timeline, recorded))
 }
@@ -142,14 +141,14 @@ fn note(timeline: &live::Timeline, recorded: Duration) -> Option<Div> {
         .px(px(8.))
         .py(px(4.))
         .rounded(px(8.))
-        .bg(theme::deck())
+        .bg(theme::bg())
         .border_1()
-        .border_color(theme::warn_edge())
+        .border_color(theme::alpha(theme::warn(), 0.35))
         .text_size(px(12.))
         .line_height(px(TEXT_LINE))
         .text_color(theme::warn())
         .truncate()
-        .child(ui::num(div().child(parts.join(" · "))));
+        .child(div().child(parts.join(" · ")));
     // 圆心右边的往右伸、左边的往左伸，都不出钟面区域
     Some(if x >= half {
         pill.left(px(x.min(AREA - NOTE_MAX_WIDTH)))
@@ -159,7 +158,7 @@ fn note(timeline: &live::Timeline, recorded: Duration) -> Option<Div> {
 }
 
 /// 录制的读数：已录、这次打开以来缺失、会话、刷新。
-pub(super) fn reads(row: &Row) -> Vec<(SharedString, SharedString)> {
+pub(super) fn reads(row: &Row) -> Vec<Stat> {
     let recorded = row.completed().map_or_else(
         || "—".to_owned(),
         |(segments, bytes)| format!("{segments} 片 · {}", format::bytes(bytes)),
@@ -196,15 +195,12 @@ pub(super) fn reads(row: &Row) -> Vec<(SharedString, SharedString)> {
             || if progress.is_some() { "正常" } else { "—" }.to_owned(),
             |reason| format!("失败：{reason}"),
         );
-    [
-        ("已录", recorded),
-        ("这次打开以来缺失", missed),
-        ("会话", session),
-        ("刷新", refresh),
+    vec![
+        Stat::new("已录", recorded),
+        Stat::new("这次打开以来缺失", missed),
+        Stat::new("会话", session),
+        Stat::text("刷新", refresh),
     ]
-    .into_iter()
-    .map(|(label, value)| (label.into(), value.into()))
-    .collect()
 }
 
 /// 钟面的图例：各会话的颜色、这次打开以前录的与缺片。
@@ -234,7 +230,7 @@ pub(super) fn legend(row: &Row) -> Div {
         .first()
         .map_or(Duration::MAX, |&(start, _)| start);
     if row.recorded() > Duration::ZERO && unknown_before > Duration::ZERO {
-        sessions_legend.push((theme::accent_dim(), "这次打开以前录的".to_owned()));
+        sessions_legend.push((live::before_color(), "这次打开以前录的".to_owned()));
     }
     let legend = |color: Hsla, half: f32, text: String| {
         div()
@@ -243,7 +239,7 @@ pub(super) fn legend(row: &Row) -> Div {
             .gap(px(10.))
             .text_size(px(12.))
             .line_height(px(CAPTION_LINE))
-            .text_color(theme::soft())
+            .text_color(theme::ink_2())
             .child(div().w(px(2.)).h(px(2. * half)).rounded(px(1.)).bg(color))
             .child(text)
     };
@@ -251,7 +247,7 @@ pub(super) fn legend(row: &Row) -> Div {
         .flex()
         .flex_col()
         .gap(px(6.))
-        .child(div().pb(px(2.)).child(ui::caption("钟面")))
+        .child(div().pb(px(2.)).child(widgets::caption("钟面")))
         .children(
             sessions_legend
                 .into_iter()

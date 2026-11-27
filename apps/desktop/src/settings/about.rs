@@ -6,8 +6,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{Context, Div, IntoElement as _, ParentElement as _, Styled as _, div, px};
 
 use super::{SettingsView, row};
-use crate::ui::{self, Tone};
 use crate::updates::UpdateState;
+use crate::widgets::{self, Button, Kind, Stat, Toward};
 
 /// 随安装包附上的第三方声明目录（打包时由 cargo-packager 当作资源放进，见 apps/desktop/Cargo.toml）：macOS 在
 /// `.app/Contents/Resources/LICENSES`，Windows 在程序旁的 `LICENSES`，Linux 在 `/usr/lib/<程序名>/LICENSES`（deb）。找不到（从源码直接运行）时为原因。
@@ -53,71 +53,58 @@ impl SettingsView {
             .flex()
             .flex_wrap()
             .gap(px(8.))
-            .child(ui::chip(
+            .child(widgets::chip(
                 "update-auto",
                 "启动时与每天检查",
                 auto,
+                Toward::Right,
                 cx.listener(|this, _, _, cx| this.pick_auto_update(true, cx)),
             ))
-            .child(ui::chip(
+            .child(widgets::chip(
                 "update-manual",
                 "不自动检查",
                 !auto,
+                Toward::Right,
                 cx.listener(|this, _, _, cx| this.pick_auto_update(false, cx)),
             ));
         let check = |cx: &mut Context<Self>| {
-            ui::button(
-                "update-check",
-                "检查更新",
-                Tone::Plain,
-                cx.listener(|this, _, _, cx| {
+            Button::new("update-check", "检查更新", Kind::Secondary)
+                .on_click(cx.listener(|this, _, _, cx| {
                     this.updates.update(cx, |updates, cx| updates.check(cx));
-                }),
-            )
-            .into_any_element()
+                }))
+                .into_any_element()
         };
         let install = |label: &'static str, cx: &mut Context<Self>| {
-            ui::button(
-                "update-install",
-                label,
-                Tone::Glow,
-                cx.listener(|this, _, _, cx| {
+            Button::new("update-install", label, Kind::Primary)
+                .on_click(cx.listener(|this, _, _, cx| {
                     this.updates.update(cx, |updates, cx| updates.install(cx));
-                }),
-            )
-            .into_any_element()
+                }))
+                .into_any_element()
         };
         let page = |url: &hs_m3u8_core::Url, label: &'static str, cx: &mut Context<Self>| {
             let url = url.to_string();
-            ui::button(
-                "update-page",
-                label,
-                Tone::Plain,
-                cx.listener(move |_, _, _, cx| cx.open_url(&url)),
-            )
-            .into_any_element()
+            Button::new("update-page", label, Kind::Secondary)
+                .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url)))
+                .into_any_element()
         };
         let mut lines: Vec<gpui_kit::AnyElement> = Vec::new();
         let mut buttons: Vec<gpui_kit::AnyElement> = Vec::new();
         match &state {
             UpdateState::Idle => buttons.push(check(cx)),
-            UpdateState::Checking => lines.push(ui::caption("正在查…").into_any_element()),
+            UpdateState::Checking => lines.push(widgets::caption("正在查…").into_any_element()),
             UpdateState::Latest => {
-                lines.push(ui::caption("已是最新").into_any_element());
+                lines.push(widgets::caption("已是最新").into_any_element());
                 buttons.push(check(cx));
             }
             UpdateState::Available(release) => {
                 lines.push(
-                    ui::reads(
-                        Vec::new(),
-                        Some(("新版本".into(), release.version.to_string().into())),
-                    )
-                    .into_any_element(),
+                    widgets::stats(vec![Stat::new("新版本", release.version.to_string())], 1)
+                        .into_any_element(),
                 );
                 match &release.package {
                     Some(package) => {
                         lines.push(
-                            ui::caption(format!(
+                            widgets::caption(format!(
                                 "下载 {}；装好后退出并打开新版本，运行中的任务会暂停，要在新版本里点继续",
                                 crate::format::bytes(package.size)
                             ))
@@ -126,7 +113,8 @@ impl SettingsView {
                         buttons.push(install("更新并重启", cx));
                     }
                     None => lines.push(
-                        ui::caption("这个平台不能自动更新，到下载页下载新版本").into_any_element(),
+                        widgets::caption("这个平台不能自动更新，到下载页下载新版本")
+                            .into_any_element(),
                     ),
                 }
                 buttons.push(page(&release.page, "更新内容", cx));
@@ -134,7 +122,7 @@ impl SettingsView {
             UpdateState::Downloading { release, received } => {
                 let total = release.package.as_ref().map_or(0, |package| package.size);
                 lines.push(
-                    ui::caption(format!(
+                    widgets::caption(format!(
                         "下载 {}：{} / {}",
                         release.version,
                         crate::format::bytes(*received),
@@ -144,11 +132,11 @@ impl SettingsView {
                 );
             }
             UpdateState::Installing(version) => {
-                lines.push(ui::caption(format!("正在装 {version}")).into_any_element());
+                lines.push(widgets::caption(format!("正在装 {version}")).into_any_element());
             }
             UpdateState::Installed(version) => {
                 lines.push(
-                    ui::caption(match (restarting, hs_dlx_app::INSTALLED_BEFORE_RESTART) {
+                    widgets::caption(match (restarting, hs_dlx_app::INSTALLED_BEFORE_RESTART) {
                         (true, _) => format!("{version}：退出后打开新版本"),
                         (false, true) => format!("{version} 已装好，重启后用新版本"),
                         (false, false) => format!("{version} 已下载并验过：点「现在重启」时装上"),
@@ -157,24 +145,20 @@ impl SettingsView {
                 );
                 if !restarting {
                     buttons.push(
-                        ui::button(
-                            "update-restart",
-                            "现在重启",
-                            Tone::Glow,
-                            cx.listener(|this, _, _, cx| {
+                        Button::new("update-restart", "现在重启", Kind::Primary)
+                            .on_click(cx.listener(|this, _, _, cx| {
                                 this.updates
                                     .update(cx, |updates, cx| updates.restart_now(cx));
-                            }),
-                        )
-                        .into_any_element(),
+                            }))
+                            .into_any_element(),
                     );
                 }
             }
             UpdateState::Stranded(reason) => {
-                lines.push(ui::error_text(reason.clone()).into_any_element());
+                lines.push(widgets::error_text(reason.clone()).into_any_element());
             }
             UpdateState::Failed { release, reason } => {
-                lines.push(ui::error_text(reason.clone()).into_any_element());
+                lines.push(widgets::error_text(reason.clone()).into_any_element());
                 match release {
                     Some(release) => {
                         if release.package.is_some() {
@@ -195,7 +179,7 @@ impl SettingsView {
                 .gap(px(12.))
                 .child(chips)
                 .children(lines)
-                .children(self.updates_error.clone().map(ui::error_text))
+                .children(self.updates_error.clone().map(widgets::error_text))
                 .when(!buttons.is_empty(), |content| {
                     content.child(div().flex().flex_wrap().gap(px(8.)).children(buttons))
                 }),
@@ -229,19 +213,17 @@ impl SettingsView {
                         .items_center()
                         .justify_between()
                         .gap(px(12.))
-                        .child(ui::num(
+                        .child(
                             div()
                                 .text_size(px(15.))
                                 .child(concat!("hs-dlx ", env!("CARGO_PKG_VERSION"))),
-                        ))
-                        .child(ui::button(
-                            "settings-notices",
-                            "第三方声明",
-                            Tone::Plain,
-                            cx.listener(|this, _, _, cx| this.open_notices(cx)),
-                        )),
+                        )
+                        .child(
+                            Button::new("settings-notices", "第三方声明", Kind::Secondary)
+                                .on_click(cx.listener(|this, _, _, cx| this.open_notices(cx))),
+                        ),
                 )
-                .children(self.notices_error.clone().map(ui::error_text)),
+                .children(self.notices_error.clone().map(widgets::error_text)),
         )
     }
 }

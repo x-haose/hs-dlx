@@ -3,7 +3,7 @@
 
 use gpui_kit::{
     AnyElement, Context, Div, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, div, px,
+    StatefulInteractiveElement as _, Styled as _, div, px,
 };
 use hs_dlx_app::web::{AudioCodec, Choice, Container, VideoCodec, no_choice_reason};
 use hs_dlx_app::ytdlp::{ExtractError, Live};
@@ -15,7 +15,8 @@ use crate::dial;
 use crate::format;
 use crate::ring::{self, Ticks};
 use crate::theme;
-use crate::ui::{self, Solid, Tone};
+use crate::ui;
+use crate::widgets::{self, Button, Kind, Size, Stat};
 
 /// 解析出的视频与选中的画质。
 pub(super) struct WebChoice {
@@ -219,7 +220,7 @@ impl NewTask {
         cx: &mut Context<Self>,
     ) -> Div {
         let mut body: Vec<AnyElement> = vec![
-            ui::note(
+            widgets::note(
                 "解析网页里的视频（YouTube、B 站等）要先装网页视频的组件：下载 yt-dlp，约 11 MB，只装一次"
                     .to_owned(),
                 false,
@@ -229,15 +230,19 @@ impl NewTask {
         let mut foot = Vec::new();
         match state {
             WebState::Installing(progress) => {
-                body.push(ui::steps(format::web_install_steps(progress)).into_any_element());
-                body.push(ui::note(format::web_install(progress), false).into_any_element());
+                body.push(
+                    widgets::steps(format::web_install_steps(progress), theme::accent())
+                        .into_any_element(),
+                );
+                body.push(widgets::note(format::web_install(progress), false).into_any_element());
             }
             WebState::Failed(reason) => {
-                body.push(ui::note(format!("上次没装成：{reason}"), true).into_any_element());
+                body.push(widgets::note(format!("上次没装成：{reason}"), true).into_any_element());
             }
             WebState::Broken(reason) => {
                 body.push(
-                    ui::note(format!("组件运行不了，要重装：{reason}"), true).into_any_element(),
+                    widgets::note(format!("组件运行不了，要重装：{reason}"), true)
+                        .into_any_element(),
                 );
             }
             WebState::Missing
@@ -248,35 +253,33 @@ impl NewTask {
         }
         if !matches!(state, WebState::Installing(_)) {
             foot.push(
-                ui::primary(
+                Button::new(
                     "install-web",
                     if matches!(state, WebState::Broken(_)) {
                         "重装网页视频组件"
                     } else {
                         "安装网页视频组件"
                     },
-                    None,
-                    Solid::Glow,
-                    true,
-                    cx.listener(|this, _, _, cx| this.install_web(cx)),
+                    Kind::Primary,
                 )
+                .size(Size::Large)
+                .w_full()
+                .on_click(cx.listener(|this, _, _, cx| this.install_web(cx)))
                 .into_any_element(),
             );
         }
         if !self.from_sniff {
             let url = self.url.clone();
             foot.push(
-                ui::button(
-                    "sniff",
-                    "改用嗅探页找视频流",
-                    Tone::Plain,
-                    cx.listener(move |_, _, _, cx| cx.emit(NewTaskEvent::Sniff(url.clone()))),
-                )
-                .w_full()
-                .into_any_element(),
+                Button::new("sniff", "改用嗅探页找视频流", Kind::Secondary)
+                    .on_click(
+                        cx.listener(move |_, _, _, cx| cx.emit(NewTaskEvent::Sniff(url.clone()))),
+                    )
+                    .w_full()
+                    .into_any_element(),
             );
         }
-        foot.push(self.cancel(Tone::Ghost, cx));
+        foot.push(self.cancel(Kind::Text, cx));
         ui::inspector(title, host, body, foot)
     }
 
@@ -289,15 +292,15 @@ impl NewTask {
         cx: &mut Context<Self>,
     ) -> Div {
         let info = &choice.resolved.info;
-        let mut cells: Vec<(SharedString, SharedString)> = Vec::new();
+        let mut cells: Vec<Stat> = Vec::new();
         if let Some(duration) = info.duration {
-            cells.push((
-                "时长".into(),
-                format::clock(std::time::Duration::from_secs_f64(duration.max(0.0))).into(),
+            cells.push(Stat::new(
+                "时长",
+                format::clock(std::time::Duration::from_secs_f64(duration.max(0.0))),
             ));
         }
         if let Some(uploader) = &info.uploader {
-            cells.push(("上传者".into(), uploader.clone().into()));
+            cells.push(Stat::new("上传者", uploader.clone()));
         }
         let mut body: Vec<AnyElement> = self.reads_with_route(cells).into_iter().collect();
         let rows = choice
@@ -320,7 +323,7 @@ impl NewTask {
                     .child(div().child(label(option)))
                     .child(
                         div()
-                            .text_color(theme::muted())
+                            .text_color(theme::ink_3())
                             .child(option.size.map_or_else(String::new, |size| {
                                 let approx = if size.exact { "" } else { "约 " };
                                 format!("{approx}{}", format::bytes(size.bytes))
@@ -338,22 +341,20 @@ impl NewTask {
         let mut foot: Vec<AnyElement> = self
             .error
             .clone()
-            .map(|error| ui::error_text(error).into_any_element())
+            .map(|error| widgets::error_text(error).into_any_element())
             .into_iter()
             .collect();
         foot.push(
-            ui::primary(
-                "start",
-                headline,
-                Some(format!("{} · {}", self.title, label(choice.choice())).into()),
-                Solid::Glow,
-                !self.creating,
-                cx.listener(|this, _, window, cx| this.start(window, cx)),
-            )
-            .into_any_element(),
+            Button::new("start", headline, Kind::Primary)
+                .size(Size::Large)
+                .w_full()
+                .detail(format!("{} · {}", self.title, label(choice.choice())))
+                .disabled(self.creating)
+                .on_click(cx.listener(|this, _, window, cx| this.start(window, cx)))
+                .into_any_element(),
         );
         if !self.creating {
-            foot.push(self.cancel(Tone::Ghost, cx));
+            foot.push(self.cancel(Kind::Text, cx));
         }
         ui::inspector(title, host, body, foot)
     }
@@ -361,11 +362,7 @@ impl NewTask {
 
 /// 选中的画质的表盘：大字为清晰度（只要音频时为「音频」），下面是编码、容器与大小。
 pub(super) fn web_dial(choice: &WebChoice) -> Div {
-    let ticks = Ticks::full(
-        ring::COMET_TICKS,
-        theme::alpha(theme::accent(), 0.45),
-        false,
-    );
+    let ticks = Ticks::full(ring::COMET_TICKS, theme::alpha(theme::accent(), 0.45));
     let option = choice.choice();
     let big = match option.height {
         Some(height) if option.video.is_some() => format!("{height}p"),
@@ -381,7 +378,6 @@ pub(super) fn web_dial(choice: &WebChoice) -> Div {
     });
     let line = format!("{}{size}", codecs(option));
     dial::dial(
-        theme::accent(),
         Mode::Choosing,
         dial::figure(move |bounds, window, _| {
             ring::paint_ticks(bounds, ring::RADIUS, &ticks, window)
@@ -454,10 +450,10 @@ impl Selected for gpui_kit::Stateful<Div> {
     fn when_selected(self, selected: bool) -> Self {
         if selected {
             self.bg(theme::alpha(theme::accent(), 0.16))
-                .text_color(theme::text())
+                .text_color(theme::ink())
         } else {
-            self.text_color(theme::muted())
-                .hover(|style| style.text_color(theme::text()))
+            self.text_color(theme::ink_3())
+                .hover(|style| style.text_color(theme::ink()))
         }
     }
 }

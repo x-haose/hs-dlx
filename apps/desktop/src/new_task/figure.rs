@@ -14,7 +14,8 @@ use hs_m3u8_core::{FileInfo, Probe, VariantInfo};
 use super::{NewTask, PageCheck, Probing, TorrentChoice, duration_of};
 use crate::backdrop::{self, Disc};
 use crate::ring::{self, Ticks};
-use crate::{dial, format, theme, ui};
+use crate::widgets;
+use crate::{dial, format, theme};
 
 /// 同心环所在方框的边长。
 const BOX: f32 = 480.;
@@ -122,13 +123,9 @@ fn ring_div(radius: f32, width: f32) -> Div {
     )
 }
 
-/// 选中的环：主色的环，外加两圈更宽更淡的同心环作光晕。阴影会透过透明的环心铺满整个圆，所以光晕用环画。
-fn lit_ring(radius: f32, width: f32) -> Vec<Div> {
-    vec![
-        ring_div(radius, width + 18.).border_color(theme::alpha(theme::accent(), 0.06)),
-        ring_div(radius, width + 8.).border_color(theme::alpha(theme::accent(), 0.14)),
-        ring_div(radius, width).border_color(theme::accent()),
-    ]
+/// 选中的环：主色的环。
+fn lit_ring(radius: f32, width: f32) -> Div {
+    ring_div(radius, width).border_color(theme::accent())
 }
 
 impl NewTask {
@@ -202,7 +199,6 @@ impl NewTask {
             0.
         };
         dial::dial(
-            theme::accent(),
             Mode::Preparing,
             dial::figure(move |bounds, window, _| {
                 ring::paint_comet(bounds, ring::RADIUS, head, theme::accent(), window)
@@ -296,18 +292,18 @@ impl NewTask {
                             .items_center()
                             .justify_center()
                             .gap(px(4.))
-                            .child(ui::num(
+                            .child(
                                 div()
                                     .text_size(px(34.))
                                     .font_weight(FontWeight::BOLD)
                                     .child(center),
-                            ))
-                            .child(ui::num(
+                            )
+                            .child(
                                 div()
                                     .text_size(px(13.))
-                                    .text_color(theme::muted())
+                                    .text_color(theme::ink_3())
                                     .child(note),
-                            )),
+                            ),
                     )
                     .children(labels),
             )
@@ -315,31 +311,17 @@ impl NewTask {
 
     /// 探测完成后舞台里同心环下面的一行：按键在界面上看不出来。
     pub(super) fn keys_hint(&self) -> Option<AnyElement> {
-        let probe = match &self.probing {
-            Probing::Ready(probe) => probe,
-            Probing::File(_) | Probing::Torrent(_) => {
-                return Some(ui::caption("回车开始").into_any_element());
-            }
-            Probing::Web(choice) => {
-                let text = if choice.resolved.choices.len() > 1 {
-                    "↑ ↓ 换一档 · 回车开始"
-                } else {
-                    "回车开始"
-                };
-                return Some(ui::caption(text).into_any_element());
-            }
+        let switch = match &self.probing {
+            Probing::Ready(probe) => probe.master.as_ref().is_some_and(|m| m.variants.len() > 1),
+            Probing::File(_) | Probing::Torrent(_) => false,
+            Probing::Web(choice) => choice.resolved.choices.len() > 1,
             Probing::Running
             | Probing::Failed(_)
             | Probing::Metadata(_)
             | Probing::Resolving
             | Probing::NeedsWeb(_) => return None,
         };
-        let text = if probe.master.as_ref().is_some_and(|m| m.variants.len() > 1) {
-            "↑ ↓ 换一档 · 回车开始"
-        } else {
-            "回车开始"
-        };
-        Some(ui::caption(text).into_any_element())
+        Some(keys(switch).into_any_element())
     }
 
     /// 探测完成时的同心环：圆心写选中一档的清晰度与大小上限，只有一档时写时长与片数。
@@ -354,7 +336,7 @@ impl NewTask {
                 (format::clock(duration), format!("{segments} 个分片"))
             };
             return Figure {
-                rings: lit_ring(SINGLE_RADIUS, SINGLE_WIDTH),
+                rings: vec![lit_ring(SINGLE_RADIUS, SINGLE_WIDTH)],
                 labels: Vec::new(),
                 center,
                 note,
@@ -375,12 +357,12 @@ impl NewTask {
             let color = if on {
                 theme::accent()
             } else if hover {
-                theme::hover_edge()
+                theme::alpha(theme::ink(), 0.24)
             } else {
-                theme::ring_idle()
+                theme::outline()
             };
             if on {
-                ring_divs.extend(lit_ring(ring.radius, ring.width));
+                ring_divs.push(lit_ring(ring.radius, ring.width));
             } else {
                 ring_divs.push(ring_div(ring.radius, ring.width).border_color(color));
             }
@@ -402,7 +384,11 @@ impl NewTask {
                     .top(px(y))
                     .w(px(LABEL_X - 4. - x))
                     .h(px(1.))
-                    .bg(if on { theme::accent() } else { theme::edge() }),
+                    .bg(if on {
+                        theme::accent()
+                    } else {
+                        theme::outline()
+                    }),
             );
             labels.push(
                 div()
@@ -414,19 +400,17 @@ impl NewTask {
                     .gap(px(8.))
                     .whitespace_nowrap()
                     .text_size(px(15.))
-                    .child(ui::num(
+                    .child(
                         div()
-                            .text_color(if on { theme::text() } else { theme::muted() })
+                            .text_color(if on { theme::ink() } else { theme::ink_3() })
                             .when(on, |s| s.font_weight(FontWeight::BOLD))
                             .child(label),
-                    ))
+                    )
                     .children(rate.map(|rate| {
-                        ui::num(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(theme::muted())
-                                .child(rate),
-                        )
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme::ink_3())
+                            .child(rate)
                     })),
             );
         }
@@ -449,11 +433,7 @@ impl NewTask {
 
 /// 认出文件的表盘：整圈暗的主色，圆盘里写大小（服务器没给出时写「大小未知」）与类型。
 fn file_dial(info: &FileInfo) -> Div {
-    let ticks = Ticks::full(
-        ring::COMET_TICKS,
-        theme::alpha(theme::accent(), 0.45),
-        false,
-    );
+    let ticks = Ticks::full(ring::COMET_TICKS, theme::alpha(theme::accent(), 0.45));
     let big = info
         .length
         .map_or_else(|| "大小未知".to_owned(), format::bytes);
@@ -462,7 +442,6 @@ fn file_dial(info: &FileInfo) -> Div {
         .clone()
         .unwrap_or_else(|| "类型未知".to_owned());
     dial::dial(
-        theme::accent(),
         Mode::Choosing,
         dial::figure(move |bounds, window, _| {
             ring::paint_ticks(bounds, ring::RADIUS, &ticks, window)
@@ -473,15 +452,10 @@ fn file_dial(info: &FileInfo) -> Div {
 
 /// 取到种子信息后的表盘：圆盘里写选了的文件的大小与几个文件。
 fn torrent_dial(choice: &TorrentChoice) -> Div {
-    let ticks = Ticks::full(
-        ring::COMET_TICKS,
-        theme::alpha(theme::accent(), 0.45),
-        false,
-    );
+    let ticks = Ticks::full(ring::COMET_TICKS, theme::alpha(theme::accent(), 0.45));
     let (count, bytes) = choice.selected();
     let line = format!("{count} / {} 个文件", choice.info.files.len());
     dial::dial(
-        theme::accent(),
         Mode::Choosing,
         dial::figure(move |bounds, window, _| {
             ring::paint_ticks(bounds, ring::RADIUS, &ticks, window)
@@ -498,9 +472,8 @@ fn torrent_dial(choice: &TorrentChoice) -> Div {
 /// 探测失败的表盘：整圈暗的警告色，圆盘里写状态码或种类（见 [`format::failure`]）；怎么办写在检查面板里。
 fn failed_dial(failure: &Failure) -> Div {
     let (mark, _) = format::failure(failure.kind);
-    let ticks = Ticks::full(ring::COMET_TICKS, theme::alpha(theme::warn(), 0.45), false);
+    let ticks = Ticks::full(ring::COMET_TICKS, theme::alpha(theme::warn(), 0.45));
     dial::dial(
-        theme::warn(),
         Mode::Failed { progress: None },
         dial::figure(move |bounds, window, _| {
             ring::paint_ticks(bounds, ring::RADIUS, &ticks, window)
@@ -521,6 +494,28 @@ struct Figure {
     note: String,
     /// 最外一环的外沿离圆心多远：窗口背景的日冕从这里放出
     edge: f32,
+}
+
+/// 按键说明一行的高：放得下键帽。
+pub const KEYS_HEIGHT: f32 = 20.;
+
+/// 按键说明：「↵ 开始」，`switch` 时前面加「↑ ↓ 换一档」。
+fn keys(switch: bool) -> Div {
+    let row = div()
+        .h(px(KEYS_HEIGHT))
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .text_size(px(12.))
+        .text_color(theme::ink_3());
+    let row = if switch {
+        row.child(widgets::kbd("↑"))
+            .child(widgets::kbd("↓"))
+            .child("换一档")
+    } else {
+        row
+    };
+    row.child(widgets::kbd("↵")).child("开始")
 }
 
 #[cfg(test)]

@@ -1,8 +1,6 @@
 //! 左边的任务栏面板：标题栏写有几个任务，下面每个任务一个进度小环；新建时最上面是一个虚线环的「新任务」，在网页里
 //! 找视频流时有网页那一项。
 
-use std::time::Duration;
-
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Context, Div, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Stateful,
@@ -13,8 +11,8 @@ use super::look::look;
 use super::{Page, Shell};
 use crate::new_task::Phase;
 use crate::tasks::{Row, Tasks};
-use crate::{motion, ring, theme, ui};
-use hs_dlx_app::Status;
+use crate::widgets;
+use crate::{ring, theme, ui};
 
 /// 任务栏的宽度。
 const WIDTH: f32 = 288.;
@@ -24,8 +22,6 @@ pub(super) const MIN_WIDTH: f32 = 240.;
 /// 小环的边长与环宽。
 const ORB: f32 = 46.;
 const ORB_WIDTH: f32 = 5.;
-/// 小环上的光点绕一圈要多久。
-const ORBIT: Duration = Duration::from_millis(2800);
 
 impl Shell {
     pub(super) fn render_list(&self, tasks: &Tasks, cx: &Context<Self>) -> impl IntoElement {
@@ -62,9 +58,9 @@ impl Shell {
                     .pt(px(10.))
                     .pb(px(8.))
                     .text_size(px(13.))
-                    .text_color(theme::muted())
+                    .text_color(theme::ink_3())
                     .child("任务")
-                    .child(ui::num(div().child(tasks.rows().len().to_string()))),
+                    .child(div().child(tasks.rows().len().to_string())),
             )
             .child(
                 div()
@@ -94,10 +90,6 @@ impl Shell {
         let look = look(row);
         let on = selected == Some(id) && matches!(self.page, Page::Task) && self.settings.is_none();
         let (fraction, color) = (look.fraction, look.orb);
-        // 在下的任务：一颗光点沿小环绕行
-        let orbit = (row.task.status == Status::Running)
-            .then(|| motion::turn(ORBIT))
-            .flatten();
         ui::list_item(("task", id.0 as u64), on)
             .when(dim, |s| s.opacity(0.5))
             .cursor_pointer()
@@ -120,12 +112,9 @@ impl Shell {
                                     ORB_WIDTH,
                                     fraction,
                                     color,
-                                    theme::line(),
+                                    theme::outline(),
                                     window,
                                 );
-                                if let Some(turn) = orbit {
-                                    ring::paint_orbit(bounds, ORB_WIDTH, turn, color, window);
-                                }
                             },
                         )
                         .absolute()
@@ -133,7 +122,7 @@ impl Shell {
                     )
                     // 新建时其余任务只留环，中间空着，视线落在新建上
                     .when(!dim, |orb| {
-                        orb.child(ui::num(
+                        orb.child(
                             div()
                                 .absolute()
                                 .size_full()
@@ -141,9 +130,9 @@ impl Shell {
                                 .items_center()
                                 .justify_center()
                                 .text_size(px(10.5))
-                                .text_color(theme::soft())
+                                .text_color(theme::ink_2())
                                 .child(look.short),
-                        ))
+                        )
                     }),
             )
             .child(two_lines(
@@ -167,13 +156,13 @@ fn two_lines(title: String, state: String) -> impl IntoElement {
                 .truncate()
                 .child(title),
         )
-        .child(ui::num(
+        .child(
             div()
                 .text_size(px(12.))
-                .text_color(theme::muted())
+                .text_color(theme::ink_3())
                 .truncate()
                 .child(state),
-        ))
+        )
 }
 
 /// 网页里的视频流那一项：两个同心实线环（与列表里每条流前面的一样），写网页的标题与找到了几条；`on` 为正显示着。
@@ -234,7 +223,7 @@ fn empty_slots() -> Vec<gpui_kit::AnyElement> {
                     .flex_none()
                     .rounded_full()
                     .border_2()
-                    .border_color(theme::ring_idle()),
+                    .border_color(theme::outline()),
             )
             .child(
                 div()
@@ -247,14 +236,14 @@ fn empty_slots() -> Vec<gpui_kit::AnyElement> {
                             .h(px(9.))
                             .w(px(width))
                             .rounded(px(5.))
-                            .bg(theme::selected()),
+                            .bg(theme::hover()),
                     )
                     .child(
                         div()
                             .h(px(7.))
                             .w(px(width * 0.6))
                             .rounded(px(4.))
-                            .bg(theme::raised()),
+                            .bg(theme::wash()),
                     ),
             )
             .into_any_element()
@@ -278,8 +267,8 @@ fn empty_slots() -> Vec<gpui_kit::AnyElement> {
             .child(
                 div()
                     .text_size(px(12.5))
-                    .line_height(px(ui::TEXT_LINE))
-                    .text_color(theme::muted())
+                    .line_height(px(widgets::TEXT_LINE))
+                    .text_color(theme::ink_3())
                     .child("探测好、开始下载后列在这里；关窗时可以让它在后台接着下"),
             )
             .into_any_element(),

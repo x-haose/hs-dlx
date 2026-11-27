@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use gpui_kit::{App, Div, ParentElement as _, Styled as _, div, px};
 use hs_dlx_app::ytdlp::Browser;
 
-use crate::ui::{self, Tone};
+use crate::widgets::{self, Button, Kind};
 
 /// 系统设置里「隐私与安全性 → 完全磁盘访问权限」那一页
 const FULL_DISK_ACCESS: &str =
@@ -17,7 +17,7 @@ const PROTECTED: &str = "Library/Safari";
 
 /// `browser` 的数据读不了时的警告：怎么办，macOS 上另有去开权限的按钮（见 [`button`]）。
 pub fn card(browser: Browser) -> Div {
-    ui::note(browser.denied_hint(), true)
+    widgets::note(browser.denied_hint(), true)
         .flex()
         .flex_col()
         .gap(px(12.))
@@ -32,13 +32,13 @@ pub fn button() -> Option<Div> {
             .flex()
             .flex_col()
             .gap(px(8.))
-            .child(div().flex().child(ui::button(
-                "open-full-disk-access",
-                "打开系统设置",
-                Tone::Plain,
-                |_, _, cx| open_settings(cx),
-            )))
-            .child(ui::caption(
+            .child(
+                div().flex().child(
+                    Button::new("open-full-disk-access", "打开系统设置", Kind::Secondary)
+                        .on_click(|_, _, cx| open_settings(cx)),
+                ),
+            )
+            .child(widgets::caption(
                 "同时在 Finder 里选中 hs-dlx：列表里没有它时，把它拖进列表",
             ))
     })

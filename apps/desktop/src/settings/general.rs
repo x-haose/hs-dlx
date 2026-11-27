@@ -5,8 +5,8 @@ use hs_m3u8_core::{Proxy, Url};
 
 use super::{Mode, SettingsView, mode_of, row};
 use crate::route::Route;
-use crate::ui::{self, Tone};
 use crate::web_route::WebRoute;
+use crate::widgets::{self, Button, Kind, Stat, Toward};
 
 impl SettingsView {
     /// 选了一种方式：跟随系统、直连即存，存进了才选中；指定代理要填了端口、核对过再存。
@@ -89,19 +89,20 @@ impl SettingsView {
             _ => None,
         };
         let chip = |id: &'static str, label: &'static str, mode: Mode, cx: &mut Context<Self>| {
-            ui::chip(
+            widgets::chip(
                 id,
                 label,
                 self.mode == mode,
+                Toward::Right,
                 cx.listener(move |this, _, _, cx| this.pick(mode, cx)),
             )
         };
-        let now = |value: String| ui::reads(Vec::new(), Some(("现在".into(), value.into())));
+        let now = |value: String| widgets::stats(vec![Stat::text("现在", value)], 1);
         let line = match self.mode {
             Mode::System => self.system.as_ref().map(|route| match route {
                 Route::Proxy(proxy, source) => now(format!("经 {proxy}（{source}）")),
                 Route::Direct(why) => now(format!("直连 · {why}")),
-                Route::Broken(why) => ui::error_text(why.clone()),
+                Route::Broken(why) => widgets::error_text(why.clone()),
             }),
             Mode::Direct => Some(now("不经任何代理".to_owned())),
             Mode::Custom => Some(
@@ -110,7 +111,7 @@ impl SettingsView {
                     .flex_col()
                     .gap(px(8.))
                     .child(self.address.clone())
-                    .children(unsaved.map(ui::caption)),
+                    .children(unsaved.map(widgets::caption)),
             ),
         };
         row(
@@ -130,8 +131,8 @@ impl SettingsView {
                     .child(chip("proxy-custom", "指定代理", Mode::Custom, cx)),
             )
             .children(line)
-            .children(self.proxy_error.clone().map(ui::error_text))
-            .child(ui::caption(
+            .children(self.proxy_error.clone().map(widgets::error_text))
+            .child(widgets::caption(
                 match hs_dlx_webview::custom_proxy_supported() {
                     Ok(()) if hs_dlx_webview::PROXY_FIXED_FOR_PROCESS => "在下的任务暂停再继续后才换；嗅探页的网页在直连与指定代理之间立即换，与跟随系统之间换要重启应用".to_owned(),
                     Ok(()) => "在下的任务暂停再继续后才换；嗅探页的网页在直连与指定代理之间立即换，与跟随系统之间换要把它们都关掉再开".to_owned(),
@@ -158,20 +159,18 @@ impl SettingsView {
                         .items_center()
                         .gap(px(8.))
                         .child(
-                            ui::field(crate::format::path(
+                            widgets::field(crate::format::path(
                                 self.tasks.read(cx).folder(),
                                 self.home.as_deref(),
                             ))
                             .flex_1(),
                         )
-                        .child(ui::button(
-                            "settings-folder",
-                            "更改",
-                            Tone::Plain,
-                            cx.listener(|this, _, _, cx| this.change_folder(cx)),
-                        )),
+                        .child(
+                            Button::new("settings-folder", "更改", Kind::Secondary)
+                                .on_click(cx.listener(|this, _, _, cx| this.change_folder(cx))),
+                        ),
                 )
-                .children(self.folder_error.clone().map(ui::error_text)),
+                .children(self.folder_error.clone().map(widgets::error_text)),
         )
     }
 }

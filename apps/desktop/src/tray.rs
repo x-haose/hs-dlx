@@ -328,7 +328,7 @@ fn ring_icon(arc: f32, dot: bool) -> Result<Icon, String> {
         (
             rgba8(theme::accent()),
             {
-                let [r, g, b, _] = rgba8(theme::muted());
+                let [r, g, b, _] = rgba8(theme::ink_3());
                 [r, g, b, 150]
             },
             rgba8(theme::live()),

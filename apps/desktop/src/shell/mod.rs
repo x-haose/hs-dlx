@@ -32,7 +32,6 @@ use crate::dial;
 use crate::dock::{Dock, DockEvent};
 use crate::headers::HeadersEditor;
 use crate::links;
-use crate::motion;
 use crate::new_task;
 use crate::new_task::NewTask;
 use crate::settings::{Section, SettingsEvent, SettingsView};
@@ -41,6 +40,7 @@ use crate::tasks::{Row, Tasks};
 use crate::theme;
 use crate::ui::{GAP, PAD, TITLE_HEIGHT, max};
 use crate::updates::Updates;
+use crate::widgets;
 
 /// 窗口的最小宽：放得下任务栏收到最窄时、最宽的一个视图。
 pub const MIN_WIDTH: f32 =
@@ -88,11 +88,10 @@ pub struct Shell {
     standby_frames: Option<Task<()>>,
     /// 窗口的动态背景
     backdrop: Backdrop,
-    /// 每隔 [`backdrop::FRAME`] 给背景送一次参数、换上画好的图，并让窗口重画（装饰动效的节拍，见
-    /// [`crate::motion`]）：窗口在前台、系统没要求减少动态效果时每次都重画，否则只在背景换了图时重画。
+    /// 每隔 [`backdrop::FRAME`] 给背景送一次参数、换上画好的图；换了图时让窗口重画。
     /// 简化：整窗每次都重画（任务栏每一项的小环都重新细分），任务很多、机器很弱时成为瓶颈再把任务栏拆成缓存的视图
     _frames: Task<()>,
-    /// 这次进入待机页的时刻：彗尾与背光按它走
+    /// 这次进入待机页的时刻：彗尾按它走
     standby_since: Instant,
     /// 进入待机页时读到的代理设置（待机页写新任务经哪里走；在设置页改了之后回来会重读）；读不出时为原因
     standby_proxy: Result<hs_m3u8_core::Proxy, String>,
@@ -142,7 +141,7 @@ impl Shell {
         let frames = cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(backdrop::FRAME).await;
-                let ticked = this.update_in(cx, |this, window, cx| {
+                let ticked = this.update_in(cx, |this, _, cx| {
                     let changed = if this.backdrop.stopped() {
                         false
                     } else {
@@ -154,7 +153,7 @@ impl Shell {
                             }
                         }
                     };
-                    if changed || (window.is_window_active() && !cx.reduce_motion()) {
+                    if changed {
                         cx.notify();
                     }
                 });
@@ -295,8 +294,8 @@ impl Shell {
             .update(cx, |dock, cx| dock.set_probing(probing, cx));
     }
 
-    /// 显示着待机页（任务页、没有任务）时每隔 [`dial::frame`]（按 [`dial::STANDBY_TURN`]） 重画一次，让彗尾慢慢扫、背光起伏（系统要求减少动态
-    /// 效果时不画）；离开待机页即停。
+    /// 显示着待机页（任务页、没有任务）时每隔 [`dial::frame`]（按 [`dial::STANDBY_TURN`]） 重画一次，让彗尾慢慢扫（系统要求减少动态效果时
+    /// 不画）；离开待机页即停。
     fn sync_standby(&mut self, cx: &mut Context<Self>) {
         let standby =
             matches!(self.page, Page::Task) && self.selected.is_none() && self.settings.is_none();
@@ -402,9 +401,8 @@ impl Shell {
 }
 
 impl Render for Shell {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let now = Instant::now();
-        motion::set_still(cx.reduce_motion());
         let cx = &*cx;
         let tasks = self.tasks.read(cx);
         let mut body = div()
@@ -431,18 +429,18 @@ impl Render for Shell {
                     body.child(stage).child(inspector)
                 }
                 None => {
-                    let (stage, inspector) = self.render_standby(tasks, window, cx);
+                    let (stage, inspector) = self.render_standby(tasks, cx);
                     body.child(stage).child(inspector)
                 }
             },
         };
-        div()
+        widgets::typeset(div())
             .relative()
             .size_full()
             .flex()
             .flex_col()
-            .bg(theme::ground())
-            .text_color(theme::text())
+            .bg(theme::bg())
+            .text_color(theme::ink())
             .text_size(px(14.))
             .child(backdrop::layer())
             .child(self.render_header(tasks, now, cx))

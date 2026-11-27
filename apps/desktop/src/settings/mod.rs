@@ -24,8 +24,9 @@ use self::proxy_editor::{ProxyEditor, ProxyEditorEvent};
 use crate::route::Route;
 use crate::tasks::Tasks;
 use crate::theme;
-use crate::ui::{self, Tone};
+use crate::ui;
 use crate::updates::Updates;
+use crate::widgets::{self, Button, Kind, Toward};
 
 /// 设置各行的最大宽度。
 const MAX_WIDTH: f32 = 720.;
@@ -312,7 +313,7 @@ impl Render for SettingsView {
         let last = rows.len() - 1;
         let rows = rows.into_iter().enumerate().map(|(index, row)| {
             row.when(index < last, |row| {
-                row.border_b_1().border_color(theme::hairline())
+                row.border_b_1().border_color(theme::rule())
             })
             .flex_none()
             .w_full()
@@ -333,13 +334,9 @@ impl Render for SettingsView {
                 None,
                 "设置",
                 None,
-                [ui::button(
-                    "close-settings",
-                    "关闭",
-                    Tone::Ghost,
-                    cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Dismissed)),
-                )
-                .into_any_element()],
+                [Button::new("close-settings", "关闭", Kind::Text)
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Dismissed)))
+                    .into_any_element()],
             ))
             .child(
                 div()
@@ -356,7 +353,7 @@ impl Render for SettingsView {
                             .px(px(12.))
                             .pt(px(14.))
                             .border_r_1()
-                            .border_color(theme::hairline())
+                            .border_color(theme::rule())
                             .children(nav),
                     )
                     .child(
@@ -377,7 +374,7 @@ impl Render for SettingsView {
     }
 }
 
-/// 左边的一组：选中的底色略亮、字为正文色。
+/// 左边的一组：选中的按 [`widgets::lit`] 画（光在右边）、字为正文色。
 fn nav_item(
     id: impl Into<ElementId>,
     label: &'static str,
@@ -386,20 +383,24 @@ fn nav_item(
 ) -> Stateful<Div> {
     let item = div()
         .id(id)
-        .px(px(12.))
-        .py(px(8.))
-        .rounded(px(10.))
+        .h(px(38.))
+        .px(px(14.))
+        .flex()
+        .items_center()
+        .rounded(px(widgets::CONTROL_RADIUS))
         .text_size(px(13.5))
         .cursor_pointer()
         .on_click(on_click)
         .child(label);
     if selected {
-        item.bg(theme::alpha(theme::text(), 0.08))
-            .text_color(theme::text())
-            .font_weight(FontWeight::SEMIBOLD)
+        widgets::lit(item, Toward::Right, theme::accent())
+            .text_color(theme::ink())
+            .font_weight(FontWeight::MEDIUM)
     } else {
-        item.text_color(theme::muted())
-            .hover(|style| style.text_color(theme::text()))
+        item.border_1()
+            .border_color(gpui_kit::transparent_black())
+            .text_color(theme::ink_2())
+            .hover(|style| style.text_color(theme::ink()))
     }
 }
 
@@ -429,8 +430,8 @@ fn row(title: &'static str, about: Option<&'static str>, content: Div) -> Div {
                 .children(about.map(|about| {
                     div()
                         .text_size(px(12.))
-                        .line_height(px(ui::CAPTION_LINE))
-                        .text_color(theme::faint())
+                        .line_height(px(widgets::CAPTION_LINE))
+                        .text_color(theme::ink_3())
                         .child(about)
                 })),
         )

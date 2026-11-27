@@ -1,18 +1,15 @@
-//! 环的画法：中央的刻度环（任务的分片、待机与探测的彗尾）、外圈的表圈与列表里的小进度环；刻度、角度与圆上的点也给直播钟面（[`crate::live`]）
-//! 用。都以绘制区域的中心为圆心，从 12 点方向顺时针。
+//! 环的画法：中央的刻度环（任务的分片、待机与探测的彗尾）与列表里的小进度环；刻度、角度与圆上的点也给直播钟面
+//! （[`crate::live`]）用。都以绘制区域的中心为圆心，从 12 点方向顺时针。刻度不发光。
 
 use std::f32::consts::{FRAC_PI_2, TAU};
 
 use gpui_kit::{Bounds, Hsla, PathBuilder, Pixels, Point, Window, point, px};
 
-use crate::{motion, theme};
+use crate::theme;
 
 /// 中央刻度环的绘制区域边长与刻度环的半径。
 pub const AREA: f32 = 460.;
 pub const RADIUS: f32 = 206.;
-
-/// 表圈（[`paint_bezel`]）刻度的外沿半径：离绘制区域的边留 1。
-const BEZEL: f32 = AREA / 2. - 1.;
 
 /// 刻度环最多画几个刻度：在 [`RADIUS`] 的环上每格 2 宽、至少留 1.6 的缝。分片更多时一个刻度管几片。
 pub const MAX_TICKS: usize = 360;
@@ -37,8 +34,6 @@ pub struct Ticks {
     pub retrying: bool,
     /// 已完成刻度的颜色：下载为主色，录制为直播色
     pub color: Hsla,
-    /// 已完成的刻度发光；暂停、失败时不发光
-    pub glow: bool,
 }
 
 impl Ticks {
@@ -55,12 +50,11 @@ impl Ticks {
             active: usize::from(running && lit < count),
             retrying: false,
             color: theme::accent(),
-            glow: true,
         }
     }
 
-    /// `count` 格全部点亮成 `color`，`glow` 时发光：探测失败、认出了链接时的整圈。
-    pub fn full(count: usize, color: Hsla, glow: bool) -> Ticks {
+    /// `count` 格全部点亮成 `color`：探测失败、认出了链接时的整圈。
+    pub fn full(count: usize, color: Hsla) -> Ticks {
         Ticks {
             count,
             lit: count,
@@ -68,7 +62,6 @@ impl Ticks {
             active: 0,
             retrying: false,
             color,
-            glow,
         }
     }
 }
@@ -102,54 +95,30 @@ impl Stroke {
     }
 }
 
-/// 在 `bounds` 中心画半径 `radius` 的刻度环。发光是同一组刻度先画两层更粗、更淡的描边；下载中的那一格是闪烁的亮白
-/// （[`motion::blink`]），带已完成刻度颜色的光晕。
+/// 在 `bounds` 中心画半径 `radius` 的刻度环：已写出的为正文色，已完成的为 `ticks.color`，下载中的那一格加粗，重试中
+/// 的那一格为警告色、更长更粗。
 pub fn paint_ticks(bounds: Bounds<Pixels>, radius: f32, ticks: &Ticks, window: &mut Window) {
     let center = bounds.center();
-    let mut idle = Stroke::new(2., theme::line(), HALF);
-    let mut halo_wide = Stroke::new(9., theme::alpha(ticks.color, 0.07), HALF + 2.);
-    let mut halo_near = Stroke::new(5., theme::alpha(ticks.color, 0.18), HALF + 1.);
+    let mut idle = Stroke::new(2., theme::outline(), HALF);
     let mut lit = Stroke::new(2., ticks.color, HALF);
-    let mut written_halo = Stroke::new(5., theme::alpha(theme::written(), 0.16), HALF + 1.);
-    let mut written = Stroke::new(2., theme::written(), HALF);
-    let blink = motion::blink();
-    let mut active_halo = Stroke::new(8., theme::alpha(ticks.color, 0.35 * blink), HALF + 2.);
-    let mut active = Stroke::new(2.2, theme::alpha(gpui_kit::white(), blink), HALF);
-    let mut retry_halo = Stroke::new(10., theme::alpha(theme::warn(), 0.3), RETRY_HALF + 2.);
+    let mut written = Stroke::new(2., theme::ink(), HALF);
+    let mut active = Stroke::new(3., theme::ink(), HALF);
     let mut retry = Stroke::new(3., theme::warn(), RETRY_HALF);
     for i in 0..ticks.count {
         let rad = angle(i as f32 / ticks.count as f32);
         if i < ticks.written {
-            written_halo.tick(center, radius, rad);
             written.tick(center, radius, rad);
         } else if i < ticks.lit {
-            if ticks.glow {
-                halo_wide.tick(center, radius, rad);
-                halo_near.tick(center, radius, rad);
-            }
             lit.tick(center, radius, rad);
         } else if i == ticks.lit && ticks.retrying {
-            retry_halo.tick(center, radius, rad);
             retry.tick(center, radius, rad);
         } else if i < ticks.lit + ticks.active {
-            active_halo.tick(center, radius, rad);
             active.tick(center, radius, rad);
         } else {
             idle.tick(center, radius, rad);
         }
     }
-    for stroke in [
-        idle,
-        halo_wide,
-        halo_near,
-        lit,
-        written_halo,
-        written,
-        active_halo,
-        active,
-        retry_halo,
-        retry,
-    ] {
+    for stroke in [idle, lit, written, active, retry] {
         stroke.paint(window);
     }
 }
@@ -157,8 +126,8 @@ pub fn paint_ticks(bounds: Bounds<Pixels>, radius: f32, ticks: &Ticks, window: &
 /// 彗尾一圈的刻度数。
 pub const COMET_TICKS: usize = 120;
 
-/// 彗尾环：一圈 [`COMET_TICKS`] 格暗刻度，`head`（整圈为 1，从 12 点顺时针）前的 22 格由淡到亮成 `color`，最前面的
-/// 一格带光晕。转的快慢见 [`crate::dial::TURN`]。
+/// 彗尾环：一圈 [`COMET_TICKS`] 格暗刻度，`head`（整圈为 1，从 12 点顺时针）前的 22 格由淡到亮成 `color`。转的快慢
+/// 见 [`crate::dial::TURN`]。
 pub fn paint_comet(
     bounds: Bounds<Pixels>,
     radius: f32,
@@ -171,7 +140,7 @@ pub fn paint_comet(
     let center = bounds.center();
     let first = (head.rem_euclid(1.) * COUNT as f32).round() as usize + COUNT - TAIL;
     let lit = |i: usize| (i + COUNT - first % COUNT) % COUNT;
-    let mut idle = Stroke::new(2., theme::line(), HALF);
+    let mut idle = Stroke::new(2., theme::outline(), HALF);
     for i in (0..COUNT).filter(|&i| lit(i) >= TAIL) {
         idle.tick(center, radius, angle(i as f32 / COUNT as f32));
     }
@@ -179,33 +148,10 @@ pub fn paint_comet(
     for k in 0..TAIL {
         let rad = angle(((first + k) % COUNT) as f32 / COUNT as f32);
         let strength = (k + 1) as f32 / TAIL as f32;
-        if k == TAIL - 1 {
-            let mut halo = Stroke::new(6., theme::alpha(color, 0.3), HALF + 1.);
-            halo.tick(center, radius, rad);
-            halo.paint(window);
-        }
         let mut tick = Stroke::new(2., theme::alpha(color, strength.powf(1.6)), HALF);
         tick.tick(center, radius, rad);
         tick.paint(window);
     }
-}
-
-/// 表圈：贴着 [`AREA`] 边的 120 格细刻度，每 10 格一格长而亮，只作刻度盘的外框、不表示数据。
-pub fn paint_bezel(bounds: Bounds<Pixels>, window: &mut Window) {
-    const COUNT: usize = 120;
-    let center = bounds.center();
-    let mut major = Stroke::new(1.2, theme::stroke(), 3.5);
-    let mut minor = Stroke::new(1.2, theme::hairline(), 2.);
-    for i in 0..COUNT {
-        let rad = angle(i as f32 / COUNT as f32);
-        if i % 10 == 0 {
-            major.tick(center, BEZEL - 3.5, rad);
-        } else {
-            minor.tick(center, BEZEL - 2., rad);
-        }
-    }
-    major.paint(window);
-    minor.paint(window);
 }
 
 /// 在 `bounds` 里画一个贴着边、宽 `width` 的环：底色 `track` 一整圈，上面从 12 点起顺时针画 `fraction`（0 到 1）
@@ -225,36 +171,6 @@ pub fn paint_arc(
         if span > 0.0 {
             window.paint_path(arc(center, radius, width, 0.0, span), paint);
         }
-    }
-}
-
-/// [`paint_arc`] 画的环上，`turn`（整圈为 1，从 12 点顺时针）处一颗白色光点，带 `color` 的光晕：在下的任务的小环上
-/// 绕行。
-pub fn paint_orbit(
-    bounds: Bounds<Pixels>,
-    width: f32,
-    turn: f32,
-    color: Hsla,
-    window: &mut Window,
-) {
-    let side = f32::from(bounds.size.width.min(bounds.size.height));
-    let at = on_circle(bounds.center(), side / 2. - width / 2., angle(turn));
-    for (diameter, paint) in [
-        (11., theme::alpha(color, 0.35)),
-        (7., theme::alpha(color, 0.7)),
-        (4.4, gpui_kit::white()),
-    ] {
-        let half = px(diameter / 2.);
-        window.paint_quad(
-            gpui_kit::fill(
-                Bounds::new(
-                    point(at.x - half, at.y - half),
-                    gpui_kit::size(half * 2., half * 2.),
-                ),
-                paint,
-            )
-            .corner_radii(half),
-        );
     }
 }
 

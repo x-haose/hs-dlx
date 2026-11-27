@@ -72,27 +72,26 @@ pub fn look(row: &Row) -> Look {
     }
 }
 
-/// 正在放弃或放弃没做完：刻度按已有的内容、不发光；`state` 与 `line` 为状态与说明。
+/// 正在放弃或放弃没做完：刻度按已有的内容、为灰色；`state` 与 `line` 为状态与说明。
 fn discarding(row: &Row, state: &str, line: &str) -> Look {
     let (done, total) = Amount::of(row).map_or((0, 0), |a| (a.done, a.total));
     Look {
         state: state.to_owned(),
-        color: theme::muted(),
+        color: theme::ink_3(),
         ticks: Ticks {
-            color: theme::finished(),
-            glow: false,
+            color: theme::alpha(theme::ink(), 0.34),
             ..Ticks::of(total, done, false)
         },
         big: "…".to_owned(),
         line: line.to_owned(),
         hint: None,
         fraction: 0.0,
-        orb: theme::finished(),
+        orb: theme::alpha(theme::ink(), 0.34),
         short: "…".to_owned(),
     }
 }
 
-/// 暂停或失败的任务：按任务目录里已完成的内容显示，刻度不发光；失败的大字与说明按种类（见 [`format::failure`]），完整的
+/// 暂停或失败的任务：按任务目录里已完成的内容显示；失败的大字与说明按种类（见 [`format::failure`]），完整的
 /// 错误在信号里。点了继续、还在读任务目录时状态写「正在继续」。
 fn stopped(row: &Row, why: Stopped<'_>) -> Look {
     let kept = kept(row, matches!(why, Stopped::Paused));
@@ -101,7 +100,6 @@ fn stopped(row: &Row, why: Stopped<'_>) -> Look {
     let state = |state: &str| if row.resuming { "正在继续" } else { state }.to_owned();
     let ticks = |lit: Hsla| Ticks {
         color: lit,
-        glow: false,
         ..Ticks::of(total, done, false)
     };
     match why {
@@ -109,8 +107,8 @@ fn stopped(row: &Row, why: Stopped<'_>) -> Look {
             let (big, line) = (kept.big, kept.line);
             Look {
                 state: state("已暂停"),
-                color: theme::muted(),
-                ticks: ticks(theme::accent_dim()),
+                color: theme::ink_3(),
+                ticks: ticks(theme::alpha(theme::ink(), 0.5)),
                 short: if known && !recording {
                     big.clone()
                 } else {
@@ -120,7 +118,7 @@ fn stopped(row: &Row, why: Stopped<'_>) -> Look {
                 line,
                 hint: None,
                 fraction,
-                orb: theme::accent_dim(),
+                orb: theme::alpha(theme::ink(), 0.5),
             }
         }
         Stopped::Failed(failure) => {
@@ -139,7 +137,7 @@ fn stopped(row: &Row, why: Stopped<'_>) -> Look {
             Look {
                 state: state("需要处理"),
                 color: theme::warn(),
-                ticks: ticks(theme::finished()),
+                ticks: ticks(theme::alpha(theme::ink(), 0.34)),
                 big,
                 line,
                 hint: Some(hint),
@@ -364,10 +362,14 @@ fn running_cloud(row: &Row) -> Look {
                     theme::warn(),
                     "在网页或 App 里被暂停了，恢复后才接着下",
                 ),
-                CloudPhase::Queued => ("云端排队", theme::accent_dim(), "PikPak 收下了，在排队"),
+                CloudPhase::Queued => (
+                    "云端排队",
+                    theme::alpha(theme::accent(), 0.6),
+                    "PikPak 收下了，在排队",
+                ),
                 CloudPhase::Running => (
                     "云端下载",
-                    theme::accent_dim(),
+                    theme::alpha(theme::accent(), 0.6),
                     "PikPak 在下，下完后取回本机",
                 ),
             };
@@ -512,7 +514,7 @@ fn running_file(row: &Row) -> Look {
             line: "不联网".to_owned(),
             hint: None,
             fraction: 1.0,
-            orb: theme::accent_pale(),
+            orb: theme::core(),
             short: "…".to_owned(),
         };
     }
@@ -677,7 +679,7 @@ fn seeding_look(row: &Row) -> Look {
         line,
         hint: None,
         fraction: 1.0,
-        orb: theme::accent(),
+        orb: theme::deep(),
         short: "↑".to_owned(),
     }
 }
@@ -691,10 +693,9 @@ fn done_look(row: &Row) -> Look {
         .map_or_else(|| "✓".to_owned(), format::clock);
     Look {
         state: "已完成".to_owned(),
-        color: theme::muted(),
+        color: theme::ink_3(),
         ticks: Ticks {
             lit: ticks.count,
-            glow: true,
             ..ticks
         },
         big,
@@ -704,7 +705,7 @@ fn done_look(row: &Row) -> Look {
         ),
         hint: None,
         fraction: 1.0,
-        orb: theme::finished(),
+        orb: theme::alpha(theme::ink(), 0.34),
         short: "✓".to_owned(),
     }
 }
@@ -737,7 +738,7 @@ fn running(row: &Row, amount: Amount) -> Look {
             ),
             hint: None,
             fraction: written,
-            orb: theme::accent_pale(),
+            orb: theme::core(),
             short: percent,
         };
     }

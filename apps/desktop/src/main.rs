@@ -12,7 +12,6 @@ mod headers;
 mod links;
 mod live;
 mod main_window;
-mod motion;
 mod new_task;
 mod rate;
 mod ring;
@@ -28,6 +27,7 @@ mod ui;
 mod updates;
 mod wait;
 mod web_route;
+mod widgets;
 
 use std::borrow::Cow;
 use std::num::NonZeroUsize;
@@ -49,11 +49,15 @@ use crate::updates::Updates;
 /// 全部任务合计同时最多多少个请求（见 `Engine::new`）。
 const MAX_REQUESTS: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 
-/// 随应用打包的字体：数字用的 Space Grotesk 三个字重（SIL OFL 1.1，许可证见同目录 OFL.txt）。
-const FONTS: [&[u8]; 3] = [
-    include_bytes!("../assets/fonts/SpaceGrotesk-Regular.ttf"),
-    include_bytes!("../assets/fonts/SpaceGrotesk-Medium.ttf"),
-    include_bytes!("../assets/fonts/SpaceGrotesk-Bold.ttf"),
+/// 随应用打包的字体：Geist 1.9.2 的 300 到 600 四个字重与 Geist Mono 的 400、500（SIL OFL 1.1，许可证见同目录
+/// OFL.txt）。界面最粗用到 600。
+const FONTS: [&[u8]; 6] = [
+    include_bytes!("../assets/fonts/Geist-Light.ttf"),
+    include_bytes!("../assets/fonts/Geist-Regular.ttf"),
+    include_bytes!("../assets/fonts/Geist-Medium.ttf"),
+    include_bytes!("../assets/fonts/Geist-SemiBold.ttf"),
+    include_bytes!("../assets/fonts/GeistMono-Regular.ttf"),
+    include_bytes!("../assets/fonts/GeistMono-Medium.ttf"),
 ];
 
 /// 随应用带的 Python 与 QuickJS-NG（make runtime 备好、build.rs 交来，见 scripts/runtime.py）：第一次用网页视频时解进
@@ -126,8 +130,11 @@ fn main() {
             cx.text_system()
                 .add_fonts(FONTS.iter().map(|font| Cow::Borrowed(*font)).collect())
                 .expect("随应用打包的字体是有效的 TrueType 文件");
-            // 输入框等组件跟着窗口的深色底
+            // 输入框等组件跟着窗口的深色底；窗口的根按它的字体排字
             gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
+            let fonts = gpui_kit::component::Theme::global_mut(cx);
+            fonts.font_family = widgets::SANS.into();
+            fonts.mono_font_family = widgets::MONO.into();
             // 第一个参数为要探测的链接：从终端或别的程序把链接交给应用。不是 UTF-8 的照原样换成替换字符，粘贴栏里
             // 会提示它不是链接
             let link = std::env::args_os()
@@ -268,17 +275,17 @@ impl Render for Failure {
         _: &mut gpui_kit::Window,
         _: &mut gpui_kit::Context<Self>,
     ) -> impl gpui_kit::IntoElement {
-        div()
+        widgets::typeset(div())
             .size_full()
             .flex()
             .flex_col()
-            .bg(theme::ground())
-            .text_color(theme::text())
+            .bg(theme::bg())
+            .text_color(theme::ink())
             .child(
                 TitleBar::new()
                     .h(px(TITLE_HEIGHT))
-                    .bg(theme::ground())
-                    .border_color(theme::ground()),
+                    .bg(theme::bg())
+                    .border_color(theme::bg()),
             )
             .child(
                 div()
@@ -291,7 +298,7 @@ impl Render for Failure {
                     .child(
                         div()
                             .text_size(px(20.))
-                            .font_weight(FontWeight::BOLD)
+                            .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::warn())
                             .child(self.title.clone()),
                     )
@@ -300,7 +307,7 @@ impl Render for Failure {
                             .max_w(px(480.))
                             .px(px(PAD))
                             .text_center()
-                            .text_color(theme::muted())
+                            .text_color(theme::ink_3())
                             .child(self.detail.clone()),
                     ),
             )

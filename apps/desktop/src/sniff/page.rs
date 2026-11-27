@@ -5,7 +5,8 @@ use gpui_kit::{Context, Div, ParentElement as _, Styled as _, div, px};
 
 use super::{SniffEvent, SniffView};
 use crate::theme;
-use crate::ui::{self, Tone};
+use crate::ui;
+use crate::widgets::{self, Button, Kind};
 
 /// 网页的面板最窄多宽：常见网页的移动版布局从这里起。
 const PAGE_MIN_WIDTH: f32 = 480.;
@@ -34,16 +35,12 @@ impl SniffView {
                    act: fn(&wry::WebView) -> wry::Result<()>,
                    what: &'static str,
                    cx: &mut Context<Self>| {
-            ui::button(
-                id,
-                label,
-                Tone::Ghost,
-                cx.listener(move |this, _, _, cx| this.navigate(act, what, cx)),
-            )
-            .w(px(NAV))
-            .h(px(NAV))
-            .px_0()
-            .text_size(px(17.))
+            Button::new(id, label, Kind::Text)
+                .on_click(cx.listener(move |this, _, _, cx| this.navigate(act, what, cx)))
+                .w(px(NAV))
+                .h(px(NAV))
+                .px_0()
+                .text_size(px(17.))
         };
         let toolbar = div()
             .flex()
@@ -52,7 +49,7 @@ impl SniffView {
             .px(px(12.))
             .py(px(10.))
             .border_b_1()
-            .border_color(theme::hairline())
+            .border_color(theme::rule())
             .child(nav("back", "‹", wry::WebView::go_back, "没能后退", cx))
             .child(nav(
                 "forward",
@@ -63,18 +60,16 @@ impl SniffView {
             ))
             .child(nav("reload", "↻", wry::WebView::reload, "没能刷新", cx))
             .child(
-                ui::input_frame()
+                widgets::input_frame()
                     .flex_1()
                     .ml(px(6.))
                     .px(px(6.))
                     .child(Input::new(&self.address).appearance(false)),
             )
-            .child(ui::button(
-                "close-sniff-page",
-                "关闭",
-                Tone::Ghost,
-                cx.listener(|_, _, _, cx| cx.emit(SniffEvent::Dismissed)),
-            ));
+            .child(
+                Button::new("close-sniff-page", "关闭", Kind::Text)
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SniffEvent::Dismissed))),
+            );
         // 网页建不出来时没有「打开网页」，到不了这里
         let page = self
             .webview()
@@ -89,6 +84,6 @@ impl SniffView {
             .rounded_b_none()
             .child(toolbar)
             .children(page)
-            .children(trouble.map(|reason| div().p(px(10.)).child(ui::error_text(reason))))
+            .children(trouble.map(|reason| div().p(px(10.)).child(widgets::error_text(reason))))
     }
 }
