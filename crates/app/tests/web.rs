@@ -576,10 +576,10 @@ fn a_pasted_page_goes_to_the_resolver_or_waits_for_the_components() {
             loop {
                 match events.recv().await.unwrap() {
                     Event::Stage { id: at, stage } if at == id => {
-                        resolving |= *stage
-                            == Stage::Working(Step::Resolving {
+                        resolving |= stage.as_deref()
+                            == Some(&Stage::Working(Step::Resolving {
                                 plugin: "yt-dlp".to_owned(),
-                            });
+                            }));
                     }
                     Event::Ended { id: at, status, .. } if at == id => {
                         return (resolving, status);

@@ -1,9 +1,19 @@
-//! 探测嗅探到的流时带的请求头：Cookie 照浏览器在这个请求里会带的给，Referer 只给网站。
+//! 探测网页里找到的流时带的请求头：Cookie 照浏览器在这个请求里会带的给，Referer 只给网站。
 
-use hs_dlx_webview::cookies::Cookie;
 use hs_m3u8_core::{Url, check_option_header};
 
-/// 要探测的一条流与它的来历。
+/// 网页引擎的 Cookie 存储里的一条 Cookie。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cookie {
+    pub name: String,
+    pub value: String,
+    /// 跨站的请求（发起请求的页面与请求的地址不在同一站点）也带它：SameSite=None，或没设 SameSite 而网页引擎按 None
+    /// 处理
+    pub cross_site: bool,
+}
+
+/// 网页里找到的一条流与它的来历。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stream {
     pub url: Url,
     /// 报它的框架的地址，网页引擎给的；认不出是哪个框架（Linux）或框架不是 http(s) 的（about:blank、srcdoc）时为 None
@@ -16,7 +26,7 @@ pub struct Stream {
 
 /// 探测时带的请求头与没带上的 Cookie 个数。
 #[derive(Debug, PartialEq, Eq)]
-pub struct Headers {
+pub(crate) struct Headers {
     pub headers: Vec<(String, String)>,
     /// 放不进请求头的 Cookie 个数：没有名字（核心只收 `名=值`），或值里有控制字符
     pub skipped: usize,
@@ -31,7 +41,7 @@ pub struct Headers {
 /// - Cookie：流与顶层页面同一站点、且报它的框架（网页引擎认得出的）也与流同一站点时全带；否则只带跨站也带的
 ///   （[`Cookie::cross_site`]）。别的站点的框架（如广告）能报任意地址，不能借它带上这个站点的登录 Cookie。放不进请求
 ///   头的跳过，计入 [`Headers::skipped`]。
-pub fn headers_for(stream: &Stream, cookies: &[Cookie]) -> Result<Headers, String> {
+pub(crate) fn headers_for(stream: &Stream, cookies: &[Cookie]) -> Result<Headers, String> {
     let mut headers = Vec::new();
     if let Some(origin) = stream.frame.as_ref().or(stream.top.as_ref())
         && !(origin.scheme() == "https" && stream.url.scheme() == "http")
@@ -75,14 +85,20 @@ fn pair(cookie: &Cookie) -> Option<String> {
     (!cookie.name.is_empty() && check_option_header("Cookie", &pair).is_ok()).then_some(pair)
 }
 
-/// 网页视频解析带的 Cookie 请求头（发往网页的 `cookies`，见 [`cookies_for`](hs_dlx_webview::cookies::cookies_for)）：
-/// 合请求头要求、没有制表符（yt-dlp 的 cookies.txt 以它分列）的；一条都没有时为 None。
+/// 网页视频解析带的 Cookie 请求头（`cookies` 为网页引擎里会发往网页的）：合请求头要求、没有制表符（yt-dlp 的
+/// cookies.txt 以它分列）的；一条都没有时为 None。
 pub fn cookie_header(cookies: &[Cookie]) -> Option<(String, String)> {
-    let pairs: Vec<String> = cookies
+    let writable: Vec<Cookie> = cookies
         .iter()
-        .filter_map(pair)
-        .filter(|pair| !pair.contains('\t'))
+        .filter(|cookie| !cookie.name.contains('\t') && !cookie.value.contains('\t'))
+        .cloned()
         .collect();
+    cookie_pairs(&writable)
+}
+
+/// `cookies` 合成的 Cookie 请求头：放不进请求头的跳过；一条都没有时为 None。
+pub(crate) fn cookie_pairs(cookies: &[Cookie]) -> Option<(String, String)> {
+    let pairs: Vec<String> = cookies.iter().filter_map(pair).collect();
     (!pairs.is_empty()).then(|| ("Cookie".to_owned(), pairs.join("; ")))
 }
 
@@ -92,11 +108,17 @@ fn same_site(a: &Url, b: &Url) -> bool {
 }
 
 fn site(url: &Url) -> Option<String> {
-    let host = url.host()?;
-    let text = host.to_string().to_ascii_lowercase();
-    Some(match host {
-        url::Host::Domain(_) => psl::domain_str(&text).map_or_else(|| text.clone(), str::to_owned),
-        url::Host::Ipv4(_) | url::Host::Ipv6(_) => text,
+    let host = url.host_str()?.to_ascii_lowercase();
+    // IP 地址（IPv6 的带方括号）没有可注册域名，按整个主机比
+    let ip = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok();
+    Some(if ip {
+        host
+    } else {
+        psl::domain_str(&host).map_or_else(|| host.clone(), str::to_owned)
     })
 }
 

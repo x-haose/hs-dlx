@@ -7,14 +7,12 @@ use gpui_kit::{
     AnyElement, Context, Div, InteractiveElement as _, IntoElement, ParentElement as _,
     SharedString, StatefulInteractiveElement as _, Styled as _, Task, div, px,
 };
-use hs_dlx_app::web::Container;
-use hs_dlx_app::{Check, FailureKind, TaskId};
+use hs_dlx_app::{Action, Check, FailureKind, Plan, Situation, TaskId};
 use hs_dlx_app::{Status, TorrentPhase};
 use hs_dlx_scene::Mode;
 use hs_m3u8_core::bare_url;
 
 use super::look::{Look, look};
-use super::plan::{Action, Instead, Plan, stopped_plan};
 use super::{Shell, live_view};
 use crate::signals::{Level, Signal};
 use crate::tasks::{Amount, Disk, FileAmount, Row, main_output, resume_label, saved_as};
@@ -314,40 +312,36 @@ impl Shell {
         )
     }
 
-    /// 停着的任务 `row` 的操作（见 [`stopped_plan`]）。
+    /// 停着的任务 `row` 的操作（见 [`hs_dlx_app::plan`]）里这一页给的：粘贴 curl 没有单独的入口（改请求头的编辑框里
+    /// 可以粘贴），放弃另有按钮，正在改请求头时编辑卡片里有保存、不再给改请求头。
     fn plan(&self, row: &Row) -> Plan {
-        let failure = match &row.task.status {
-            Status::Failed(failure) => Some(failure.kind),
-            _ => None,
-        };
         let editing = self
             .editing_headers
             .as_ref()
             .is_some_and(|(at, _)| *at == row.task.id);
-        let headers = row.task.spec.torrent().is_none() && row.task.spec.cloud().is_none();
-        let instead = match (row.task.spec.hls(), row.task.spec.web()) {
-            (Some(_), _) => Instead::Hls,
-            (None, Some(web)) if web.container == Container::Mp4 => Instead::Matroska,
-            (None, _) => Instead::Nothing,
-        };
-        stopped_plan(
-            failure,
-            row.recording(),
-            row.task.write_only,
-            headers,
-            editing,
-            instead,
-        )
+        let mut plan = hs_dlx_app::plan(
+            &row.task,
+            Situation {
+                recording: row.recording(),
+                offered: false,
+            },
+        );
+        plan.actions.retain(|action| match action {
+            Action::PasteCurl | Action::Discard => false,
+            Action::EditHeaders => !editing,
+            _ => true,
+        });
+        plan
     }
 
-    /// 暂停或失败的任务的操作（见 [`stopped_plan`]）：第一个是主操作（失败的为警告色），其余在下面一行。
+    /// 暂停或失败的任务的操作（见 [`Shell::plan`]）：第一个是主操作（失败的为警告色），其余在下面一行。
     fn stopped_foot(&self, row: &Row, discard: Button, cx: &Context<Self>) -> Foot {
         let id = row.task.id;
         let failed = matches!(row.task.status, Status::Failed(_));
         let plan = self.plan(row);
         let mut primary = None;
         let mut rest = Vec::new();
-        for (index, action) in plan.actions.iter().enumerate() {
+        for action in &plan.actions {
             let (key, label, detail): (&'static str, String, Option<SharedString>) = match action {
                 Action::EditHeaders => (
                     "edit-headers",
@@ -384,6 +378,16 @@ impl Shell {
                     Some("在浏览器里确认，之后再继续".into()),
                 ),
                 Action::LocalTorrent => ("local-torrent", "改用本机 BT".to_owned(), None),
+                // 不是停着的任务的操作，或这一页另有入口的（见 Shell::plan）
+                Action::PasteCurl
+                | Action::Pause
+                | Action::Stop
+                | Action::Discard
+                | Action::Forget
+                | Action::Seed
+                | Action::StopSeeding
+                | Action::Play
+                | Action::Reveal => continue,
             };
             let act = *action;
             let folder = folder_of(&row.task.spec);
@@ -397,7 +401,17 @@ impl Shell {
                 Action::OpenFolder => cx.open_with_system(&folder),
                 Action::LogIn => this.log_in_pikpak(window, cx),
                 Action::LocalTorrent => this.probe_text(link.as_str(), window, cx),
+                Action::PasteCurl
+                | Action::Pause
+                | Action::Stop
+                | Action::Discard
+                | Action::Forget
+                | Action::Seed
+                | Action::StopSeeding
+                | Action::Play
+                | Action::Reveal => {}
             });
+            let index = usize::from(primary.is_some()) + rest.len();
             if index == 0 {
                 let kind = if failed { Kind::Warn } else { Kind::Primary };
                 primary = Some(

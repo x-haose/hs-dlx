@@ -1,25 +1,17 @@
 //! 打开的地址是不是网页：按网页引擎打开它后的第一个顶层文档判断，只定一次，之后的换页不改。
 
+use hs_dlx_app::Verdict;
+
 /// 网页引擎当作网页显示的顶层文档类型。
 const PAGE_TYPES: [&str; 2] = ["text/html", "application/xhtml+xml"];
 
-/// 结论。
+/// 判断到哪了。
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Verdict {
+pub enum Ruling {
     /// 还不知道
     Pending,
-    /// 网页：网页引擎拿到的是 2xx，或是整页的人机验证（要用户在网页里过了才看得到内容）
-    Page,
-    /// 网页引擎打开它也是 HTTP 出错的页面（防盗链、过期的地址之类的拒绝页、找不到的页）：状态码
-    Refused(u16),
-    /// 不是网页：网页引擎认出的类型（如 `video/mp4`）；文档加载完也没报类型（脚本没在里面跑，如 PDF）时为 None
-    NotPage(Option<String>),
-    /// 按网页类型发来、正文是 HLS 播放列表（如 PHP 的默认类型）
-    Playlist,
-    /// 打开的地址本身是要下载的文件
-    Download,
-    /// 网页类型的文档加载完了，网页引擎与页面都没报它的 HTTP 状态码：判断不了是不是出错的页面
-    Unknown,
+    /// 有了结论
+    Decided(Verdict),
     /// 打不开：建不出网页、导航没成、网页进程退出、到时还没有结论；原因
     Broken(String),
 }
@@ -30,7 +22,7 @@ pub enum Verdict {
 /// 的人机验证不等状态码（它本身多为 403、503，不论状态码都是网页）。
 #[derive(Debug)]
 pub(super) struct Judge {
-    verdict: Verdict,
+    ruling: Ruling,
     /// 顶层文档报过网页的类型，等正文就绪再定（按网页类型发来的播放列表，如 PHP 的默认类型）
     html: bool,
     /// 正文就绪且不是播放列表：值为这一页是整页的人机验证
@@ -48,7 +40,7 @@ pub(super) struct Judge {
 impl Judge {
     pub fn new() -> Judge {
         Judge {
-            verdict: Verdict::Pending,
+            ruling: Ruling::Pending,
             html: false,
             content: None,
             pending: None,
@@ -58,8 +50,8 @@ impl Judge {
         }
     }
 
-    pub fn verdict(&self) -> &Verdict {
-        &self.verdict
+    pub fn ruling(&self) -> &Ruling {
+        &self.ruling
     }
 
     /// 网页引擎拿到了顶层的响应：地址 `url` 与状态码 `status`。是开始显示了、还没报类型的那个文档的即归给它，否则等
@@ -140,7 +132,7 @@ impl Judge {
     }
 
     pub fn fail(&mut self, reason: String) -> bool {
-        self.decide(Verdict::Broken(reason))
+        self.rule(Ruling::Broken(reason))
     }
 
     /// 网页类型的文档：正文就绪且是人机验证即定，不是的等状态码。
@@ -156,10 +148,15 @@ impl Judge {
     }
 
     fn decide(&mut self, verdict: Verdict) -> bool {
-        if self.verdict != Verdict::Pending {
+        self.rule(Ruling::Decided(verdict))
+    }
+
+    /// 还没有结论时定为 `ruling`，为 true；已有的不改。
+    fn rule(&mut self, ruling: Ruling) -> bool {
+        if self.ruling != Ruling::Pending {
             return false;
         }
-        self.verdict = verdict;
+        self.ruling = ruling;
         true
     }
 }
@@ -206,16 +203,16 @@ mod tests {
         // 网页：网页引擎先报状态码（macOS、Linux），2xx、正文不是播放列表
         let mut judge = shown(200);
         assert!(judge.content(false, false));
-        assert_eq!(judge.verdict(), &Verdict::Page);
+        assert_eq!(judge.ruling(), &Ruling::Decided(Verdict::Page));
         // 之后的事不改结论
         assert!(!judge.fail("网页进程退出了".into()));
-        assert_eq!(judge.verdict(), &Verdict::Page);
+        assert_eq!(judge.ruling(), &Ruling::Decided(Verdict::Page));
 
         // 页面在文档建出时报状态码（Chromium）
         let mut judge = Judge::new();
         judge.document("text/html", Some(204));
         assert!(judge.content(false, false));
-        assert_eq!(judge.verdict(), &Verdict::Page);
+        assert_eq!(judge.ruling(), &Ruling::Decided(Verdict::Page));
 
         // 网页引擎报的优先于页面报的（页面改不了它）
         let mut judge = Judge::new();
@@ -223,20 +220,20 @@ mod tests {
         judge.started(A);
         judge.document("text/html", Some(200));
         assert!(judge.content(false, false));
-        assert_eq!(judge.verdict(), &Verdict::Refused(403));
+        assert_eq!(judge.ruling(), &Ruling::Decided(Verdict::Refused(403)));
 
         // 网页引擎打开也是出错的页面：拒绝；是整页的人机验证（如 Cloudflare 回 403）：网页
         let mut judge = shown(403);
         assert!(judge.content(false, false));
-        assert_eq!(judge.verdict(), &Verdict::Refused(403));
+        assert_eq!(judge.ruling(), &Ruling::Decided(Verdict::Refused(403)));
         let mut judge = shown(403);
         assert!(judge.content(false, true));
-        assert_eq!(judge.verdict(), &Verdict::Page);
+        assert_eq!(judge.ruling(), &Ruling::Decided(Verdict::Page));
         // 人机验证页不等状态码
         let mut judge = Judge::new();
         judge.document("text/html", None);
         assert!(judge.content(false, true));
-        assert_eq!(judge.verdict(), &Verdict::Page);
+        assert_eq!(judge.ruling(), &Ruling::Decided(Verdict::Page));
 
         // 开始显示先于响应报来（Linux 上 wry 的处理先接上）：同样归给它
         let mut judge = Judge::new();
@@ -244,14 +241,14 @@ mod tests {
         judge.responded(A.into(), 403);
         judge.document("text/html", None);
         assert!(judge.content(false, false));
-        assert_eq!(judge.verdict(), &Verdict::Refused(403));
+        assert_eq!(judge.ruling(), &Ruling::Decided(Verdict::Refused(403)));
 
         // 认领过的文档不被同一地址的下一次响应（刷新）改掉
         let mut judge = shown_before_document(200);
         judge.responded(A.into(), 503);
         judge.document("text/html", None);
         assert!(judge.content(false, false));
-        assert_eq!(judge.verdict(), &Verdict::Page);
+        assert_eq!(judge.ruling(), &Ruling::Decided(Verdict::Page));
 
         // 显示的地址带账号口令、响应的没有，片段不同：同一个文档
         let mut judge = Judge::new();
@@ -259,13 +256,13 @@ mod tests {
         judge.started("https://user:pw@a.example/v#t=1");
         judge.document("text/html", None);
         assert!(judge.content(false, false));
-        assert_eq!(judge.verdict(), &Verdict::Page);
+        assert_eq!(judge.ruling(), &Ruling::Decided(Verdict::Page));
 
         // 第一页还没就绪时下一次导航的响应先到：归给下一个文档，不算这一页的
         let mut judge = shown(200);
         judge.responded("https://b.example/".into(), 403);
         assert!(judge.content(false, false));
-        assert_eq!(judge.verdict(), &Verdict::Page);
+        assert_eq!(judge.ruling(), &Ruling::Decided(Verdict::Page));
 
         // 没成为文档的响应（转为下载）不被下一个别的地址的文档领走
         let mut judge = Judge::new();
@@ -274,37 +271,40 @@ mod tests {
         judge.document("text/html", None);
         judge.content(false, false);
         assert!(judge.finished());
-        assert_eq!(judge.verdict(), &Verdict::Unknown);
+        assert_eq!(judge.ruling(), &Ruling::Decided(Verdict::Unknown));
 
         // 加载完时网页引擎才给状态码（Windows）：正文就绪时还不定
         let mut judge = Judge::new();
         judge.document("text/html", None);
         assert!(!judge.content(false, false));
         assert!(judge.completed(200));
-        assert_eq!(judge.verdict(), &Verdict::Page);
+        assert_eq!(judge.ruling(), &Ruling::Decided(Verdict::Page));
 
         // 按网页类型发来的播放列表：不等状态码
         let mut judge = Judge::new();
         judge.document("text/html", None);
         assert!(judge.content(true, false));
-        assert_eq!(judge.verdict(), &Verdict::Playlist);
+        assert_eq!(judge.ruling(), &Ruling::Decided(Verdict::Playlist));
 
         // 视频文件：类型即定
         let mut judge = Judge::new();
         assert!(judge.document("video/mp4", None));
-        assert_eq!(judge.verdict(), &Verdict::NotPage(Some("video/mp4".into())));
+        assert_eq!(
+            judge.ruling(),
+            &Ruling::Decided(Verdict::NotPage(Some("video/mp4".into())))
+        );
 
         // 报过网页类型、正文没来就加载完了：按状态码定；没报过类型就加载完了：不是网页
         let mut judge = shown(200);
         assert!(judge.finished());
-        assert_eq!(judge.verdict(), &Verdict::Page);
+        assert_eq!(judge.ruling(), &Ruling::Decided(Verdict::Page));
         let mut judge = Judge::new();
         assert!(judge.finished());
-        assert_eq!(judge.verdict(), &Verdict::NotPage(None));
+        assert_eq!(judge.ruling(), &Ruling::Decided(Verdict::NotPage(None)));
 
         // 正文就绪只在报过网页类型之后才算
         let mut judge = Judge::new();
         assert!(!judge.content(true, false));
-        assert_eq!(judge.verdict(), &Verdict::Pending);
+        assert_eq!(judge.ruling(), &Ruling::Pending);
     }
 }

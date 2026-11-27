@@ -1,13 +1,13 @@
 //! 新建：探测链接、开新建视图、新建任务（在 [`crate::tasks::Tasks`] 里）并把结果交回发起它的视图。
 
 use gpui_kit::{AppContext as _, Context, Entity, Window};
-use hs_dlx_app::Draft;
+use hs_dlx_app::{Draft, Verdict};
 use hs_m3u8_core::Url;
 
 use super::{Page, Shell};
 use crate::links;
 use crate::new_task::{Link, NewTask, NewTaskEvent, Phase};
-use crate::sniff::{SniffEvent, SniffView, Verdict};
+use crate::sniff::{Ruling, SniffEvent, SniffView};
 
 impl Shell {
     /// 探测 `text`：链接，或 curl 命令（地址与请求头一起交给新建页）；都不是时在粘贴栏里写原因。
@@ -182,7 +182,7 @@ impl Shell {
         self.checked_page(&sniff, window, cx);
     }
 
-    /// 后台的网页 `sniff` 有了是不是网页的结论（见 [`Verdict`]）：是网页就换到嗅探页，否则在新建页的失败下面写明（新建页
+    /// 后台的网页 `sniff` 有了是不是网页的结论（见 [`Ruling`]）：是网页就换到嗅探页，否则在新建页的失败下面写明（新建页
     /// 留着，可改请求头重新探测）。新建页已换走、或用户已改了请求头重新探测的，不再需要它。
     fn checked_page(
         &mut self,
@@ -206,18 +206,20 @@ impl Shell {
             *page_check = None;
             return;
         }
-        let note = match sniff.read(cx).verdict() {
-            Verdict::Pending => return,
-            Verdict::Page => None,
-            Verdict::Refused(status) => Some(format!("网页引擎打开它回 HTTP {status}")),
-            Verdict::Unknown => {
-                Some("网页引擎没报出它的 HTTP 状态码，判断不了这一页是不是出错页".to_owned())
-            }
-            Verdict::NotPage(Some(kind)) => Some(format!("网页引擎打开它是 {kind}，不是网页")),
-            Verdict::NotPage(None) => Some("网页引擎打开它也不是网页".to_owned()),
-            Verdict::Playlist => Some("网页引擎打开它是 HLS 播放列表，不是网页".to_owned()),
-            Verdict::Download => Some("网页引擎打开它是要下载的文件，不是网页".to_owned()),
-            Verdict::Broken(reason) => Some(format!("在网页里也打不开：{reason}")),
+        let note = match sniff.read(cx).ruling() {
+            Ruling::Pending => return,
+            Ruling::Broken(reason) => Some(format!("在网页里也打不开：{reason}")),
+            Ruling::Decided(verdict) => match verdict {
+                Verdict::Page => None,
+                Verdict::Refused(status) => Some(format!("网页引擎打开它回 HTTP {status}")),
+                Verdict::Unknown => {
+                    Some("网页引擎没报出它的 HTTP 状态码，判断不了这一页是不是出错页".to_owned())
+                }
+                Verdict::NotPage(Some(kind)) => Some(format!("网页引擎打开它是 {kind}，不是网页")),
+                Verdict::NotPage(None) => Some("网页引擎打开它也不是网页".to_owned()),
+                Verdict::Playlist => Some("网页引擎打开它是 HLS 播放列表，不是网页".to_owned()),
+                Verdict::Download => Some("网页引擎打开它是要下载的文件，不是网页".to_owned()),
+            },
         };
         *page_check = None;
         match note {

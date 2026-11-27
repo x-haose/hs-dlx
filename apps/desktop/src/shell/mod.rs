@@ -8,7 +8,6 @@ mod live_view;
 mod look;
 mod notices;
 mod operations;
-mod plan;
 mod quit;
 mod standby;
 mod task_list;

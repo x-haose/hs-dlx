@@ -1,5 +1,5 @@
-//! 网页里的视频流：网页在后台加载、不显示，主体列出找到的视频流，每条在后台探测好（几档清晰度、时长或直播），用户
-//! 挑一条下载。要登录、认证或手动点播放时可以打开网页（左边网页、右边列表），弄完收起。
+//! 网页里的视频流：网页在后台加载、不显示，主体列出找到的视频流，每条在后台探测好（几档清晰度、时长或直播，同一条
+//! 流的判定与配请求头探测在 [`hs_dlx_app::page`]），用户挑一条下载。要登录、认证或手动点播放时可以打开网页（左边网页、右边列表），弄完收起。
 //!
 //! 页面的地址、加载、标题、故障与顶层文档的 HTTP 状态码由网页引擎报；脚本发回的只有找到的流与顶层文档的情况（类型、
 //! 页面读到的状态码、正文是否为播放列表、是不是整页的人机验证），按不可信数据校验、限量（见 [`script`]、[`inbox`]）。
@@ -8,11 +8,9 @@
 //! 可以当作播放列表交回新建页（缺请求头时源站回了网页）。
 
 mod check;
-mod found;
 mod inbox;
 mod list;
 mod page;
-mod request;
 mod script;
 mod verdict;
 
@@ -25,14 +23,14 @@ use gpui_kit::{
     ParentElement as _, Render, Styled as _, Subscription, Task, Window, div, px,
 };
 use hs_dlx_app::Service;
+use hs_dlx_app::page::{COOKIE_TIMEOUT, Check, Found, Stream, cookie_header};
 use hs_dlx_webview::WebView;
 use hs_m3u8_core::Url;
 
-use self::found::{Check, Found};
 use self::inbox::{Engine, Inbox};
 use self::script::Report;
 use self::verdict::Judge;
-pub use self::verdict::Verdict;
+pub use self::verdict::Ruling;
 use crate::dial;
 use crate::links::{NOT_HTTP, http_url};
 use crate::new_task::Link;
@@ -56,7 +54,7 @@ pub enum SniffEvent {
     Dismissed,
     /// 网页显示或收起了：外面据此决定要不要让出任务列表的位置
     PageToggled,
-    /// 打开的地址是不是网页有了结论（[`SniffView::verdict`]）
+    /// 打开的地址是不是网页有了结论（[`SniffView::ruling`]）
     Decided,
 }
 
@@ -373,7 +371,13 @@ impl SniffView {
                 Some(Report::Stream { url, agent }) => {
                     let top = self.load.shown.as_deref().and_then(http_url);
                     let frame = frame.as_deref().and_then(http_url);
-                    self.add(Found::new(url, frame, top, agent), cx);
+                    let stream = Stream {
+                        url,
+                        frame,
+                        top,
+                        agent,
+                    };
+                    self.add(Found::new(stream), cx);
                     false
                 }
                 Some(Report::Document {
@@ -464,9 +468,9 @@ impl SniffView {
         self.check_next(cx);
     }
 
-    /// 打开的地址是不是网页。
-    pub fn verdict(&self) -> &Verdict {
-        self.judge.verdict()
+    /// 打开的地址是不是网页，判断到哪了。
+    pub fn ruling(&self) -> &Ruling {
+        self.judge.ruling()
     }
 
     /// 网页的标题；还没有时为 None。
@@ -592,24 +596,17 @@ impl SniffView {
             .unwrap_or_else(|| self.opened.clone());
         let cookies = cookies_for(webview.read(cx).raw(), &page);
         self.opening_web = Some(cx.spawn(async move |this, cx| {
-            let executor = cx.background_executor().clone();
-            let cookies = within(
-                std::pin::pin!(cookies),
-                executor.timer(check::COOKIE_TIMEOUT),
-            )
-            .await
-            .unwrap_or_else(|| {
-                Err(format!(
-                    "网页引擎 {} 秒没有回出 Cookie",
-                    check::COOKIE_TIMEOUT.as_secs()
-                ))
-            });
+            let timer = cx.background_executor().timer(COOKIE_TIMEOUT);
+            let cookies = within(std::pin::pin!(cookies), timer)
+                .await
+                .unwrap_or_else(|| Err(check::cookie_timeout()))
+                .map(check::for_service);
             // 关了时不再需要
             let _closed = this.update(cx, |this, cx| {
                 this.opening_web = None;
                 match cookies {
                     Ok(cookies) => {
-                        let headers = request::cookie_header(&cookies).into_iter().collect();
+                        let headers = cookie_header(&cookies).into_iter().collect();
                         this.open_link(page, None, headers, None, cx);
                     }
                     Err(reason) => {

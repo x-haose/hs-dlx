@@ -3549,7 +3549,6 @@ dependencies = [
  "image",
  "jiff",
  "percent-encoding",
- "psl",
  "serde",
  "serde_json",
  "tokio",

@@ -181,7 +181,7 @@ async fn asked(events: &mut mpsc::UnboundedReceiver<Event>, id: TaskId) -> Offer
     loop {
         match events.recv().await.expect("服务还在，事件通道不会关闭") {
             Event::Stage { id: at, stage } if at == id => {
-                if let Stage::Asking(offer) = *stage {
+                if let Some(Stage::Asking(offer)) = stage.map(|stage| *stage) {
                     return offer;
                 }
             }

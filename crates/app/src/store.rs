@@ -2431,6 +2431,7 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
         Option<String>,
         Option<String>,
         bool,
+        u8,
     );
     let (
         folder,
@@ -2447,10 +2448,11 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
         web_browser,
         web_browser_profile,
         confirm_before_start,
+        web_pages,
     ): Columns = tx.query_row(
             "SELECT folder, proxy, theme, seed, seed_ratio_percent, seed_minutes, upload_limit, check_updates,
                     torrent_proxy, web_channel, web_preference, web_browser, web_browser_profile,
-                    confirm_before_start
+                    confirm_before_start, web_pages
              FROM settings WHERE id = 1",
             [],
             |row| {
@@ -2469,6 +2471,7 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
                     row.get(11)?,
                     row.get(12)?,
                     row.get(13)?,
+                    row.get(14)?,
                 ))
             },
         )?;
@@ -2534,7 +2537,17 @@ pub fn settings(tx: &Transaction<'_>) -> Result<Settings, Error> {
             })
             .transpose()?,
         confirm_before_start,
+        web_pages,
     })
+}
+
+/// 记下同时最多开几个内置网页（1 到 3，表上有 CHECK）。
+pub fn set_web_pages(tx: &Transaction<'_>, pages: u8) -> Result<(), Error> {
+    tx.execute(
+        "UPDATE settings SET web_pages = ?1 WHERE id = 1",
+        params![pages],
+    )?;
+    Ok(())
 }
 
 /// 记下没有要选的任务开始前要不要先停下确认。
@@ -4398,6 +4411,10 @@ mod tests {
         );
         set_confirm_before_start(&tx, true).unwrap();
         assert!(settings(&tx).unwrap().confirm_before_start);
+        assert_eq!(settings(&tx).unwrap().web_pages, 2);
+        set_web_pages(&tx, 3).unwrap();
+        assert_eq!(settings(&tx).unwrap().web_pages, 3);
+        assert!(set_web_pages(&tx, 4).is_err());
     }
 
     /// 来源是种子的还没定下的任务占着种子的编号：同一个种子不能再建（不论定没定下），续传数据到手后存下；定下为 BT

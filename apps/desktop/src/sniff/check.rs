@@ -1,23 +1,29 @@
-//! 后台探测找到的流：一次一条，读出网页引擎里发往它的 Cookie、配好请求头、探测。
+//! 后台探测找到的流：一次一条，读出网页引擎里发往它的 Cookie，交给服务配请求头、探测。
 
-use std::future::Future;
-use std::rc::Rc;
-use std::time::Duration;
+use gpui_kit::Context;
+use hs_dlx_app::page::{COOKIE_TIMEOUT, Check, Cookie};
+use hs_dlx_webview::cookies::cookies_for;
+use hs_m3u8_core::Url;
 
-use gpui_kit::{BackgroundExecutor, Context};
-use hs_dlx_app::{Failure, Service};
-use hs_dlx_webview::cookies::{Cookie, cookies_for};
-use hs_m3u8_core::{Source, Url};
-
-use super::found::Check;
-use super::{SniffView, request};
+use super::SniffView;
 use crate::wait::within;
 
-/// 等网页引擎回出 Cookie 最多多久：引擎卡住时不让探测一直挂着。
-pub(super) const COOKIE_TIMEOUT: Duration = Duration::from_secs(5);
-/// 探测一条流最多多久，到时取消（连同核心在途的请求与重试）：源站不回应时不让后面的一直排着。核心默认连接超时 15
-/// 秒、第一次重试前等约 0.5 秒，30 秒容得下一次连接超时后再试一次。
-const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+/// 网页引擎给的 Cookie 换成服务用的写法。
+pub(super) fn for_service(cookies: Vec<hs_dlx_webview::cookies::Cookie>) -> Vec<Cookie> {
+    cookies
+        .into_iter()
+        .map(|cookie| Cookie {
+            name: cookie.name,
+            value: cookie.value,
+            cross_site: cookie.cross_site,
+        })
+        .collect()
+}
+
+/// 等网页引擎回出 Cookie 最多 [`COOKIE_TIMEOUT`]，到时为原因。
+pub(super) fn cookie_timeout() -> String {
+    format!("网页引擎 {} 秒没有回出 Cookie", COOKIE_TIMEOUT.as_secs())
+}
 
 impl SniffView {
     /// 没在探测时，探测下一条等着的流。网页建不出来时不探测（列表里写着原因）。
@@ -37,16 +43,24 @@ impl SniffView {
         };
         found.check = Check::Running;
         let cookies = cookies_for(webview.read(cx).raw(), &found.url);
-        let target = request::Stream {
-            url: found.url.clone(),
-            frame: found.frame.clone(),
-            top: found.top.clone(),
-            agent: found.agent.clone(),
-        };
+        let stream = found.stream();
         let service = self.service.clone();
         self.checking = Some(cx.spawn(async move |this, cx| {
-            let executor = cx.background_executor().clone();
-            let (check, skipped) = run(&service, cookies, &target, &executor).await;
+            let timer = cx.background_executor().timer(COOKIE_TIMEOUT);
+            let cookies = within(std::pin::pin!(cookies), timer)
+                .await
+                .unwrap_or_else(|| Err(cookie_timeout()))
+                .map(for_service);
+            let (check, skipped) = match service.check_stream(stream, cookies).await {
+                Ok(checked) => checked,
+                Err(join) => (
+                    Check::Failed {
+                        reason: format!("探测中途出错：{join}"),
+                        headers: None,
+                    },
+                    0,
+                ),
+            };
             // 关了时不再需要结果
             let _closed = this.update(cx, |this, cx| {
                 this.checking = None;
@@ -76,59 +90,4 @@ impl SniffView {
         self.check_next(cx);
         cx.notify();
     }
-}
-
-/// 读出 Cookie、配好请求头、探测；返回结果与没带上的 Cookie 个数。
-async fn run(
-    service: &Rc<Service>,
-    cookies: impl Future<Output = Result<Vec<Cookie>, String>>,
-    target: &request::Stream,
-    executor: &BackgroundExecutor,
-) -> (Check, usize) {
-    let cookies = within(std::pin::pin!(cookies), executor.timer(COOKIE_TIMEOUT))
-        .await
-        .unwrap_or_else(|| {
-            Err(format!(
-                "网页引擎 {} 秒没有回出 Cookie",
-                COOKIE_TIMEOUT.as_secs()
-            ))
-        });
-    let made = cookies.and_then(|cookies| request::headers_for(target, &cookies));
-    let made = match made {
-        Ok(made) => made,
-        Err(reason) => {
-            return (
-                Check::Failed {
-                    reason,
-                    headers: None,
-                },
-                0,
-            );
-        }
-    };
-    let mut source = Source::new(target.url.clone());
-    source.http.headers.clone_from(&made.headers);
-    let failed = |reason| Check::Failed {
-        reason,
-        headers: Some(made.headers.clone()),
-    };
-    let probing = match service.probe(source) {
-        Ok(probing) => probing,
-        Err(error) => return (failed(error.to_string()), made.skipped),
-    };
-    // 超时即释放句柄、取消探测
-    let probing = std::pin::pin!(probing);
-    let check = match within(probing, executor.timer(PROBE_TIMEOUT)).await {
-        Some(Ok(Ok(probe))) => Check::Ready {
-            probe: Box::new(probe),
-            headers: made.headers.clone(),
-        },
-        Some(Ok(Err(error))) => failed(Failure::of(&error).message),
-        Some(Err(join)) => failed(format!("探测中途出错：{join}")),
-        None => failed(format!(
-            "探测 {} 秒没有结果，已停下",
-            PROBE_TIMEOUT.as_secs()
-        )),
-    };
-    (check, made.skipped)
 }

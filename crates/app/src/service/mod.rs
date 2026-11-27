@@ -25,12 +25,14 @@ use tokio::task::JoinHandle;
 use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
 mod cloud;
+mod in_page;
+mod pages;
 mod prepare;
 mod web;
 mod web_task;
 
 pub use cloud::{CloudPhase, CloudProgress};
-pub use prepare::{Answer, Offer, Recognized, Stage, Step};
+pub use prepare::{Answer, Offer, Recognized, Stage, Step, StreamOption};
 pub use web::{Resolved, WebConfig, WebState};
 pub use web_task::WebProgress;
 
@@ -90,8 +92,12 @@ pub enum Event {
     /// 任务停下时先发它，再发带着附带信息的 [`Event::Ended`]
     Changed { task: Box<Task> },
     /// 还没定下的任务准备到了哪一步，或停下等用户时的可选项（同 [`Handle::stage`]）。任务不再准备（定下、暂停、
-    /// 失败、放弃）时不另发，见那时的 [`Event::Changed`] 或 [`Event::Removed`]
-    Stage { id: TaskId, stage: Box<Stage> },
+    /// 失败、放弃）时不另发，见那时的 [`Event::Changed`] 或 [`Event::Removed`]。None：任务照旧在等用户，而可选项
+    /// 不在了（它停在网页上，宿主关掉了网页），要 [`Handle::resume`] 重新准备
+    Stage {
+        id: TaskId,
+        stage: Option<Box<Stage>>,
+    },
     /// 任务的记录删了（放弃做完、从列表移除，或刚建的任务没能记进存储）
     Removed { id: TaskId },
     /// 运行中的 HLS 任务的进度快照；同一任务两次之间至少隔 100 毫秒，进度没变时不发
@@ -127,7 +133,8 @@ pub enum Event {
         end: SeedEnd,
         unsaved: Option<String>,
     },
-    /// 任务停下；还没定下的任务的一轮准备停下（暂停、失败、停下等用户）时也发。`result` 在状态为 [`Status::Done`] 时为写出的结果，`total` 同 [`Task::total`]，`leftovers` 为完成时
+    /// 任务停下；还没定下的任务的一轮准备停下（暂停、失败、停下等用户）时也发。停在网页上等用户（[`crate::Ask::Page`]）
+    /// 时这一轮没停下，不发；它因网页没了而停下时发，状态照旧。`result` 在状态为 [`Status::Done`] 时为写出的结果，`total` 同 [`Task::total`]，`leftovers` 为完成时
     /// 没删掉的东西（被替换的旧输出、没删干净的任务目录等，输出不受影响）。`unsaved` 为 Some 时状态没能写进存储：服务
     /// 记着它，下一次写存储（任何操作或 [`Handle::flush`]）时补写，[`Handle::tasks`] 也按它返回；补写之前服务关闭
     /// 而补写不进的，下次打开时按暂停处理
@@ -214,8 +221,10 @@ struct Running {
     /// 这次登记的编号：同一任务的登记被换掉（准备完定下后换成下载的，或准备的一轮被另一轮顶掉）之后，旧登记释放时
     /// 不动新的
     serial: u64,
-    /// 在准备时：这一刻的步骤；在下载或录制时为 None
+    /// 在准备时：这一刻的步骤；在下载或录制时、准备的一轮停在网页上等用户时为 None
     step: Option<prepare::Step>,
+    /// 在网页里找流的一轮在内置网页名额里的位子（排着或占着）；别的为 None。随登记撤掉或换掉而让出
+    seat: Option<pages::Seat>,
 }
 
 /// 运行中任务的控制：各种任务的进度不同。
@@ -347,7 +356,8 @@ impl Ending {
     }
 }
 
-/// 服务的状态，运行时里的任务与界面共用。锁的顺序：先 `store`，再其余各把（其余各把之间不嵌套）。
+/// 服务的状态，运行时里的任务与界面共用。锁的顺序：先 `store`，再其余各把（其余各把之间不嵌套；`pages` 里的账
+/// 自己有锁，同样排在 `store` 之后、不与别的嵌套）。
 struct Shared {
     engine: Engine,
     store: Mutex<Store>,
@@ -367,7 +377,9 @@ struct Shared {
     serials: AtomicU64,
     /// 停下等用户的任务的可选项；只在内存里，重开应用后没有（磁力任务选文件的除外，见 `Shared::restore_offers`）。
     /// 增删都在 `store` 锁内，与任务状态的改动不交错
-    offers: Mutex<HashMap<TaskId, Offer>>,
+    offers: Mutex<HashMap<TaskId, prepare::Asked>>,
+    /// 内置网页的宿主与名额
+    pages: pages::Pages,
     /// BT 引擎，第一次用到时建会话
     bt: Bt,
     /// 取公共 tracker 列表的任务（BT 会话建起时开始，取到为止）；关闭时取消
@@ -483,6 +495,7 @@ impl Service {
             events,
             serials: AtomicU64::new(0),
             offers: Mutex::new(HashMap::new()),
+            pages: pages::Pages::new(usize::from(settings.web_pages)),
             bt: Bt::new(
                 network,
                 settings.upload_limit,
@@ -655,7 +668,7 @@ impl Handle {
     }
 
     /// 按拆好的一条 `intake` 建一个还没定下的任务并开始准备，返回存进存储的任务（准备中）；`at` 为新建时间（Unix
-    /// 秒）。之后服务自己往下走：认地址、解析、取种子信息，到要用户决定的一步停下等（[`Status::Waiting`]，可选项见
+    /// 秒）。之后服务自己往下走：认地址、解析、取种子信息、在内置网页里找流，到要用户决定的一步停下等（[`Status::Waiting`]，可选项见
     /// [`Handle::stage`]，选择经 [`Handle::choose`]），都定了即定下是哪种任务并开始下载；每一步以 [`Event`] 报来。
     /// 请求头不合要求、保存目录不是绝对路径、磁力链接用不了、种子文件不是种子时报 [`Error::InvalidInput`]，种子文件
     /// 读不出时报 [`Error::Io`]，种子已在某个任务里时报 [`Error::TorrentTaken`]，正在退出时报 [`Error::Closed`]。
@@ -667,14 +680,16 @@ impl Handle {
     }
 
     /// 还没定下的任务 `id` 此刻准备到哪一步，或停下等用户时的可选项。定下了的、暂停或失败的为 None；停下等用户而
-    /// 可选项已不在的（重开应用后）也为 None，要 [`Handle::resume`] 重新准备。没有这个任务时报 [`Error::NotFound`]。
+    /// 可选项已不在的（重开应用后，或它停着的网页被宿主关掉了）也为 None，要 [`Handle::resume`] 重新准备。没有这个
+    /// 任务时报 [`Error::NotFound`]。
     pub fn stage(&self, id: TaskId) -> Result<Option<Stage>, Error> {
         self.shared.stage(id)
     }
 
     /// 交上用户对停下等用户的任务 `id` 的选择：任务回到准备中接着走（都定了的随即定下、开始下载），返回准备中的
     /// 任务。任务没在等选择、可选项已不在、`answer` 与在等的对不上、选的不在可选项里、保存目录不是绝对路径时报
-    /// [`Error::InvalidInput`]；别的拒绝的情形同 [`Handle::resume`]。
+    /// [`Error::InvalidInput`]；没有这个任务、正在放弃、正在退出时报 [`Error::NotFound`]、[`Error::Discarding`]、
+    /// [`Error::Closed`]。停在网页上等用户的任务换请求头（[`Answer::Headers`]）时，看着网页的那一轮随之作废、网页关掉。
     pub fn choose(&self, id: TaskId, answer: Answer) -> Result<Task, Error> {
         let _entered = self.runtime().enter();
         self.shared.choose(id, answer)
@@ -692,6 +707,96 @@ impl Handle {
     pub fn set_confirm_before_start(&self, confirm: bool) -> Result<(), Error> {
         self.shared
             .write(|tx| store::set_confirm_before_start(tx, confirm))
+    }
+
+    /// 注册网页宿主：之后要到网页里找流的任务经它开网页，`pace` 为找流的几个时长。注册时宿主算作开得了网页。
+    pub fn set_page_host(&self, host: Arc<dyn crate::PageHost>, pace: crate::PagePace) {
+        let _store = lock(&self.shared.store);
+        self.shared.pages.set_host(host, pace);
+    }
+
+    /// 宿主此刻开不开得了网页（桌面应用：主窗口开着没有）。服务从宿主关掉网页（[`crate::PageEvent::Closed`]）或没开成
+    /// （[`crate::Unopened::Away`]）得知它开不了、不再让任务去开；又开得了时由宿主的一方在这里说一声，排着的随即依次
+    /// 放行。
+    pub fn set_page_host_ready(&self, ready: bool) {
+        let _store = lock(&self.shared.store);
+        self.shared.pages.set_ready(ready);
+    }
+
+    /// 记下同时最多开几个内置网页（见 [`Settings::web_pages`]）：调大时排着的随即放行，调小时已开着的不关、等它们
+    /// 自己结束。不在 1 到 3 之间时报 [`Error::InvalidInput`]。
+    pub fn set_web_pages(&self, pages: u8) -> Result<(), Error> {
+        if !Settings::WEB_PAGES.contains(&pages) {
+            return Err(Error::InvalidInput(format!(
+                "内置网页同时开 {} 到 {} 个：{pages}",
+                Settings::WEB_PAGES.start(),
+                Settings::WEB_PAGES.end()
+            )));
+        }
+        let mut store = lock(&self.shared.store);
+        self.shared
+            .write_in(&mut store, |tx| store::set_web_pages(tx, pages))?;
+        self.shared.pages.set_limit(usize::from(pages));
+        Ok(())
+    }
+
+    /// 任务 `id` 此刻能做的操作，最该先做的排第一（见 [`crate::plan`]）；正在放弃时没有。没有这个任务时报
+    /// [`Error::NotFound`]。
+    pub fn actions(&self, id: TaskId) -> Result<crate::Plan, Error> {
+        let mut store = lock(&self.shared.store);
+        let task = self.shared.task_in(&mut store, id)?;
+        if lock(&self.shared.discarding).contains(&id) {
+            return Ok(crate::Plan {
+                actions: Vec::new(),
+                resume_after_headers: false,
+            });
+        }
+        // 在运行的 HLS 任务按此刻的阶段：准备阶段还不知道是不是直播，照新建时的选择。停着的照新建时的选择，记下过
+        // 点播总片数的不算（按直播新建、实际是点播的）
+        let live = task.spec.hls().is_some_and(|hls| hls.live);
+        let stage = match lock(&self.shared.running)
+            .get(&id)
+            .map(|running| &running.control)
+        {
+            Some(Control::Hls(control)) => Some(control.progress().borrow().stage),
+            _ => None,
+        };
+        let recording = match (&task.status, stage) {
+            (Status::Running, _) if task.write_only => false,
+            (Status::Running, Some(JobStage::Recording)) => true,
+            (Status::Running, Some(JobStage::Preparing) | None) => live,
+            (Status::Running, Some(JobStage::Downloading | JobStage::Writing | JobStage::Done)) => {
+                false
+            }
+            _ => live && task.total.is_none(),
+        };
+        let offered = lock(&self.shared.offers).contains_key(&id);
+        Ok(crate::plan(&task, crate::Situation { recording, offered }))
+    }
+
+    /// 探测网页里找到的一条流 `stream`，经设置里的代理：请求头照网页引擎里会发往它的 `cookies` 配（没读出时为原因，
+    /// 不探测）。结果为探测到哪一步（成了，或没成的原因）与没带上的、放不进请求头的 Cookie 个数；30 秒没有结果算没成。
+    /// 返回的句柄在任何执行器上都可等待，释放它即取消。
+    pub fn check_stream(
+        &self,
+        stream: crate::page::Stream,
+        cookies: Result<Vec<crate::page::Cookie>, String>,
+    ) -> AbortOnDropHandle<(crate::page::Check, usize)> {
+        let shared = self.shared.clone();
+        AbortOnDropHandle::new(self.runtime().spawn(async move {
+            match shared.settings() {
+                Ok(settings) => {
+                    crate::page::check(&shared.engine, settings.proxy, &stream, cookies, &[]).await
+                }
+                Err(error) => (
+                    crate::page::Check::Failed {
+                        reason: format!("读不出设置：{error}"),
+                        headers: None,
+                    },
+                    0,
+                ),
+            }
+        }))
     }
 
     /// 全部任务，按新建先后；停下了而状态还没补写进存储的，按停下时的状态。
@@ -1274,7 +1379,7 @@ impl Handle {
 
     /// 换掉停着的任务（暂停、失败，或还没定下、在等用户）的请求头，之后继续时照它请求。名与值不合要求（见
     /// [`check_option_header`]）、或任务没有请求头（BT、云离线，来源是磁力链接或种子文件的）的报
-    /// [`Error::InvalidInput`]；任务在运行（含准备中）或正在放弃时报 [`Error::Running`]、[`Error::Discarding`]，已完成、
+    /// [`Error::InvalidInput`]；任务在运行（含准备中、停在网页上等用户：后者换请求头经 [`Answer::Headers`]）或正在放弃时报 [`Error::Running`]、[`Error::Discarding`]，已完成、
     /// 放弃没做完的报 [`Error::AlreadyDone`]、[`Error::DiscardUnfinished`]。
     pub fn set_headers(&self, id: TaskId, headers: Vec<(String, String)>) -> Result<(), Error> {
         for (name, value) in &headers {
@@ -1300,7 +1405,8 @@ impl Handle {
     }
 
     /// 暂停：取消运行中的任务，保留任务目录；停下后状态为 [`Status::Paused`]。准备中的任务停掉在做的那一步（杀掉
-    /// 这次解析、不再取种子信息），之后继续时从头准备。没在运行时（含停下等用户的）什么也不做。
+    /// 这次解析、不再取种子信息、关掉内置网页并让出名额），之后继续时从头准备；停在网页上等用户的任务同样。没在运行
+    /// 时（含别的停下等用户的）什么也不做。
     pub fn pause(&self, id: TaskId) {
         if let Some(running) = lock(&self.shared.running).get(&id) {
             running.control.cancel();
@@ -1561,15 +1667,15 @@ impl RunningGuard {
 
 impl Drop for RunningGuard {
     fn drop(&mut self) {
-        {
+        let removed = {
             let mut running = lock(&self.shared.running);
-            if running
+            let mine = running
                 .get(&self.id)
-                .is_some_and(|running| running.serial == self.serial)
-            {
-                running.remove(&self.id);
-            }
-        }
+                .is_some_and(|running| running.serial == self.serial);
+            mine.then(|| running.remove(&self.id)).flatten()
+        };
+        // 登记里的网页名额在 `running` 锁外让出（各把锁之间不嵌套）
+        drop(removed);
         self.stopped.send_replace(true);
     }
 }
@@ -2565,15 +2671,18 @@ impl Shared {
     ) -> RunningGuard {
         let serial = self.serials.fetch_add(1, Ordering::Relaxed);
         let (stopped_tx, stopped) = watch::channel(false);
-        lock(&self.running).insert(
+        let replaced = lock(&self.running).insert(
             id,
             Running {
                 control,
                 stopped,
                 serial,
                 step,
+                seat: None,
             },
         );
+        // 换掉的登记里的网页名额在 `running` 锁外让出（各把锁之间不嵌套）
+        drop(replaced);
         RunningGuard {
             id,
             serial,
@@ -2649,7 +2758,7 @@ impl Shared {
         if let Some(offer) = offer {
             self.events.send(Event::Stage {
                 id,
-                stage: Box::new(Stage::Asking(offer)),
+                stage: Some(Box::new(Stage::Asking(offer))),
             });
         }
         self.events.send(Event::Ended {

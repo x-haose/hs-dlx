@@ -1,6 +1,7 @@
 //! 桌面应用的业务层：任务与设置的存储、任务的生命周期与节流后的进度，建在 hs-m3u8-core（HLS 与单个文件）与
 //! hs-dlx-torrent（BT）之上，不依赖界面框架。
 
+mod actions;
 pub mod curl;
 mod diagnosis;
 mod error;
@@ -8,6 +9,7 @@ mod failure;
 pub mod intake;
 mod naming;
 mod netcheck;
+pub mod page;
 mod preference;
 mod proxy_probe;
 mod public_trackers;
@@ -21,6 +23,7 @@ mod torrent;
 mod update;
 pub mod web;
 
+pub use actions::{Action, Plan, Situation, plan};
 pub use diagnosis::{Check, CheckItem, CheckLevel};
 pub use error::Error;
 pub use failure::{Failure, FailureKind, maybe_a_page};
@@ -30,12 +33,13 @@ pub use hs_dlx_ytdlp as ytdlp;
 pub use intake::{Intake, Rejected};
 pub use naming::{file_name, task_title, title_of};
 pub use netcheck::{NetCheck, NetItem, NetworkReport};
+pub use page::{Page, PageEvent, PageHost, PagePace, PageSession, Unopened, Verdict};
 pub use preference::StoredPreference;
 pub use proxy_probe::{ProxyLogin, ProxyProbeError, ProxyProtocol, ProxyWanted};
 pub use service::{
     Answer, CloudPhase, CloudProgress, Downloaded, Event, Events, Handle, MetadataFetch,
-    MetadataHandle, Offer, PikPakLogin, Recognized, Resolved, Service, Stage, Step, UpdateDownload,
-    WebConfig, WebProgress, WebState,
+    MetadataHandle, Offer, PikPakLogin, Recognized, Resolved, Service, Stage, Step, StreamOption,
+    UpdateDownload, WebConfig, WebProgress, WebState,
 };
 pub use settings::{Seeding, Settings, Theme};
 pub use store::Store;

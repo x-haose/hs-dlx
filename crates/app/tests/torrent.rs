@@ -173,7 +173,9 @@ fn paste(rt: &Runtime, service: &Service, uri: &str, folder: &Path) -> (TaskId, 
         loop {
             match events.recv().await.expect("服务还在，事件通道不会关闭") {
                 Event::Stage { id: at, stage } if at == id => {
-                    if let Stage::Asking(Offer::Files { info: offered, .. }) = *stage {
+                    if let Some(Stage::Asking(Offer::Files { info: offered, .. })) =
+                        stage.map(|stage| *stage)
+                    {
                         info = Some(*offered);
                     }
                 }
@@ -1154,7 +1156,7 @@ fn a_magnet_waiting_for_files_keeps_its_choices_across_reopening() {
                 if let Event::Stage { id: at, stage } = events.recv().await.unwrap()
                     && at == task
                 {
-                    return *stage;
+                    return *stage.expect("可选项还在");
                 }
             }
         };

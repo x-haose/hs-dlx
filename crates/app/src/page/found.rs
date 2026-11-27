@@ -1,9 +1,12 @@
-//! 列表里的一条流与它在后台探测到哪一步。
+//! 网页里找到的一条流与它在后台探测到哪一步。
 
 use hs_m3u8_core::{Probe, Url};
 
+use super::Stream;
+
 /// 一条流在后台探测到哪一步。
-pub(super) enum Check {
+#[derive(Debug, Clone, PartialEq)]
+pub enum Check {
     Waiting,
     Running,
     /// 探测成了：结果与探测时带的请求头
@@ -19,8 +22,9 @@ pub(super) enum Check {
 }
 
 /// 找到的一条流。
-pub(super) struct Found {
-    /// 去掉低延迟直播刷新参数的地址（见 [`key`]）：同一个框架报来的、它相同的算一条流
+#[derive(Debug, Clone, PartialEq)]
+pub struct Found {
+    /// 去掉低延迟直播的刷新参数（`_HLS_` 起头的查询参数）与片段的地址：同一个框架报来的、它相同的算一条流
     pub key: String,
     /// 最近一次报来的地址；探测中与探测成了的不再换
     pub url: Url,
@@ -36,7 +40,13 @@ pub(super) struct Found {
 }
 
 impl Found {
-    pub fn new(url: Url, frame: Option<Url>, top: Option<Url>, agent: String) -> Found {
+    pub fn new(stream: Stream) -> Found {
+        let Stream {
+            url,
+            frame,
+            top,
+            agent,
+        } = stream;
         Found {
             key: key(&url),
             url,
@@ -45,6 +55,16 @@ impl Found {
             agent,
             check: Check::Waiting,
             skipped: 0,
+        }
+    }
+
+    /// 探测它时要知道的：地址与来历。
+    pub fn stream(&self) -> Stream {
+        Stream {
+            url: self.url.clone(),
+            frame: self.frame.clone(),
+            top: self.top.clone(),
+            agent: self.agent.clone(),
         }
     }
 
@@ -95,7 +115,12 @@ mod tests {
     use super::*;
 
     fn found(text: &str) -> Found {
-        Found::new(Url::parse(text).unwrap(), None, None, String::new())
+        Found::new(Stream {
+            url: Url::parse(text).unwrap(),
+            frame: None,
+            top: None,
+            agent: String::new(),
+        })
     }
 
     #[test]

@@ -31,6 +31,13 @@ pub struct Settings {
     /// 没有要选的任务（单个文件、只有一档的 HLS、直播、单文件种子）开始前先停下确认（[`crate::Ask::Confirm`]）；为否
     /// 时它们粘贴后直接开始，存到建任务时给的保存目录
     pub confirm_before_start: bool,
+    /// 同时最多开几个内置网页（在网页里找视频流的任务各占一个），1 到 3
+    pub web_pages: u8,
+}
+
+impl Settings {
+    /// [`Settings::web_pages`] 能取的值。
+    pub const WEB_PAGES: std::ops::RangeInclusive<u8> = 1..=3;
 }
 
 impl Default for Settings {
@@ -47,6 +54,7 @@ impl Default for Settings {
             web_preference: crate::web::Preference::Compatible,
             web_browser: None,
             confirm_before_start: false,
+            web_pages: 2,
         }
     }
 }

@@ -3,6 +3,10 @@
 //! 准备按「轮」走：每一轮是运行时里的一个任务，与下载一样登记在运行表里（暂停、放弃、关闭经同一个登记找到它）。一轮
 //! 以四种方式之一结束：定下（登记换成下载的）、停下等用户（[`Status::Waiting`]，可选项记在内存里）、失败、被取消
 //! （暂停）。用户的选择、继续、交给网盘各开新的一轮。
+//!
+//! 例外：在网页里找流的一轮（见 `in_page`）停下等用户在网页里动手（[`Ask::Page`]）时不结束，照旧登记着、占着网页的
+//! 名额，用户弄好了它自己把状态改回准备中接着走。所以等用户的任务里只有这一种在运行表里：暂停它即关掉网页，换请求头
+//! （[`Answer::Headers`]）顶掉它。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,17 +14,20 @@ use std::sync::atomic::Ordering;
 
 use hs_dlx_ytdlp::{ExtractError, InstallProgress, Live};
 use hs_m3u8_core::hls::{AudioChoice, Preference, VariantChoice};
-use hs_m3u8_core::{CancellationToken, FileInfo, Probe, Resource, Source, check_option_header};
+use hs_m3u8_core::{
+    CancellationToken, FileInfo, Probe, Resource, Source, Url, check_option_header,
+};
 use rusqlite::Transaction;
 
 use super::{Control, Ending, Event, Resolved, Run, RunningGuard, Shared, WebState, lock};
 use crate::intake::{self, Intake};
+use crate::page::{Check, Found};
 use crate::store::{self, NewPending};
 use crate::web::no_choice_reason;
 use crate::{
     Ask, CloudProvider, Draft, DraftKind, Error, Expected, Failure, FailureKind, MetadataProgress,
-    OutputKind, Settings, Status, Task, TaskId, TaskSpec, TorrentInfo, WebSpec, maybe_a_page,
-    naming, torrent,
+    OutputKind, PageAsk, Settings, Status, Task, TaskId, TaskSpec, TorrentInfo, WebSpec,
+    maybe_a_page, naming, torrent,
 };
 
 /// 准备中的任务此刻在做哪一步。
@@ -34,6 +41,13 @@ pub enum Step {
     Installing(InstallProgress),
     /// 磁力链接在取种子信息
     Metadata(MetadataProgress),
+    /// 要在内置网页里找流，在等网页的名额：前面还有 `ahead` 个任务；`away` 为宿主此刻开不了网页（桌面应用的主
+    /// 窗口关着），要等它又能开了才轮得到
+    PageQueued { ahead: usize, away: bool },
+    /// 网页开着（占着一个名额），在后台找流、逐条探测：已找到 `found` 条
+    Page { found: usize },
+    /// 网页已关掉、名额已让出：在照找到的流定下，或在重新取网页引擎打开后发现不是网页的地址
+    Probing,
     /// 都定了：在取名、建任务目录，随即开始下载
     Starting,
 }
@@ -64,6 +78,18 @@ pub enum Offer {
     Confirm(Recognized),
     /// 解析网页要用的组件没装好：它此刻的状态（没装、上次没装成、坏了）
     Components(WebState),
+    /// 网页里找到几条探测成功的流，选一条；或找到的都没探测成（各自的原因在里面，可以换请求头再来）
+    Streams(Vec<StreamOption>),
+    /// 要用户在网页里动手：网页由宿主显示着。过了人机验证、点了播放找到流之后任务自己接着走，不用回答
+    Page(PageAsk),
+}
+
+/// 网页里找到的一条流。
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamOption {
+    pub url: Url,
+    /// 探测的结果；没成（或采用别的流时还没轮到它）时为原因，这样的不能选
+    pub probed: Result<Box<Probe>, String>,
 }
 
 /// 没有要选的任务认出的是什么。
@@ -85,6 +111,8 @@ impl Offer {
             Offer::Files { .. } => Ask::Files,
             Offer::Confirm(_) => Ask::Confirm,
             Offer::Components(_) => Ask::Components,
+            Offer::Streams(_) => Ask::Stream,
+            Offer::Page(ask) => Ask::Page(*ask),
         }
     }
 }
@@ -106,6 +134,8 @@ pub enum Answer {
     Files { wanted: Vec<i32>, folder: PathBuf },
     /// 单个文件（认出文件的 [`Offer::Confirm`]）：保存目录
     File { folder: PathBuf },
+    /// 网页里找到的流（[`Offer::Streams`]）：用可选项里的第几条，须是探测成功的；它有两档以上时接着停下选画质
+    Stream(usize),
     /// 安装组件并接着解析（[`Offer::Components`]）。组件是各任务共用的：之后暂停或放弃这个任务不停掉安装
     Install,
     /// 换掉任务的请求头并从头准备；对哪种可选项都可以，来源是磁力链接或种子文件的任务没有请求头
@@ -118,25 +148,103 @@ pub(super) enum Entry {
     Fresh,
     /// 先装解析组件，再从头
     Install,
+    /// 用网页里找到的这条流：有两档以上时停下选画质，否则定下
+    Stream(Box<Adopted>),
     /// 都定了：照它取名、定下并开始
     Settle(Box<Draft>),
 }
 
+/// 停下等用户时记在内存里的：给用户的可选项，与照选择定下任务时要用、不给用户看的来历。
+pub(super) struct Asked {
+    pub offer: Offer,
+    /// 可选项里的 HLS 或文件不是照任务自己的地址与请求头取的（网页里找到的流、带着网页引擎的 Cookie 重新取的地址）
+    /// 时：取它的地址与请求头
+    origin: Option<Origin>,
+    /// [`Offer::Streams`] 各条流的来历，与可选项一一对应；没探测成的为 None
+    streams: Vec<Option<Origin>>,
+}
+
+/// 一个 HLS 或文件是从哪取的。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Origin {
+    pub url: Url,
+    /// 探测时带的请求头，下载照它带
+    pub headers: Vec<(String, String)>,
+    /// 所在网页的标题，任务照它取名；None 时由地址得出
+    pub title: Option<String>,
+}
+
+/// 网页里找到、要用的一条流：探测结果与来历。
+pub(super) struct Adopted {
+    pub probe: Box<Probe>,
+    pub origin: Origin,
+}
+
+impl Asked {
+    /// 照任务自己的地址与请求头给出的可选项。
+    pub fn plain(offer: Offer) -> Asked {
+        Asked {
+            offer,
+            origin: None,
+            streams: Vec::new(),
+        }
+    }
+
+    /// 网页里找到的几条流 `found`，所在网页的标题为 `title`。
+    pub fn streams(found: Vec<Found>, title: Option<&str>) -> Asked {
+        let mut options = Vec::with_capacity(found.len());
+        let mut streams = Vec::with_capacity(found.len());
+        for found in found {
+            let (probed, origin) = match found.check {
+                Check::Ready { probe, headers } => (
+                    Ok(probe),
+                    Some(Origin {
+                        url: found.url.clone(),
+                        headers,
+                        title: title.map(str::to_owned),
+                    }),
+                ),
+                Check::Failed { reason, .. } => (Err(reason), None),
+                Check::Waiting | Check::Running => (Err("还没轮到探测它".to_owned()), None),
+            };
+            options.push(StreamOption {
+                url: found.url,
+                probed,
+            });
+            streams.push(origin);
+        }
+        Asked {
+            offer: Offer::Streams(options),
+            origin: None,
+            streams,
+        }
+    }
+}
+
 /// 一轮准备往下走到的结论。
-enum Next {
-    Ask(Offer),
+pub(super) enum Next {
+    Ask(Box<Asked>),
     Settle(Box<Draft>),
 }
 
+impl Next {
+    pub(super) fn ask(asked: Asked) -> Next {
+        Next::Ask(Box::new(asked))
+    }
+}
+
 /// 一轮准备没走到结论。
-enum Stop {
+pub(super) enum Stop {
     /// 被取消：暂停、放弃、关闭，或被另一轮顶掉
     Cancelled,
     Failed(Failure),
+    /// 任务正停在网页上等用户，而网页没了（宿主关掉了它）：状态照旧是等用户，可选项作废，与重开应用后一样要继续、
+    /// 重新准备
+    Lapsed,
 }
 
 impl Stop {
-    fn failed(kind: FailureKind, message: impl Into<String>) -> Stop {
+    pub(super) fn failed(kind: FailureKind, message: impl Into<String>) -> Stop {
         Stop::Failed(Failure {
             kind,
             message: message.into(),
@@ -144,14 +252,18 @@ impl Stop {
     }
 
     /// 服务自己的错误 `error`（读写存储、取名、建会话等）对应的失败。
-    fn of(error: &Error) -> Stop {
+    pub(super) fn of(error: &Error) -> Stop {
         let kind = match error {
             Error::Core(error) => return Stop::Failed(Failure::of(error)),
-            Error::InvalidInput(_) | Error::Corrupt(_) => FailureKind::Unrecoverable,
+            // 种子已在别的任务里：再试也一样
+            Error::InvalidInput(_) | Error::Corrupt(_) | Error::TorrentTaken(_) => {
+                FailureKind::Unrecoverable
+            }
             Error::Io { .. } | Error::TimedOut { .. } => FailureKind::Disk,
             Error::PathTaken(_) => FailureKind::OutputTaken,
             Error::NotLoggedIn => FailureKind::CloudLogin,
-            Error::WebUnavailable | Error::WebNotReady | Error::WebInstalling => {
+            // 有网页视频任务在跑、组件重装不了：暂停它们之后再试
+            Error::WebUnavailable | Error::WebNotReady | Error::WebInstalling | Error::WebInUse => {
                 FailureKind::WebComponents
             }
             _ => FailureKind::Other,
@@ -162,9 +274,9 @@ impl Stop {
 
 /// 一轮准备：它在运行表里的登记与取消的信号。
 pub(super) struct Flow {
-    id: TaskId,
-    cancel: CancellationToken,
-    guard: RunningGuard,
+    pub id: TaskId,
+    pub cancel: CancellationToken,
+    pub guard: RunningGuard,
 }
 
 /// 地址回的是网页而没有解析器认得它时的失败。
@@ -182,7 +294,7 @@ fn claimed(_url: &hs_m3u8_core::Url) -> Option<String> {
 
 /// 还没定下的任务在知道更好的名字之前的标题：磁力链接为显示名（`dn`，整理成文件主名），没有时为「磁力链接」；种子
 /// 文件为去掉 `.torrent` 的文件名；其余由地址得出（[`naming::task_title`]）。
-fn pending_title(url: &hs_m3u8_core::Url) -> String {
+pub(super) fn pending_title(url: &Url) -> String {
     match url.scheme() {
         "magnet" => {
             let name = url
@@ -256,20 +368,25 @@ fn absolute(folder: &Path) -> Result<(), Error> {
     }
 }
 
-/// 把还没定下的任务 `task` 定下为 HLS 任务的草稿。
+/// 把还没定下的任务 `task` 定下为 HLS 任务的草稿：地址、请求头照 `origin`（网页里找到的流；任务照网页的标题取名），
+/// 没有时照任务自己的。
 fn hls_draft(
     task: &Task,
     probe: &Probe,
     preference: Preference,
     output: OutputKind,
     folder: PathBuf,
+    origin: Option<&Origin>,
 ) -> Draft {
     Draft {
-        url: task.spec.url.clone(),
-        headers: task.spec.headers.clone(),
+        url: origin.map_or_else(|| task.spec.url.clone(), |origin| origin.url.clone()),
+        headers: origin.map_or_else(
+            || task.spec.headers.clone(),
+            |origin| origin.headers.clone(),
+        ),
         folder,
         kind: DraftKind::Hls {
-            title: None,
+            title: origin.and_then(|origin| origin.title.clone()),
             preference,
             output,
             live: probe.live,
@@ -277,12 +394,51 @@ fn hls_draft(
     }
 }
 
+/// 认出 HLS（探测结果 `probe`，来历 `origin` 同 [`hls_draft`]）之后：有两档以上时停下选画质，设置了开始前确认时停下
+/// 确认，否则照来源默认的选轨定下，存成 MP4。
+pub(super) fn hls_next(
+    task: &Task,
+    probe: Box<Probe>,
+    origin: Option<Origin>,
+    folder: PathBuf,
+    settings: &Settings,
+) -> Next {
+    let several = probe
+        .master
+        .as_ref()
+        .is_some_and(|master| master.variants.len() >= 2);
+    let offer = if several {
+        Offer::Quality(probe)
+    } else if settings.confirm_before_start {
+        Offer::Confirm(Recognized::Hls(probe))
+    } else {
+        let preference = default_preference(&probe);
+        return Next::Settle(Box::new(hls_draft(
+            task,
+            &probe,
+            preference,
+            OutputKind::Mp4,
+            folder,
+            origin.as_ref(),
+        )));
+    };
+    Next::ask(Asked {
+        offer,
+        origin,
+        streams: Vec::new(),
+    })
+}
+
 /// 把还没定下的任务 `task` 定下为文件任务的草稿：地址用任务原来的（重定向到的多为有时效的签名地址，续传时重新
-/// 跟随），文件名取服务器给的或重定向之后的地址里的。
-fn file_draft(task: &Task, info: &FileInfo, folder: PathBuf) -> Draft {
+/// 跟随），文件名取服务器给的或重定向之后的地址里的；请求头照 `origin`（带着网页引擎的 Cookie 认出的），没有时照任务
+/// 自己的。
+fn file_draft(task: &Task, info: &FileInfo, folder: PathBuf, origin: Option<&Origin>) -> Draft {
     Draft {
         url: task.spec.url.clone(),
-        headers: task.spec.headers.clone(),
+        headers: origin.map_or_else(
+            || task.spec.headers.clone(),
+            |origin| origin.headers.clone(),
+        ),
         folder,
         kind: DraftKind::File {
             name: Some(naming::file_name(&info.url, info.file_name.as_deref())),
@@ -423,7 +579,7 @@ impl Shared {
 
     /// 给还没定下的任务 `task` 开一轮准备，从 `entry` 走起：状态记为准备中，提交 `tx`（连同补写了的 `applied`），登记、
     /// 起这一轮，发 [`Event::Added`]（`added` 时）或 [`Event::Changed`]。这个任务在跑的那一轮（交给网盘时顶掉取种子
-    /// 信息的）随之作废。返回准备中的任务；提交不了时什么也没开始。调用方持着 `store` 锁、核对过服务没关闭，且在
+    /// 信息的，换请求头时顶掉停在网页上等用户的）随之作废，它占着的网页名额随登记换掉而归还。返回准备中的任务；提交不了时什么也没开始。调用方持着 `store` 锁、核对过服务没关闭，且在
     /// 运行时里。
     pub(super) fn begin_flow(
         self: &Arc<Self>,
@@ -448,7 +604,7 @@ impl Shared {
                 bytes: 0,
                 total: None,
             }),
-            Entry::Settle(_) => Step::Starting,
+            Entry::Stream(_) | Entry::Settle(_) => Step::Starting,
         };
         if let Some(superseded) = lock(&self.running).get(&id) {
             superseded.control.cancel();
@@ -463,7 +619,7 @@ impl Shared {
         });
         self.events.send(Event::Stage {
             id,
-            stage: Box::new(Stage::Working(step)),
+            stage: Some(Box::new(Stage::Working(step))),
         });
         let shared = self.clone();
         self.tracker
@@ -477,18 +633,22 @@ impl Shared {
         if self.closed.load(Ordering::Relaxed) {
             return Err(Error::Closed);
         }
+        if lock(&self.discarding).contains(&id) {
+            return Err(Error::Discarding(id));
+        }
         let tx = store.transaction()?;
         let applied = self.apply_unsaved(&tx)?;
-        let mut task = self.stopped(&tx, id)?;
+        // 等用户的任务里只有停在网页上的那种在运行表里（见模块说明）：新的一轮顶掉它
+        let mut task = store::get(&tx, id)?.ok_or(Error::NotFound(id))?;
         if !matches!(task.status, Status::Waiting(_)) {
             return Err(Error::InvalidInput(format!("{id}没有在等选择")));
         }
         let entry = {
             let offers = lock(&self.offers);
-            let offer = offers.get(&id).ok_or_else(|| {
+            let asked = offers.get(&id).ok_or_else(|| {
                 Error::InvalidInput(format!("{id}的可选项已不在，要先继续、重新准备"))
             })?;
-            entry_for(&tx, &mut task, offer, answer)?
+            entry_for(&tx, &mut task, asked, answer)?
         };
         self.begin_flow(tx, applied, task, entry, false)
     }
@@ -538,7 +698,9 @@ impl Shared {
             .and_then(|running| running.step.clone());
         Ok(match step {
             Some(step) => Some(Stage::Working(step)),
-            None => lock(&self.offers).get(&id).cloned().map(Stage::Asking),
+            None => lock(&self.offers)
+                .get(&id)
+                .map(|asked| Stage::Asking(asked.offer.clone())),
         })
     }
 
@@ -584,10 +746,10 @@ impl Shared {
                     if !waiting || lock(&shared.running).contains_key(&id) {
                         continue;
                     }
-                    lock(&shared.offers).insert(id, offer.clone());
+                    lock(&shared.offers).insert(id, Asked::plain(offer.clone()));
                     shared.events.send(Event::Stage {
                         id,
-                        stage: Box::new(Stage::Asking(offer)),
+                        stage: Some(Box::new(Stage::Asking(offer))),
                     });
                 }
             }
@@ -602,7 +764,7 @@ impl Shared {
             .await
             .unwrap_or(Err(Stop::Cancelled));
         let ended = match walked {
-            Ok(Next::Ask(offer)) => Ok(offer),
+            Ok(Next::Ask(asked)) => Ok(*asked),
             Ok(Next::Settle(draft)) => {
                 let settled = flow
                     .cancel
@@ -620,33 +782,68 @@ impl Shared {
         self.finish_flow(flow, ended);
     }
 
-    /// 一轮准备没定下就结束了：停下等用户（`ended` 为可选项）、失败或被取消。在 `store` 锁内核对这一轮没被顶掉（顶掉
-    /// 了的什么也不做），把状态写进存储（写不进时记为待补写）、记下可选项、去掉登记，再发 [`Event::Changed`]、
-    /// [`Event::Stage`]（有可选项时）与 [`Event::Ended`]，都在锁内、释放登记之前。结论出来之后才到的取消（暂停）照
-    /// 暂停算。
-    fn finish_flow(&self, flow: Flow, ended: Result<Offer, Stop>) {
+    /// 一轮准备没定下就结束了：停下等用户（`ended` 为可选项）、失败、被取消，或停在网页上等用户时网页没了。在
+    /// `store` 锁内核对这一轮没被顶掉（顶掉了的什么也不做），把状态写进存储（写不进时记为待补写）、换掉记着的可选项、
+    /// 发 [`Event::Changed`]、[`Event::Stage`]（有可选项时）与 [`Event::Ended`]，最后去掉登记（它占着的网页名额随之
+    /// 归还）：都在锁内，别的操作与下一个轮到名额的任务的事件排不到这之前。结论出来之后才到的取消（暂停）照暂停算。
+    ///
+    /// 停在网页上等用户的一轮被关闭服务取消、或网页没了（[`Stop::Lapsed`]）时状态不动（照旧等用户，重开应用后与别的
+    /// 等用户的任务一样），只作废可选项：发可选项没有了的 [`Event::Stage`] 与 [`Event::Ended`]。
+    fn finish_flow(&self, flow: Flow, ended: Result<Asked, Stop>) {
         let Flow { id, cancel, guard } = flow;
         let mut store = lock(&self.store);
         if !self.current(id, &guard) {
             return;
         }
-        let (status, offer) = match ended {
-            _ if cancel.is_cancelled() => (Status::Paused, None),
-            Ok(offer) => (Status::Waiting(offer.ask()), Some(offer)),
-            Err(Stop::Cancelled) => (Status::Paused, None),
+        let ended = match ended {
+            _ if cancel.is_cancelled() => Err(Stop::Cancelled),
+            ended => ended,
+        };
+        let lapsed = match &ended {
+            Err(Stop::Lapsed) => true,
+            Err(Stop::Cancelled) => {
+                self.closed.load(Ordering::Relaxed)
+                    && self
+                        .task_in(&mut store, id)
+                        .is_ok_and(|task| matches!(task.status, Status::Waiting(Ask::Page(_))))
+            }
+            Ok(_) | Err(Stop::Failed(_)) => false,
+        };
+        lock(&self.offers).remove(&id);
+        if lapsed {
+            self.events.send(Event::Stage { id, stage: None });
+            // 读不出时不报这一轮停下：存储出了错，状态照它里面的
+            if let Ok(task) = self.task_in(&mut store, id) {
+                self.events.send(Event::Ended {
+                    id,
+                    status: task.status,
+                    result: None,
+                    total: None,
+                    leftovers: Vec::new(),
+                    unsaved: None,
+                });
+            }
+            drop(guard);
+            return;
+        }
+        let (status, asked) = match ended {
+            Ok(asked) => (Status::Waiting(asked.offer.ask()), Some(asked)),
             Err(Stop::Failed(failure)) => (Status::Failed(failure), None),
+            Err(Stop::Cancelled | Stop::Lapsed) => (Status::Paused, None),
         };
         let ending = Ending::of(status);
         let saved = self.save_in(&mut store, id, &ending);
-        if let Some(offer) = &offer {
-            lock(&self.offers).insert(id, offer.clone());
-        }
+        let offer = asked.map(|asked| {
+            let offer = asked.offer.clone();
+            lock(&self.offers).insert(id, asked);
+            offer
+        });
         self.announce_in(&mut store, id, ending, offer, Vec::new(), saved);
         drop(guard);
     }
 
     /// 任务 `id` 在运行表里的登记还是 `guard` 的那一次（没被另一轮或下载顶掉）。
-    fn current(&self, id: TaskId, guard: &RunningGuard) -> bool {
+    pub(super) fn current(&self, id: TaskId, guard: &RunningGuard) -> bool {
         lock(&self.running)
             .get(&id)
             .is_some_and(|running| running.serial == guard.serial)
@@ -654,8 +851,13 @@ impl Shared {
 
     /// 这一轮走到了 `step`：记下并发 [`Event::Stage`]；已被顶掉的不记。在 `store` 锁内做：与顶掉它的那一轮发的
     /// 事件先后分明。
-    fn step(&self, flow: &Flow, step: Step) {
+    pub(super) fn step(&self, flow: &Flow, step: Step) {
         let _store = lock(&self.store);
+        self.step_in(flow, step);
+    }
+
+    /// 同 [`Shared::step`]，调用方已持着 `store` 锁。
+    pub(super) fn step_in(&self, flow: &Flow, step: Step) {
         {
             let mut running = lock(&self.running);
             match running.get_mut(&flow.id) {
@@ -670,19 +872,25 @@ impl Shared {
         }
         self.events.send(Event::Stage {
             id: flow.id,
-            stage: Box::new(Stage::Working(step)),
+            stage: Some(Box::new(Stage::Working(step))),
         });
     }
 
-    /// 准备中知道了更好的名字：换掉标题（整理成文件主名，什么都不剩或与现在的相同时不动），发 [`Event::Changed`]。
-    fn rename(&self, flow: &Flow, task: &Task, title: &str) -> Result<(), Stop> {
+    /// 准备中知道了更好的名字：换掉标题（整理成文件主名，什么都不剩或与 `task` 里的相同时不动），发
+    /// [`Event::Changed`]。
+    pub(super) fn rename(&self, flow: &Flow, task: &Task, title: &str) -> Result<(), Stop> {
         let title = naming::clean_title(title);
         if title.is_empty() || title == task.spec.title {
             return Ok(());
         }
+        self.retitle(flow, &title)
+    }
+
+    /// 把这一轮的任务的标题换成 `title`（已整理成文件主名），发 [`Event::Changed`]。
+    pub(super) fn retitle(&self, flow: &Flow, title: &str) -> Result<(), Stop> {
         let id = flow.id;
         self.change(|tx| {
-            store::set_pending_title(tx, id, &title)?;
+            store::set_pending_title(tx, id, title)?;
             store::get(tx, id)?.ok_or(Error::NotFound(id))
         })
         .map(drop)
@@ -692,6 +900,11 @@ impl Shared {
     async fn walk(self: &Arc<Self>, flow: &Flow, entry: Entry) -> Result<Next, Stop> {
         match entry {
             Entry::Settle(draft) => Ok(Next::Settle(draft)),
+            Entry::Stream(adopted) => {
+                let (task, folder, settings) = self.unsettled(flow)?;
+                let Adopted { probe, origin } = *adopted;
+                Ok(hls_next(&task, probe, Some(origin), folder, &settings))
+            }
             Entry::Install => {
                 // 这期间别处装好了的不重装
                 let missing = matches!(
@@ -710,14 +923,7 @@ impl Shared {
     /// 从头准备：磁力链接、种子文件取种子信息；http(s) 的地址先看有没有插件认领，没有就自己探测一次，是播放列表、
     /// 文件的照它定，是网页的交给 yt-dlp 解析。
     async fn fresh(self: &Arc<Self>, flow: &Flow) -> Result<Next, Stop> {
-        let task = self.get(flow.id).map_err(|error| Stop::of(&error))?;
-        let folder = task
-            .spec
-            .pending()
-            .expect("准备的只会是还没定下的任务")
-            .folder
-            .clone();
-        let settings = self.settings().map_err(|error| Stop::of(&error))?;
+        let (task, folder, settings) = self.unsettled(flow)?;
         if intake::torrent_source(&task.spec.url) {
             return self.torrent(flow, &task, folder, &settings).await;
         }
@@ -729,47 +935,60 @@ impl Shared {
         source.http.headers.clone_from(&task.spec.headers);
         source.http.proxy = settings.proxy.clone();
         match self.engine.identify(&source).await {
-            Ok(Resource::Playlist(probe)) => {
-                let several = probe
-                    .master
-                    .as_ref()
-                    .is_some_and(|master| master.variants.len() >= 2);
-                Ok(if several {
-                    Next::Ask(Offer::Quality(probe))
-                } else if settings.confirm_before_start {
-                    Next::Ask(Offer::Confirm(Recognized::Hls(probe)))
-                } else {
-                    let preference = default_preference(&probe);
-                    Next::Settle(Box::new(hls_draft(
-                        &task,
-                        &probe,
-                        preference,
-                        OutputKind::Mp4,
-                        folder,
-                    )))
-                })
-            }
-            Ok(Resource::File(info)) => {
-                // 地址经过重定向时，最后的地址里才有真正的文件名
-                let name = naming::file_name(&info.url, info.file_name.as_deref());
-                self.rename(flow, &task, &name)?;
-                Ok(if settings.confirm_before_start {
-                    Next::Ask(Offer::Confirm(Recognized::File(Box::new(info))))
-                } else {
-                    Next::Settle(Box::new(file_draft(&task, &info, folder)))
-                })
-            }
+            Ok(Resource::Playlist(probe)) => Ok(hls_next(&task, probe, None, folder, &settings)),
+            Ok(Resource::File(info)) => self.file_next(flow, &task, info, None, folder, &settings),
             Ok(Resource::Page { .. }) => {
                 self.page(flow, &task, folder, &settings, WebSpec::YT_DLP.to_owned())
                     .await
             }
-            Err(error) if maybe_a_page(&error) => in_page(Failure::of(&error)),
+            Err(error) if maybe_a_page(&error) => {
+                self.in_page(flow, &task, folder, &settings, Failure::of(&error))
+                    .await
+            }
             Err(error) => Err(Stop::Failed(Failure::of(&error))),
         }
     }
 
+    /// 这一轮的任务（还没定下）、它的保存目录与此刻的设置。
+    fn unsettled(&self, flow: &Flow) -> Result<(Task, PathBuf, Settings), Stop> {
+        let task = self.get(flow.id).map_err(|error| Stop::of(&error))?;
+        let folder = task
+            .spec
+            .pending()
+            .expect("准备的只会是还没定下的任务")
+            .folder
+            .clone();
+        let settings = self.settings().map_err(|error| Stop::of(&error))?;
+        Ok((task, folder, settings))
+    }
+
+    /// 认出单个文件 `info`（请求头照 `origin`，同 [`file_draft`]）之后：任务改叫文件名，设置了开始前确认时停下确认，
+    /// 否则定下。
+    pub(super) fn file_next(
+        &self,
+        flow: &Flow,
+        task: &Task,
+        info: FileInfo,
+        origin: Option<Origin>,
+        folder: PathBuf,
+        settings: &Settings,
+    ) -> Result<Next, Stop> {
+        // 地址经过重定向时，最后的地址里才有真正的文件名
+        let name = naming::file_name(&info.url, info.file_name.as_deref());
+        self.rename(flow, task, &name)?;
+        Ok(if settings.confirm_before_start {
+            Next::ask(Asked {
+                offer: Offer::Confirm(Recognized::File(Box::new(info))),
+                origin,
+                streams: Vec::new(),
+            })
+        } else {
+            Next::Settle(Box::new(file_draft(task, &info, folder, origin.as_ref())))
+        })
+    }
+
     /// 交给插件 `plugin` 解析网页：组件没装好时停下等用户同意安装（在装的等它装完），解析出格式后选画质（只有一档、
-    /// 又不要先确认时直接定下）。没有解析器认得这个网址、或这个平台没有组件时转到网页里找流（[`in_page`]）。
+    /// 又不要先确认时直接定下）。没有解析器认得这个网址、或这个平台没有组件时转到网页里找流（[`Shared::in_page`]）。
     async fn page(
         self: &Arc<Self>,
         flow: &Flow,
@@ -785,9 +1004,13 @@ impl Shared {
                 WebState::Ready(_) | WebState::UpdateFailed { .. } | WebState::Updating { .. } => {
                     break;
                 }
-                WebState::Unavailable => return in_page(not_media()),
+                WebState::Unavailable => {
+                    return self
+                        .in_page(flow, task, folder, settings, not_media())
+                        .await;
+                }
                 WebState::Missing | WebState::Failed(_) | WebState::Broken(_) => {
-                    return Ok(Next::Ask(Offer::Components(state)));
+                    return Ok(Next::ask(Asked::plain(Offer::Components(state))));
                 }
                 WebState::Installing(progress) => {
                     self.step(flow, Step::Installing(progress));
@@ -804,7 +1027,11 @@ impl Shared {
             .map_err(|error| Stop::of(&error))?;
         let resolved = match resolving.await {
             Ok(resolved) => resolved,
-            Err(ExtractError::Unsupported(_)) => return in_page(not_media()),
+            Err(ExtractError::Unsupported(_)) => {
+                return self
+                    .in_page(flow, task, folder, settings, not_media())
+                    .await;
+            }
             Err(error) => return Err(Stop::Failed(Failure::of_extract(&error))),
         };
         if let Some(entries) = &resolved.info.entries {
@@ -837,7 +1064,7 @@ impl Shared {
             if resolved.choices.len() == 1 && !settings.confirm_before_start {
                 Next::Settle(Box::new(web_draft(task, &resolved, 0, folder)))
             } else {
-                Next::Ask(Offer::WebQuality(Box::new(resolved)))
+                Next::ask(Asked::plain(Offer::WebQuality(Box::new(resolved))))
             },
         )
     }
@@ -891,13 +1118,15 @@ impl Shared {
                 .write(store::pikpak_account)
                 .map_err(|error| Stop::of(&error))?
                 .is_some();
-            return Ok(Next::Ask(Offer::Files {
+            return Ok(Next::ask(Asked::plain(Offer::Files {
                 info: Box::new(info),
                 pikpak,
-            }));
+            })));
         }
         Ok(if settings.confirm_before_start {
-            Next::Ask(Offer::Confirm(Recognized::Torrent(Box::new(info))))
+            Next::ask(Asked::plain(Offer::Confirm(Recognized::Torrent(Box::new(
+                info,
+            )))))
         } else {
             let all = info.files.iter().map(|file| file.index).collect();
             Next::Settle(Box::new(torrent_draft(task, resume, all, folder)))
@@ -964,22 +1193,17 @@ impl Shared {
     }
 }
 
-/// 在内置网页里找流的入口：地址可能是网页（探测被拒、取到的不是播放列表也不是文件）或网页没有解析器认得时到这里。
-/// 服务还没有网页宿主：以原来的失败 `failure` 结束。
-fn in_page(failure: Failure) -> Result<Next, Stop> {
-    Err(Stop::Failed(failure))
-}
-
-/// 用户对 `offer` 的选择 `answer` 让任务 `task` 接着从哪里走：对不上、选的不在可选项里时报 [`Error::InvalidInput`]。
-/// 选择带来的请求头写进 `tx` 与 `task`。
+/// 用户对 `asked` 里的可选项的选择 `answer` 让任务 `task` 接着从哪里走：对不上、选的不在可选项里时报
+/// [`Error::InvalidInput`]。选择带来的请求头写进 `tx` 与 `task`。
 fn entry_for(
     tx: &Transaction<'_>,
     task: &mut Task,
-    offer: &Offer,
+    asked: &Asked,
     answer: Answer,
 ) -> Result<Entry, Error> {
     let id = task.id;
-    let draft = match (offer, answer) {
+    let origin = asked.origin.as_ref();
+    let draft = match (&asked.offer, answer) {
         (_, Answer::Headers(headers)) => {
             for (name, value) in &headers {
                 check_option_header(name, value).map_err(Error::InvalidInput)?;
@@ -1004,7 +1228,30 @@ fn entry_for(
             if !offered(probe, &preference) {
                 return Err(Error::InvalidInput("选的变体或音轨不在可选项里".to_owned()));
             }
-            hls_draft(task, probe, preference, output, folder)
+            hls_draft(task, probe, preference, output, folder, origin)
+        }
+        (Offer::Streams(options), Answer::Stream(index)) => {
+            let picked = options
+                .get(index)
+                .zip(asked.streams.get(index))
+                .ok_or_else(|| {
+                    Error::InvalidInput(format!("没有第 {index} 条流：只有 {} 条", options.len()))
+                })?;
+            let (
+                StreamOption {
+                    probed: Ok(probe), ..
+                },
+                Some(origin),
+            ) = picked
+            else {
+                return Err(Error::InvalidInput(format!(
+                    "第 {index} 条流没探测成，不能用"
+                )));
+            };
+            return Ok(Entry::Stream(Box::new(Adopted {
+                probe: probe.clone(),
+                origin: origin.clone(),
+            })));
         }
         (Offer::WebQuality(resolved), Answer::Web { choice, folder }) => {
             absolute(&folder)?;
@@ -1038,7 +1285,7 @@ fn entry_for(
         }
         (Offer::Confirm(Recognized::File(info)), Answer::File { folder }) => {
             absolute(&folder)?;
-            file_draft(task, info, folder)
+            file_draft(task, info, folder, origin)
         }
         _ => {
             return Err(Error::InvalidInput(format!("这个选择与{id}在等的对不上")));
