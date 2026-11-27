@@ -1,4 +1,4 @@
-//! 任务此刻在界面上的样子：中央圆盘的字与颜色、刻度、任务栏的小环与失败时的说明。
+//! 任务此刻在界面上的样子：中央圆盘的字与颜色、刻度与失败时的说明。
 
 use gpui_kit::Hsla;
 use hs_dlx_app::web::Container;
@@ -21,10 +21,8 @@ pub struct Look {
     pub line: String,
     /// 失败时这类失败多半是怎么回事（完整的错误在信号里）；不是失败时为 None
     pub hint: Option<&'static str>,
-    /// 列表小环：进度（0 到 1）、颜色与中间的简写
+    /// 进度（0 到 1）：窗口背景的日冕按它点亮
     pub fraction: f32,
-    pub orb: Hsla,
-    pub short: String,
 }
 
 /// 向下取整的百分比（`fraction` 为 0 到 1）：没做完不写 100%。
@@ -65,11 +63,57 @@ pub fn look(row: &Row) -> Look {
         Status::Running if row.task.spec.web().is_some() => running_web(row),
         Status::Running if row.task.spec.hls().is_none() => running_file(row),
         Status::Running => running(row, Amount::of(row).unwrap_or_default()),
-        // 还没定下的任务在这一页没有自己的样子：准备中、等用户的按暂停画
-        Status::Paused | Status::Preparing | Status::Waiting(_) => stopped(row, Stopped::Paused),
+        Status::Preparing | Status::Waiting(_) => pending(row, None),
+        Status::Paused | Status::Failed(_) if row.task.spec.pending().is_some() => {
+            pending(row, Some(&row.task.status))
+        }
+        Status::Paused => stopped(row, Stopped::Paused),
         Status::Failed(failure) => stopped(row, Stopped::Failed(failure)),
         Status::Done if row.task.seeding => seeding_look(row),
         Status::Done => done_look(row),
+    }
+}
+
+/// 还没定下的任务：磁盘上没有它的东西。`stopped` 为停着的状态（暂停、失败），准备中与等用户的为 None。
+fn pending(row: &Row, stopped: Option<&Status>) -> Look {
+    let (state, color, big, line, hint) = match (stopped, &row.task.status) {
+        (Some(Status::Failed(failure)), _) => {
+            let (big, hint) = format::failure(failure.kind);
+            (
+                "需要处理",
+                theme::warn(),
+                big,
+                "还没定下 · 重试时从头准备",
+                Some(hint),
+            )
+        }
+        (Some(_), _) => (
+            "已暂停",
+            theme::ink_3(),
+            "‖".to_owned(),
+            "还没定下 · 继续时从头准备",
+            None,
+        ),
+        (None, Status::Waiting(_)) => (
+            "等你处理",
+            theme::warn(),
+            "!".to_owned(),
+            "在新建页里处理，或放弃",
+            None,
+        ),
+        (None, _) => ("准备中", theme::accent(), "…".to_owned(), "", None),
+    };
+    Look {
+        state: state.to_owned(),
+        color,
+        ticks: Ticks {
+            color: theme::alpha(theme::ink(), 0.34),
+            ..Ticks::of(0, 0, stopped.is_none())
+        },
+        big,
+        line: line.to_owned(),
+        hint,
+        fraction: 0.0,
     }
 }
 
@@ -87,8 +131,6 @@ fn discarding(row: &Row, state: &str, line: &str) -> Look {
         line: line.to_owned(),
         hint: None,
         fraction: 0.0,
-        orb: theme::alpha(theme::ink(), 0.34),
-        short: "…".to_owned(),
     }
 }
 
@@ -96,8 +138,7 @@ fn discarding(row: &Row, state: &str, line: &str) -> Look {
 /// 错误在信号里。点了继续、还在读任务目录时状态写「正在继续」。
 fn stopped(row: &Row, why: Stopped<'_>) -> Look {
     let kept = kept(row, matches!(why, Stopped::Paused));
-    let (done, total, known, fraction) = (kept.done, kept.total, kept.known, kept.fraction);
-    let recording = row.recording();
+    let (done, total, fraction) = (kept.done, kept.total, kept.fraction);
     let state = |state: &str| if row.resuming { "正在继续" } else { state }.to_owned();
     let ticks = |lit: Hsla| Ticks {
         color: lit,
@@ -110,16 +151,10 @@ fn stopped(row: &Row, why: Stopped<'_>) -> Look {
                 state: state("已暂停"),
                 color: theme::ink_3(),
                 ticks: ticks(theme::alpha(theme::ink(), 0.5)),
-                short: if known && !recording {
-                    big.clone()
-                } else {
-                    "‖".to_owned()
-                },
                 big,
                 line,
                 hint: None,
                 fraction,
-                orb: theme::alpha(theme::ink(), 0.5),
             }
         }
         Stopped::Failed(failure) => {
@@ -143,8 +178,6 @@ fn stopped(row: &Row, why: Stopped<'_>) -> Look {
                 line,
                 hint: Some(hint),
                 fraction,
-                orb: theme::warn(),
-                short: "!".to_owned(),
             }
         }
     }
@@ -155,7 +188,6 @@ fn stopped(row: &Row, why: Stopped<'_>) -> Look {
 struct Kept {
     done: usize,
     total: usize,
-    known: bool,
     fraction: f32,
     big: String,
     line: String,
@@ -176,7 +208,6 @@ fn kept(row: &Row, paused: bool) -> Kept {
         return Kept {
             done: 0,
             total: FILE_TICKS,
-            known: false,
             fraction: 0.0,
             big: "‖".to_owned(),
             line: if paused {
@@ -195,7 +226,6 @@ fn kept(row: &Row, paused: bool) -> Kept {
     Kept {
         done,
         total,
-        known: total > 0,
         fraction: amount.as_ref().map_or(0.0, Amount::fraction),
         big,
         line,
@@ -235,7 +265,6 @@ fn kept_file(row: &Row, paused: bool) -> Kept {
     Kept {
         done: lit,
         total: FILE_TICKS,
-        known: fraction.is_some(),
         fraction: fraction.unwrap_or(0.0),
         big: fraction.map_or_else(|| "‖".to_owned(), percent),
         line,
@@ -266,7 +295,6 @@ fn kept_torrent(row: &Row, paused: bool) -> Kept {
     Kept {
         done: lit(fraction),
         total: FILE_TICKS,
-        known: fraction.is_some(),
         fraction: fraction.unwrap_or(0.0),
         big: fraction.map_or_else(|| "‖".to_owned(), percent),
         line,
@@ -299,7 +327,6 @@ fn kept_cloud(row: &Row, paused: bool) -> Kept {
     Kept {
         done: lit(fraction),
         total: FILE_TICKS,
-        known: fraction.is_some(),
         fraction: fraction.unwrap_or(0.0),
         big: fraction.map_or_else(|| "‖".to_owned(), percent),
         line,
@@ -316,12 +343,10 @@ fn running_cloud(row: &Row) -> Look {
             color,
             ..Ticks::of(FILE_TICKS, lit(Some(fraction)), true)
         },
-        short: percent(fraction),
         big,
         line,
         hint: None,
         fraction,
-        orb: color,
     };
     let preparing = |line: &str| Look {
         state: "准备中".to_owned(),
@@ -331,8 +356,6 @@ fn running_cloud(row: &Row) -> Look {
         line: line.to_owned(),
         hint: None,
         fraction: 0.0,
-        orb: theme::accent(),
-        short: "…".to_owned(),
     };
     let which = |index: usize, count: usize| {
         if count > 1 {
@@ -416,12 +439,10 @@ fn running_torrent(row: &Row) -> Look {
         state: state.to_owned(),
         color,
         ticks: Ticks::of(FILE_TICKS, lit(Some(fraction)), true),
-        short: percent(fraction),
         big,
         line,
         hint: None,
         fraction,
-        orb: color,
     };
     let Some(progress) = row.torrent_progress.as_ref() else {
         return Look {
@@ -432,8 +453,6 @@ fn running_torrent(row: &Row) -> Look {
             line: String::new(),
             hint: None,
             fraction: 0.0,
-            orb: theme::accent(),
-            short: "…".to_owned(),
         };
     };
     match progress.phase {
@@ -515,8 +534,6 @@ fn running_file(row: &Row) -> Look {
             line: "不联网".to_owned(),
             hint: None,
             fraction: 1.0,
-            orb: theme::core(),
-            short: "…".to_owned(),
         };
     }
     let Some(amount) = amount.filter(|_| progress.is_some_and(|p| p.limit > 0)) else {
@@ -528,8 +545,6 @@ fn running_file(row: &Row) -> Look {
             line: "连接服务器".to_owned(),
             hint: None,
             fraction: 0.0,
-            orb: theme::accent(),
-            short: "…".to_owned(),
         };
     };
     let mut ticks = Ticks::of(FILE_TICKS, lit, true);
@@ -548,12 +563,10 @@ fn running_file(row: &Row) -> Look {
         state: "下载中".to_owned(),
         color: theme::accent(),
         ticks,
-        short: fraction.map_or_else(|| "…".to_owned(), percent),
         big,
         line,
         hint: None,
         fraction: fraction.unwrap_or(0.0),
-        orb: theme::accent(),
     }
 }
 
@@ -567,8 +580,6 @@ fn running_web(row: &Row) -> Look {
         line,
         hint: None,
         fraction: 0.0,
-        orb: theme::accent(),
-        short: "…".to_owned(),
     };
     let (state, which) = match row.web_progress.as_ref() {
         None | Some(WebProgress::Resolving) => return preparing("解析网页".to_owned()),
@@ -603,12 +614,10 @@ fn running_web(row: &Row) -> Look {
         state: state.to_owned(),
         color: theme::accent(),
         ticks: Ticks::of(FILE_TICKS, lit(fraction), true),
-        short: fraction.map_or_else(|| "…".to_owned(), percent),
         big: fraction.map_or_else(|| format::bytes(amount.bytes), percent),
         line,
         hint: None,
         fraction: fraction.unwrap_or(0.0),
-        orb: theme::accent(),
     }
 }
 
@@ -680,8 +689,6 @@ fn seeding_look(row: &Row) -> Look {
         line,
         hint: None,
         fraction: 1.0,
-        orb: theme::deep(),
-        short: "↑".to_owned(),
     }
 }
 
@@ -706,8 +713,6 @@ fn done_look(row: &Row) -> Look {
         ),
         hint: None,
         fraction: 1.0,
-        orb: theme::alpha(theme::ink(), 0.34),
-        short: "✓".to_owned(),
     }
 }
 
@@ -732,15 +737,13 @@ fn running(row: &Row, amount: Amount) -> Look {
                 written: (written * ticks.count as f32) as usize,
                 ..ticks
             },
-            big: percent.clone(),
+            big: percent,
             line: count.map_or_else(
                 || "不联网".to_owned(),
                 |c| format!("已写 {} / {} 个文件 · 不联网", c.done, c.total),
             ),
             hint: None,
             fraction: written,
-            orb: theme::core(),
-            short: percent,
         };
     }
     if row.task.write_only {
@@ -752,8 +755,6 @@ fn running(row: &Row, amount: Amount) -> Look {
             line: "不联网，只写出已录的".to_owned(),
             hint: None,
             fraction: 0.0,
-            orb: theme::accent(),
-            short: "…".to_owned(),
         };
     }
     if row.recording() {
@@ -768,8 +769,6 @@ fn running(row: &Row, amount: Amount) -> Look {
             line: format!("{} 片 · {}", amount.done, format::bytes(amount.bytes)),
             hint: None,
             fraction: 1.0,
-            orb: theme::live(),
-            short: "REC".to_owned(),
         };
     }
     if amount.total == 0 {
@@ -781,8 +780,6 @@ fn running(row: &Row, amount: Amount) -> Look {
             line: "拉取播放列表".to_owned(),
             hint: None,
             fraction: 0.0,
-            orb: theme::accent(),
-            short: "…".to_owned(),
         };
     }
     let mut ticks = Ticks::of(amount.total, amount.done, true);
@@ -798,8 +795,6 @@ fn running(row: &Row, amount: Amount) -> Look {
         line: format!("{} / {} 片", amount.done, amount.total),
         hint: None,
         fraction: amount.fraction(),
-        orb: theme::accent(),
-        short: percent(amount.fraction()),
     }
 }
 
@@ -854,7 +849,7 @@ mod tests {
         let mut paused = row(Status::Paused, true, None);
         paused.disk = Disk::Read(Some(saved(40, true)));
         let seen = look(&paused);
-        assert_eq!((seen.big.as_str(), seen.short.as_str()), ("00:40", "‖"));
+        assert_eq!(seen.big, "00:40");
         assert!(seen.line.starts_with("已录 00:40"), "{}", seen.line);
     }
 

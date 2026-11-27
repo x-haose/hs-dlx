@@ -1,6 +1,5 @@
 //! 什么文字算链接：粘贴栏、剪贴板、启动参数与再次打开应用时转交来的。
 
-use hs_dlx_app::{curl, special_link};
 use hs_m3u8_core::Url;
 
 /// 不是认得的链接时给用户的说法。
@@ -23,49 +22,6 @@ pub fn torrent_url(text: &str) -> Option<Url> {
         _ => false,
     };
     taken.then_some(url)
-}
-
-/// 要探测的请求：`text` 是 curl 命令时按命令拆（见 [`curl::parse`]），是磁力链接或种子文件的地址时为它（见
-/// [`torrent_url`]），是迅雷等的专用链接时取里面的地址（见 [`special_link::unwrap`]），否则要是 http(s) 链接（不带
-/// 请求头）；都不是时为给用户的原因。
-pub fn request(text: &str) -> Result<curl::Request, String> {
-    if curl::is_command(text) {
-        return curl::parse(text).map_err(|error| error.to_string());
-    }
-    if let Some(url) = torrent_url(text) {
-        return Ok(curl::Request {
-            url,
-            headers: Vec::new(),
-            dropped: Vec::new(),
-        });
-    }
-    let inner = special_link::unwrap(text)
-        .transpose()
-        .map_err(|error| error.to_string())?;
-    let url = match inner {
-        Some(inner) => http_url(&inner)
-            .ok_or_else(|| format!("专用链接里的地址不是 http 或 https：{inner}"))?,
-        None => http_url(text).ok_or_else(|| NOT_HTTP.to_owned())?,
-    };
-    Ok(curl::Request {
-        url,
-        headers: Vec::new(),
-        dropped: Vec::new(),
-    })
-}
-
-/// 面板标题下写的来源：磁力链接、种子文件，其余为地址的主机。
-pub fn source(url: &Url) -> String {
-    match url.scheme() {
-        "magnet" => "磁力链接".to_owned(),
-        "file" => "种子文件".to_owned(),
-        _ => url.host_str().unwrap_or_default().to_owned(),
-    }
-}
-
-/// `text` 作为要探测的请求时的地址；不是链接也不是认得出的 curl 命令时为 None。
-pub fn target(text: &str) -> Option<Url> {
-    request(text).ok().map(|request| request.url)
 }
 
 /// `text` 是路径以 `.m3u8` 结尾的 http(s) 链接时为它：看着像 HLS 播放列表（剪贴板里的提示、取到的不是播放列表时要不要
@@ -96,12 +52,5 @@ mod tests {
         assert!(torrent_url("file:///tmp/A.Torrent").is_some());
         assert!(torrent_url("file:///tmp/a.mp4").is_none());
         assert!(torrent_url("https://a.example/a.torrent").is_none());
-        assert_eq!(
-            request(&format!("magnet:?xt=urn:btih:{hash}"))
-                .unwrap()
-                .url
-                .scheme(),
-            "magnet"
-        );
     }
 }

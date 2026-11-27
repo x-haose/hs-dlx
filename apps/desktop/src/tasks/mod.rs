@@ -1,6 +1,6 @@
 //! 与窗口无关的任务状态：任务服务、列表里的各行与它们这次运行收到的进度、要用户看的提示、退出进行到哪一步、保存目录
-//! 所在盘的可用空间、后打开的实例转交来的链接。对任务的操作在这里发起并收尾（读任务目录、放弃、新建的结果都在这里
-//! 落进各行），窗口只发起与显示，窗口不在时照常进行。
+//! 所在盘的可用空间、后打开的实例转交来的链接。各行只由服务的事件增删改（不论任务由谁新建、暂停、放弃）；对任务的
+//! 操作在这里发起并收尾（读任务目录、继续的起点、没做成的提示），窗口只发起与显示，窗口不在时照常进行。
 
 mod operations;
 mod pikpak;
@@ -17,7 +17,7 @@ use hs_dlx_app::{Event, Events, Finished, SeedEnd, Service, Status, TaskId};
 use hs_dlx_instance::{Handoff, Handoffs, Received};
 use hs_m3u8_core::Stage;
 
-pub use self::operations::resume_label;
+pub use self::operations::{Pasted, Refusal, resume_label};
 pub use self::pikpak::PikPak;
 pub use self::quit::{Asked, Departure, Quit};
 #[cfg(test)]
@@ -51,7 +51,7 @@ pub enum TasksEvent {
 
 /// 任务此刻合起来的样子。
 pub struct Activity {
-    /// 在运行的任务数
+    /// 进行中的任务数：准备中与在运行的
     pub running: usize,
     /// 合计下载速度（字节每秒）
     pub speed: f64,
@@ -59,8 +59,8 @@ pub struct Activity {
     pub progress: Option<f32>,
     /// 有在录的直播
     pub recording: bool,
-    /// 失败了、停着等处理的任务数
-    pub failed: usize,
+    /// 等用户处理的任务数：停下等用户、失败、放弃没做完的
+    pub waiting: usize,
 }
 
 /// 一条要用户看到、关掉才消失的提示（操作没成、没删干净的东西）。
@@ -73,6 +73,10 @@ pub struct Tasks {
     service: Rc<Service>,
     /// 按新建先后
     rows: Vec<Row>,
+    /// 下一个进入新状态的行的 [`Row::since`]
+    next_since: u64,
+    /// 内置网页同时最多开几个（设置里的）
+    web_pages: u8,
     /// 新建任务默认保存到的目录
     folder: PathBuf,
     notices: Vec<Notice>,
@@ -80,11 +84,6 @@ pub struct Tasks {
     quit: Quit,
     /// 撤回过几次退出（见 [`Tasks::stays`]）
     stays: u64,
-    /// 在服务里进行中的新建：退出要等它们（建成的随即暂停）
-    creating: usize,
-    /// 新建期间收到的、列表里还没有的任务的结束与改名事件：新建的结果与任务的事件走两条路，它们可能先到；加进那一行
-    /// 时按收到的先后再处理
-    early: Vec<Event>,
     /// 保存目录所在盘的可用空间（字节）：还没读到时为 None，读不出、目录不在或读超时时为原因
     free_space: Option<Result<u64, String>>,
     pikpak: PikPak,
@@ -106,12 +105,13 @@ pub struct Tasks {
 impl EventEmitter<TasksEvent> for Tasks {}
 
 impl Tasks {
-    /// `handoffs` 为后打开的实例转交来的（见 hs-dlx-instance），收不了转交时为原因（提示一次，之后打开的实例各自
-    /// 报错）。
+    /// `web_pages` 为设置里内置网页同时最多开几个；`handoffs` 为后打开的实例转交来的（见 hs-dlx-instance），收不了
+    /// 转交时为原因（提示一次，之后打开的实例各自报错）。
     pub fn new(
         service: Service,
         mut events: Events,
         folder: PathBuf,
+        web_pages: u8,
         handoffs: Result<Handoffs, String>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -119,7 +119,10 @@ impl Tasks {
         let now = Instant::now();
         let mut problems = Vec::new();
         let rows: Vec<Row> = match service.tasks() {
-            Ok(tasks) => tasks.into_iter().map(|task| Row::new(task, now)).collect(),
+            Ok(tasks) => (0..)
+                .zip(tasks)
+                .map(|(since, task)| Row::new(task, now, since))
+                .collect(),
             Err(error) => {
                 problems.push(format!("读不出任务列表：{error}"));
                 Vec::new()
@@ -174,14 +177,14 @@ impl Tasks {
         });
         let mut tasks = Tasks {
             service,
+            next_since: rows.len() as u64,
             rows,
+            web_pages,
             folder,
             notices: Vec::new(),
             next_notice: 0,
             quit: Quit::Staying,
             stays: 0,
-            creating: 0,
-            early: Vec::new(),
             free_space: None,
             pikpak: PikPak::default(),
             cookies_denied: None,
@@ -231,18 +234,6 @@ impl Tasks {
     }
 
     fn apply(&mut self, event: Event, cx: &mut Context<Self>) {
-        let stopped = match &event {
-            Event::Ended { id, .. } => Some(*id),
-            Event::Changed { task } => Some(task.id),
-            _ => None,
-        };
-        if let Some(id) = stopped
-            && self.creating > 0
-            && self.row(id).is_none()
-        {
-            self.early.push(event);
-            return;
-        }
         match event {
             Event::Progress { id, progress } => {
                 if let Some(row) = self.row_mut(id) {
@@ -312,20 +303,14 @@ impl Tasks {
                     row.web_progress = Some(*progress);
                 }
             }
-            // 只取标题、输出与任务目录（云离线任务列出文件、定下内容的根时变）：状态由结束与做种的事件改
-            Event::Changed { task } => {
-                if let Some(row) = self.row_mut(task.id) {
-                    let was = row::file_name(&row.task.spec);
-                    row.task.work_dir = task.work_dir;
-                    row.set_spec(task.spec);
-                    let name = row::file_name(&row.task.spec);
-                    if name != was {
-                        row.signal(Level::Info, format!("保存为 {name}"));
-                    }
+            Event::Added { task } => self.added(*task),
+            Event::Changed { task } => self.changed(*task),
+            Event::Stage { id, stage } => {
+                if let Some(row) = self.row_mut(id) {
+                    row.preparation = stage.map(|stage| *stage);
                 }
             }
-            // 列表里的行由界面发起的新建、放弃与移除增删
-            Event::Added { .. } | Event::Stage { .. } | Event::Removed { .. } => {}
+            Event::Removed { id } => self.rows.retain(|row| row.task.id != id),
             Event::SeedingStarted { id } => {
                 if let Some(row) = self.row_mut(id) {
                     row.task.seeding = true;
@@ -409,6 +394,56 @@ impl Tasks {
             }
         }
         cx.notify();
+    }
+
+    /// 建了任务（不论由谁建的）：加进列表；在退出时随即暂停（退出不开始新的运行）。
+    fn added(&mut self, task: hs_dlx_app::Task) {
+        if self.row(task.id).is_some() {
+            return;
+        }
+        let id = task.id;
+        let started = matches!(task.status, Status::Running | Status::Preparing);
+        let mut row = Row::new(task, Instant::now(), self.next_since);
+        self.next_since += 1;
+        row.timeline.begin(Duration::ZERO);
+        self.rows.push(row);
+        if started && self.quitting() {
+            self.service.pause(id);
+        }
+    }
+
+    /// 任务在存储里的内容变了：换上新的。状态变了时记下进入的先后；不再准备、也不在等用户时准备的步骤作废；准备好开始
+    /// 下载时这次运行从零算起；定下了的任务换了输出的文件名时写信号。
+    fn changed(&mut self, task: hs_dlx_app::Task) {
+        let since = self.next_since;
+        let Some(row) = self.row_mut(task.id) else {
+            return;
+        };
+        let was = std::mem::discriminant(&row.task.status);
+        let settled = row.task.spec.pending().is_none();
+        let preparing = row.task.status == Status::Preparing;
+        let name = row.file_name.clone();
+        row.set_task(task);
+        if !matches!(row.task.status, Status::Preparing | Status::Waiting(_)) {
+            row.preparation = None;
+        }
+        if preparing && row.task.status == Status::Running {
+            let now = Instant::now();
+            row.progress = None;
+            row.file_progress = None;
+            row.torrent_progress = None;
+            row.cloud_progress = None;
+            row.web_progress = None;
+            row.rate = crate::rate::Rate::new(now, Some(0));
+            row.signal(Level::Info, format!("开始下载 · 保存为 {}", row.file_name));
+        } else if settled && row.file_name != name {
+            let text = format!("保存为 {}", row.file_name);
+            row.signal(Level::Info, text);
+        }
+        if std::mem::discriminant(&row.task.status) != was {
+            row.since = since;
+            self.next_since += 1;
+        }
     }
 
     /// 任务停下：改状态、总片数与结果，写信号，作废之前读到的任务目录内容后重读（或查输出）；`problems` 为要用户
@@ -501,12 +536,17 @@ impl Tasks {
             .iter()
             .filter(|row| row.task.status == Status::Running)
             .collect();
+        let preparing = self
+            .rows
+            .iter()
+            .filter(|row| row.task.status == Status::Preparing)
+            .count();
         let shares: Vec<f32> = running
             .iter()
             .filter_map(|row| row.progress_share())
             .collect();
         Activity {
-            running: running.len(),
+            running: running.len() + preparing,
             speed: running
                 .iter()
                 .map(|row| row.rate.bytes_per_second(now))
@@ -514,10 +554,15 @@ impl Tasks {
             progress: (!shares.is_empty())
                 .then(|| shares.iter().sum::<f32>() / shares.len() as f32),
             recording: running.iter().any(|row| row.recording()),
-            failed: self
+            waiting: self
                 .rows
                 .iter()
-                .filter(|row| matches!(row.task.status, Status::Failed(_)))
+                .filter(|row| {
+                    matches!(
+                        row.task.status,
+                        Status::Waiting(_) | Status::Failed(_) | Status::DiscardUnfinished
+                    )
+                })
                 .count(),
         }
     }
@@ -552,6 +597,11 @@ impl Tasks {
 
     pub fn folder(&self) -> &PathBuf {
         &self.folder
+    }
+
+    /// 内置网页同时最多开几个（设置里的）。
+    pub fn web_pages(&self) -> u8 {
+        self.web_pages
     }
 
     /// 换新建任务默认保存到的目录：存进设置，存进了才换、按新目录读可用空间。存不进时为原因。

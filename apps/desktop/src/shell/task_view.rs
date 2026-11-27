@@ -4,13 +4,12 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Context, Div, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Task, div, px,
+    AnyElement, Context, Div, IntoElement, ParentElement as _, SharedString, Styled as _, Task,
+    div, px,
 };
 use hs_dlx_app::{Action, Check, FailureKind, Plan, Situation, TaskId};
 use hs_dlx_app::{Status, TorrentPhase};
 use hs_dlx_scene::Mode;
-use hs_m3u8_core::bare_url;
 
 use super::look::{Look, look};
 use super::{Shell, live_view};
@@ -97,49 +96,8 @@ impl Shell {
                 ),
             )
         };
-        let stage = ui::stage(
-            ring::AREA,
-            figure,
-            self.clipboard_hint(cx),
-            self.dock.clone(),
-        );
+        let stage = ui::stage(ring::AREA, figure, None);
         (stage, self.inspector(row, &look, live, now, cx))
-    }
-
-    /// 剪贴板里有链接、粘贴栏空着时，粘贴栏上面的一行。
-    fn clipboard_hint(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        let url = self.clipboard.clone()?;
-        if !self.dock.read(cx).text(cx).is_empty() {
-            return None;
-        }
-        Some(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(10.))
-                .max_w_full()
-                .text_size(px(12.))
-                .text_color(theme::ink_3())
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .child(format!("剪贴板：{}", bare_url(&url))),
-                )
-                .child(
-                    div()
-                        .id("probe-clipboard-hint")
-                        .flex_none()
-                        .text_color(theme::accent())
-                        .cursor_pointer()
-                        .hover(|s| s.text_color(theme::ink()))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.probe_text(url.as_str(), window, cx)
-                        }))
-                        .child("探测"),
-                )
-                .into_any_element(),
-        )
     }
 
     fn inspector(
@@ -150,7 +108,7 @@ impl Shell {
         now: Instant,
         cx: &Context<Self>,
     ) -> Div {
-        let host = crate::links::source(&row.task.spec.url);
+        let host = crate::format::source(&row.task.spec.url);
         let mut body: Vec<AnyElement> = Vec::new();
         if let Some(card) = self.headers_card(row, cx) {
             body.push(card.into_any_element());
@@ -400,7 +358,7 @@ impl Shell {
                 Action::Resume => this.resume(id, cx),
                 Action::OpenFolder => cx.open_with_system(&folder),
                 Action::LogIn => this.log_in_pikpak(window, cx),
-                Action::LocalTorrent => this.probe_text(link.as_str(), window, cx),
+                Action::LocalTorrent => this.submit(link.to_string(), window, cx),
                 Action::PasteCurl
                 | Action::Pause
                 | Action::Stop
@@ -464,15 +422,26 @@ impl Shell {
             ))
         };
         match &row.task.status {
-            // 还没定下的任务在这一页只能放弃
+            // 还没定下、停下等用户或失败了的任务：这一页选不了画质、文件与流，也开不了网页，交给新建页
+            Status::Waiting(_) | Status::Failed(_) if row.task.spec.pending().is_some() => Foot {
+                primary: Some(
+                    Button::new("in-new-task", "在新建页里处理", Kind::Primary)
+                        .size(Size::Large)
+                        .w_full()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.handle_in_new_task(id, window, cx)
+                        })),
+                ),
+                rest: vec![discard(cx).flex_1()],
+            },
             Status::DiscardUnfinished | Status::Preparing | Status::Waiting(_) => Foot {
                 primary: None,
                 rest: vec![discard(cx).flex_1()],
             },
-            Status::Paused | Status::Failed(_) if row.task.spec.pending().is_some() => Foot {
-                primary: None,
-                rest: vec![discard(cx).flex_1()],
-            },
+            // 还没定下的暂停了：继续即从头准备
+            Status::Paused if row.task.spec.pending().is_some() => {
+                self.stopped_foot(row, discard(cx), cx)
+            }
             Status::Running if row.stoppable() => Foot {
                 primary: Some(
                     Button::new("stop", "停止并写出", Kind::Primary)

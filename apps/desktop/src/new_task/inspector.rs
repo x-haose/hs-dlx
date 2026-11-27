@@ -21,7 +21,7 @@ use crate::widgets::{self, Button, Kind, Size, Stat, Step, Toward};
 
 impl NewTask {
     pub(super) fn render_inspector(&self, cx: &mut Context<Self>) -> Div {
-        let host = crate::links::source(&self.url);
+        let host = crate::format::source(&self.url);
         let title = self.title.clone();
         match &self.probing {
             Probing::Metadata(progress) => self.metadata_inspector(title, host, progress, cx),

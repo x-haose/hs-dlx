@@ -1,4 +1,4 @@
-//! 基础部件：按钮、选项与「选中」的画法、输入框与键帽、步骤条、读数与速度折线、信号时间线、文字。
+//! 基础部件：按钮、选项与「选中」的画法、输入框与键帽、圆环、步骤条、读数与速度折线、信号时间线、文字。
 //!
 //! 圆角两档：控件 [`CONTROL_RADIUS`]（按钮、输入框、列表行、选项），容器 [`CONTAINER_RADIUS`]（面板、网页框、弹出
 //! 面板）；键帽 [`KEY_RADIUS`]。颜色只取 [`crate::theme`] 的角色，部件不发光。
@@ -7,6 +7,7 @@ mod button;
 mod choice;
 mod field;
 mod record;
+pub mod ring;
 mod stats;
 mod steps;
 mod text;

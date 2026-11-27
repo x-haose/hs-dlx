@@ -1,7 +1,8 @@
-//! 新建：探测链接、开新建视图、新建任务（在 [`crate::tasks::Tasks`] 里）并把结果交回发起它的视图。
+//! 新建页与嗅探页：开新建视图、按它的选择新建任务（在 [`crate::tasks::Tasks`] 里）并把结果交回发起它的视图。还没
+//! 定下、停下等用户或失败了的任务交给它处理（[`Shell::handle_in_new_task`]）。
 
 use gpui_kit::{AppContext as _, Context, Entity, Window};
-use hs_dlx_app::{Draft, Verdict};
+use hs_dlx_app::{Draft, TaskId, Verdict};
 use hs_m3u8_core::Url;
 
 use super::{Page, Shell};
@@ -10,33 +11,23 @@ use crate::new_task::{Link, NewTask, NewTaskEvent, Phase};
 use crate::sniff::{Ruling, SniffEvent, SniffView};
 
 impl Shell {
-    /// 探测 `text`：链接，或 curl 命令（地址与请求头一起交给新建页）；都不是时在粘贴栏里写原因。
-    pub(super) fn probe(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let request = match links::request(text) {
-            Ok(request) => request,
-            Err(reason) => {
-                // 嗅探页与设置页不放粘贴栏（转交来的内容可能在这时到）：关上设置露出主体的页，是嗅探页时再回任务页，
-                // 原因才看得见
-                self.close_settings(cx);
-                if matches!(self.page, Page::Sniff(_)) {
-                    self.show(Page::Task, cx);
-                }
-                self.dock.update(cx, |dock, cx| dock.refuse(reason, cx));
-                return;
-            }
+    /// 还没定下的任务 `id` 在新建页里处理：放弃它（它没有本机数据，直接删记录），用它的地址与请求头打开新建页探测。
+    pub(super) fn handle_in_new_task(
+        &mut self,
+        id: TaskId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(spec) = self.tasks.read(cx).row(id).map(|row| row.task.spec.clone()) else {
+            return;
         };
-        let url = request.url;
-        self.dock.update(cx, |dock, cx| dock.accepted(cx));
-        self.confirm_discard = None;
-        if self.clipboard.as_ref() == Some(&url) {
-            self.clipboard = None;
-        }
+        self.tasks.update(cx, |tasks, cx| tasks.discard(id, cx));
         self.open_new_task(
             Link {
-                url,
+                url: spec.url,
                 title: None,
-                headers: request.headers,
-                dropped: request.dropped,
+                headers: spec.headers,
+                dropped: Vec::new(),
                 probe: None,
             },
             false,
@@ -56,8 +47,8 @@ impl Shell {
     ) {
         // 粘贴的、转交来的、嗅探页里点的：都是用户要看的，设置开着时关上
         self.close_settings(cx);
-        let (tasks, dock) = (self.tasks.clone(), self.dock.clone());
-        let view = cx.new(|cx| NewTask::new(tasks, link, from_sniff, dock, window, cx));
+        let tasks = self.tasks.clone();
+        let view = cx.new(|cx| NewTask::new(tasks, link, from_sniff, window, cx));
         let subscription = cx.subscribe_in(
             &view,
             window,
@@ -112,13 +103,11 @@ impl Shell {
                 cx.notify();
             },
         );
-        // 探测到哪一步变了时告诉粘贴栏
-        let observing = cx.observe(&view, |this: &mut Self, _, cx| this.sync_dock(cx));
         let ready = view.read(cx).phase() == Phase::Ready;
         self.show(
             Page::NewTask {
                 view: view.clone(),
-                _subscriptions: [subscription, observing],
+                _subscriptions: [subscription],
                 from_sniff,
                 page_check: None,
             },
@@ -129,8 +118,7 @@ impl Shell {
         }
     }
 
-    /// 新建页探测好了：把键盘焦点给它；用户还在粘贴栏里打别的链接时不抢，只在粘贴栏里还是这个链接、或焦点不在粘贴栏
-    /// 时给。
+    /// 新建页探测好了：把键盘焦点给它；用户正在粘贴栏里打字时不抢。
     fn focus_new_task(
         &mut self,
         view: &Entity<NewTask>,
@@ -141,10 +129,7 @@ impl Shell {
         if self.settings.is_some() || self.new_task() != Some(view) {
             return;
         }
-        let dock = self.dock.read(cx);
-        let typing = dock.typing(window, cx);
-        let same = links::target(&dock.text(cx)).is_some_and(|url| &url == view.read(cx).url());
-        if !typing || same {
+        if !self.paste.read(cx).typing(window, cx) {
             view.update(cx, |view, cx| view.focus(window, cx));
         }
     }
@@ -230,7 +215,7 @@ impl Shell {
     }
 
     /// 按新建视图里的选择新建任务；退出中不新建。新建期间新建视图显示正在开始；建成时新建视图还开着（用户没切走）
-    /// 就关掉它、选中新任务、清空粘贴栏，失败时写在它上面，已切走时提示。
+    /// 就关掉它、选中新任务，失败时写在它上面，已切走时提示。
     pub(super) fn create(
         &mut self,
         view: Entity<NewTask>,
@@ -255,14 +240,9 @@ impl Shell {
             };
             let failure = result.as_ref().err().cloned();
             let closed = this
-                .update_in(cx, |this, window, cx| {
+                .update_in(cx, |this, _, cx| {
                     match result {
-                        Ok(id) if this.showing(&view) => {
-                            this.selected = Some(id);
-                            this.show(Page::Task, cx);
-                            this.dock
-                                .update(cx, |dock, cx| dock.set_text(String::new(), window, cx));
-                        }
+                        Ok(id) if this.showing(&view) => this.select(id, cx),
                         Ok(_) => {}
                         Err(error) if this.showing(&view) => {
                             view.update(cx, |view, cx| view.failed(error, cx))

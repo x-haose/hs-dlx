@@ -1,11 +1,11 @@
-//! 对任务的操作：新建、暂停与停止、读任务目录、继续、改请求头、放弃、从列表移除，与任务停下后的查看。要等的操作在
-//! 这里收尾，窗口关掉也照常落进各行。
+//! 对任务的操作：粘贴、新建、暂停与停止、读任务目录、继续、改请求头、放弃、从列表移除，与任务停下后的查看。要等的
+//! 操作在这里收尾，窗口关掉也照常进行；各行的增删改见服务的事件（[`Tasks::apply`]）。
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui_kit::Context;
-use hs_dlx_app::{Draft, Event, Kind, Status, TaskId};
+use hs_dlx_app::{Draft, Error, Kind, Status, TaskId};
 use hs_m3u8_core::Saved;
 use tokio::sync::oneshot;
 
@@ -18,6 +18,41 @@ use crate::signals::Level;
 /// 新建的结果：建成的任务，或失败的原因。
 pub type Created = Result<TaskId, String>;
 
+/// 一次粘贴的结果。
+pub struct Pasted {
+    /// 建出的任务，按粘贴的先后
+    pub created: Vec<TaskId>,
+    /// 没建成的各行，按粘贴的先后
+    pub refused: Vec<Refusal>,
+}
+
+/// 粘贴里没建成任务的一行。
+pub struct Refusal {
+    /// 那一行（整段不收时为整段）
+    pub text: String,
+    pub reason: String,
+    /// 同一个种子已在这个任务里
+    pub existing: Option<TaskId>,
+}
+
+/// 粘贴的一行没建成任务的原因，写给用户：参数不合要求的去掉「参数不合要求」的前缀（那是给调用方的）。
+fn refusal(error: Error) -> String {
+    match error {
+        Error::InvalidInput(reason) => reason,
+        Error::TorrentTaken(_) => "这个种子已在任务里".to_owned(),
+        error => error.to_string(),
+    }
+}
+
+/// 此刻的 Unix 秒：任务的新建时间；系统时钟早于 1970 年时为原因。
+fn now_seconds() -> Result<i64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .ok_or_else(|| "系统时钟早于 1970 年，记不了任务的创建时间".to_owned())
+}
+
 /// 继续一个停着的任务的叫法：选了只写出的改回续录叫继续录制，失败的叫重试，暂停的叫继续。
 pub fn resume_label(failed: bool, write_only: bool) -> &'static str {
     match (write_only, failed) {
@@ -28,8 +63,60 @@ pub fn resume_label(failed: bool, write_only: bool) -> &'static str {
 }
 
 impl Tasks {
+    /// 粘贴：把 `text` 拆成一条或多条（见 [`hs_dlx_app::intake::split`]），每条建一个任务、存到默认保存目录并开始
+    /// 准备；建出的任务经服务的事件加进列表。退出中不新建，系统时钟早于 1970 年时记不了创建时间，这两种立即为原因。
+    /// 结果送进返回的接收端，由发起的窗口显示。
+    pub fn paste(
+        &mut self,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<oneshot::Receiver<Pasted>, String> {
+        if self.quitting() {
+            return Err("正在退出，不新建任务".to_owned());
+        }
+        let at = now_seconds()?;
+        let (reply, pasted) = oneshot::channel();
+        let handle = self.service.paste(text, &self.folder, at);
+        let whole = text.trim().to_owned();
+        // 不随窗口：窗口关掉时照常建完，结果没人看
+        cx.background_executor()
+            .spawn(async move {
+                let result = match handle.await {
+                    Ok(lines) => {
+                        let mut created = Vec::new();
+                        let mut refused = Vec::new();
+                        for line in lines {
+                            match line {
+                                Ok(task) => created.push(task.id),
+                                Err(rejected) => refused.push(Refusal {
+                                    existing: match *rejected.reason {
+                                        Error::TorrentTaken(existing) => Some(existing),
+                                        _ => None,
+                                    },
+                                    reason: refusal(*rejected.reason),
+                                    text: rejected.text,
+                                }),
+                            }
+                        }
+                        Pasted { created, refused }
+                    }
+                    Err(join) => Pasted {
+                        created: Vec::new(),
+                        refused: vec![Refusal {
+                            text: whole,
+                            reason: format!("新建中途出错：{join}"),
+                            existing: None,
+                        }],
+                    },
+                };
+                let _unread = reply.send(result);
+            })
+            .detach();
+        Ok(pasted)
+    }
+
     /// 按 `draft` 新建任务：退出中不新建，系统时钟早于 1970 年时记不了创建时间，这两种立即为原因。新建要查磁盘，在
-    /// 服务的运行时里做；做完时建成的加进列表（选了退出的随即暂停），结果送进返回的接收端，由发起的窗口显示。
+    /// 服务的运行时里做；建成的经服务的事件加进列表，结果送进返回的接收端，由发起的窗口显示。
     pub fn create(
         &mut self,
         draft: Draft,
@@ -38,62 +125,28 @@ impl Tasks {
         if self.quitting() {
             return Err("正在退出，不开始新任务".to_owned());
         }
-        let created_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()
-            .and_then(|d| i64::try_from(d.as_secs()).ok())
-            .ok_or_else(|| "系统时钟早于 1970 年，记不了任务的创建时间".to_owned())?;
+        let created_at = now_seconds()?;
         let (reply, created) = oneshot::channel();
-        self.creating += 1;
         let handle = self.service.create(draft, created_at);
         cx.spawn(async move |this, cx| {
             let result = handle.await;
             // 应用已在退出、Tasks 已释放时，任务照常在服务里开始，下次打开时在列表里
             let _gone = this.update(cx, |this, cx| {
-                this.creating -= 1;
                 let result = match result {
-                    Ok(Ok(task)) => Ok(this.started(task, cx)),
+                    Ok(Ok(task)) => Ok(task.id),
                     Ok(Err(error)) => Err(error.to_string()),
                     Err(join) => Err(format!("新建中途出错：{join}")),
                 };
                 if result.is_err() && this.quitting() {
                     this.cancel_quit("有新建没成，没有退出".to_owned());
                 }
-                // 没有在途的新建了，留着的事件都不属于将要加进来的行（是已移除的行的）
-                if this.creating == 0 {
-                    this.early.clear();
-                }
                 // 接收端在发起的窗口里等，只在应用退出时随之释放
                 let _unread = reply.send(result);
-                this.quit_if_idle(cx);
                 cx.notify();
             });
         })
         .detach();
         Ok(created)
-    }
-
-    /// 新建的任务建成了：加进列表，按先后处理新建期间先到的结束与改名事件；选了退出的随即暂停。
-    fn started(&mut self, task: hs_dlx_app::Task, cx: &mut Context<Self>) -> TaskId {
-        let id = task.id;
-        let mut row = Row::new(task, Instant::now());
-        row.timeline.begin(Duration::ZERO);
-        self.rows.push(row);
-        let (early, rest) = std::mem::take(&mut self.early)
-            .into_iter()
-            .partition(|event| match event {
-                Event::Ended { id: at, .. } => *at == id,
-                Event::Changed { task } => task.id == id,
-                _ => false,
-            });
-        self.early = rest;
-        for event in early {
-            self.apply(event, cx);
-        }
-        if self.quitting() {
-            self.service.pause(id);
-        }
-        id
     }
 
     pub fn pause(&self, id: TaskId) {
@@ -231,6 +284,12 @@ impl Tasks {
         if !row.idle() {
             return false;
         }
+        // 还没定下的任务磁盘上没有东西，从头准备
+        if row.task.spec.pending().is_some() {
+            self.resume_now(id);
+            cx.notify();
+            return true;
+        }
         row.resuming = true;
         self.inspect(id, true, cx);
         cx.notify();
@@ -248,11 +307,10 @@ impl Tasks {
             return false;
         }
         let started = match self.service.write_recorded(id) {
-            Ok(task) => {
+            Ok(_) => {
                 let row = self.row_mut(id).expect("上面刚找到这一行");
                 // 核心报出进度之前，已录时长先按停下时知道的显示
                 row.recorded_before_writing = row.recorded();
-                row.task = task;
                 row.progress = None;
                 row.forget_disk();
                 // 写出不联网，没有下载速度与剩余时间可估
@@ -280,10 +338,7 @@ impl Tasks {
             return false;
         }
         match self.service.switch_web_to_matroska(id) {
-            Ok(task) => {
-                let row = self.row_mut(id).expect("上面刚找到这一行");
-                row.set_spec(task.spec);
-            }
+            Ok(_) => {}
             Err(error) => {
                 self.tell(format!("「{title}」没能改用 MKV：{error}"), cx);
                 return false;
@@ -304,10 +359,7 @@ impl Tasks {
             return false;
         };
         match self.service.switch_to_hls(id) {
-            Ok(task) => {
-                let row = self.row_mut(id).expect("上面刚找到这一行");
-                row.set_spec(task.spec);
-            }
+            Ok(_) => {}
             Err(error) => {
                 self.tell(format!("「{title}」没能改存本地 HLS：{error}"), cx);
                 return false;
@@ -356,14 +408,17 @@ impl Tasks {
             Disk::Web(bytes) => (Some(0), None, (*bytes > 0).then(|| format::bytes(*bytes))),
             Disk::Unread | Disk::Unreadable(_) => (None, None, None),
         };
-        let label = resume_label(
-            matches!(row.task.status, Status::Failed(_)),
-            row.task.write_only,
-        );
+        let label = if row.task.spec.pending().is_some() {
+            "重新准备"
+        } else {
+            resume_label(
+                matches!(row.task.status, Status::Failed(_)),
+                row.task.write_only,
+            )
+        };
         match self.service.resume(id) {
-            Ok(task) => {
+            Ok(_) => {
                 let row = self.row_mut(id).expect("上面刚找到这一行");
-                row.task = task;
                 row.progress = None;
                 row.file_progress = None;
                 row.torrent_progress = None;
@@ -400,30 +455,16 @@ impl Tasks {
         cx.spawn(async move |this, cx| {
             let result = handle.await;
             // 等待期间应用退出时不再需要结果；放弃本身在服务里照常做完
+            // 删了记录的行随服务的事件移除；没删干净、超时的，服务已把放弃没做完的状态随事件报来
             let _gone = this.update(cx, |this, cx| {
                 let problems = match result {
-                    Ok(Ok(leftovers)) => {
-                        this.rows.retain(|row| row.task.id != id);
-                        leftovers
-                            .iter()
-                            .map(|leftover| format!("放弃「{title}」时没删掉：{leftover}"))
-                            .collect()
-                    }
+                    Ok(Ok(leftovers)) => leftovers
+                        .iter()
+                        .map(|leftover| format!("放弃「{title}」时没删掉：{leftover}"))
+                        .collect(),
                     Ok(Err(error)) => vec![format!("放弃「{title}」失败：{error}")],
                     Err(join) => vec![format!("放弃「{title}」中途出错：{join}")],
                 };
-                // 没删干净的、超时的，服务里已记为放弃没做完：照服务里的状态改这一行（行还在时）
-                if this.row(id).is_some() {
-                    match this.service.task(id) {
-                        Ok(task) => {
-                            let row = this.row_mut(id).expect("上面刚找到这一行");
-                            row.task.status = task.status;
-                        }
-                        Err(error) => this.add_notice(format!(
-                            "读不出「{title}」放弃后的状态（{error}），界面上的状态可能不对"
-                        )),
-                    }
-                }
                 if let Some(row) = this.row_mut(id) {
                     row.discarding = false;
                 }
@@ -473,13 +514,10 @@ impl Tasks {
         let handle = self.service.forget(id);
         cx.spawn(async move |this, cx| {
             let result = handle.await;
-            // 等待期间应用退出时不再需要结果；移除本身在服务里照常做完
+            // 等待期间应用退出时不再需要结果；移除本身在服务里照常做完，行随服务的事件移除
             let _gone = this.update(cx, |this, cx| {
                 let problem = match result {
-                    Ok(Ok(())) => {
-                        this.rows.retain(|row| row.task.id != id);
-                        None
-                    }
+                    Ok(Ok(())) => None,
                     Ok(Err(error)) => Some(format!("移除「{title}」失败：{error}")),
                     Err(join) => Some(format!("移除「{title}」中途出错：{join}")),
                 };
@@ -508,11 +546,8 @@ impl Tasks {
         resume: bool,
         cx: &mut Context<Self>,
     ) -> bool {
-        let saved = match self.service.set_headers(id, headers.clone()) {
+        let saved = match self.service.set_headers(id, headers) {
             Ok(()) => {
-                if let Some(row) = self.row_mut(id) {
-                    row.task.spec.headers = headers;
-                }
                 if resume {
                     // 开始不了时原因已提示
                     let _started = self.resume(id, cx);

@@ -1,7 +1,7 @@
 //! 退出进行到哪一步：问（窗口里的提示框）之后等任务停下、补写状态再退出；期间出了要用户看的事就不退出。
 
 use gpui_kit::Context;
-use hs_dlx_app::Status;
+use hs_dlx_app::{Ask, Status};
 
 use super::Tasks;
 use super::row::Row;
@@ -54,14 +54,13 @@ impl Tasks {
         self.stays
     }
 
-    /// 有任务在运行、继续、放弃、从列表移除或新建：退出要等它们。
+    /// 有任务在准备、运行、继续、放弃或从列表移除：退出要等它们。新建与粘贴在途的不算：建成的随即暂停（见
+    /// [`Tasks::apply`]），赶不上的由服务关闭时停下。
     pub fn busy(&self) -> usize {
-        self.creating
-            + self
-                .rows
-                .iter()
-                .filter(|r| r.task.status == Status::Running || !r.idle())
-                .count()
+        self.rows
+            .iter()
+            .filter(|r| matches!(r.task.status, Status::Running | Status::Preparing) || !r.idle())
+            .count()
     }
 
     /// 有在运行的直播录制（能停止并写出的）。
@@ -118,12 +117,16 @@ impl Tasks {
         self.quit = Quit::Staying;
     }
 
-    /// 选了退出：暂停运行中的任务（`stop_recordings` 时直播录制改为停止并写出），等都停下（继续、放弃与新建也做完）
-    /// 就退出。
+    /// 选了退出：暂停在准备、运行的任务与停在网页上等用户的任务（`stop_recordings` 时直播录制改为停止并写出），等都
+    /// 停下（继续、放弃也做完）就退出。
     pub fn quit_after_stopping(&mut self, stop_recordings: bool, cx: &mut Context<Self>) {
         self.quit = Quit::Waiting;
         for row in &self.rows {
-            if row.task.status != Status::Running {
+            let stoppable = matches!(
+                row.task.status,
+                Status::Running | Status::Preparing | Status::Waiting(Ask::Page(_))
+            );
+            if !stoppable {
                 continue;
             }
             if stop_recordings && row.stoppable() {
@@ -178,7 +181,7 @@ impl Tasks {
         cx.quit();
     }
 
-    /// 选了退出、任务都停下（继续、放弃与新建也做完）时，把没写进存储的状态补写进去后退出；补写不进时不退出。
+    /// 选了退出、任务都停下（继续、放弃也做完）时，把没写进存储的状态补写进去后退出；补写不进时不退出。
     pub(super) fn quit_if_idle(&mut self, cx: &mut Context<Self>) {
         if self.quit != Quit::Waiting || self.busy() > 0 {
             return;

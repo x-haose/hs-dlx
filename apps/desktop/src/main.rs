@@ -10,7 +10,6 @@ mod backdrop;
 mod clock;
 mod dial;
 mod disk_access;
-mod dock;
 mod format;
 mod headers;
 mod links;
@@ -139,8 +138,9 @@ fn main() {
             let fonts = gpui_kit::component::Theme::global_mut(cx);
             fonts.font_family = widgets::SANS.into();
             fonts.mono_font_family = widgets::MONO.into();
-            // 第一个参数为要探测的链接：从终端或别的程序把链接交给应用。不是 UTF-8 的照原样换成替换字符，粘贴栏里
-            // 会提示它不是链接
+            cx.bind_keys(shell::key_bindings());
+            // 第一个参数为要建任务的链接：从终端或别的程序把链接交给应用。不是 UTF-8 的照原样换成替换字符，粘贴栏
+            // 下面会提示它不是链接
             let link = std::env::args_os()
                 .nth(1)
                 .map(|arg| arg.to_string_lossy().into_owned());
@@ -200,14 +200,21 @@ fn main() {
                         .folder
                         .or_else(default_folder)
                         .ok_or_else(|| Failure::new("启动失败", "找不到保存视频的目录"))?;
-                    Ok(Some((service, events, folder, handoffs, settings.check_updates)))
+                    Ok(Some((
+                        service,
+                        events,
+                        folder,
+                        settings.web_pages,
+                        handoffs,
+                        settings.check_updates,
+                    )))
                 });
             match started {
                 Ok(None) => cx.quit(),
-                Ok(Some((service, events, folder, handoffs, check_updates))) => {
+                Ok(Some((service, events, folder, web_pages, handoffs, check_updates))) => {
                     // 最后一个窗口关掉不自动退出：在后台继续时窗口关着、应用照跑；退出由 main_window 发出
                     cx.set_quit_mode(QuitMode::Explicit);
-                    let tasks = cx.new(|cx| Tasks::new(service, events, folder, handoffs, cx));
+                    let tasks = cx.new(|cx| Tasks::new(service, events, folder, web_pages, handoffs, cx));
                     let updates = cx.new(|cx| {
                         Updates::new(tasks.clone(), updates::feed(), check_updates, cx)
                     });

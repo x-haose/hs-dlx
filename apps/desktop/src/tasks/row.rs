@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use hs_dlx_app::{
-    CloudFile, CloudProgress, Finished, Kind, OutputSpec, SavedTorrent, Status, Task, TaskSpec,
-    TorrentProgress, WebProgress,
+    CloudFile, CloudProgress, Finished, Kind, OutputSpec, SavedTorrent, Stage as Preparation,
+    Status, Task, TaskSpec, TorrentProgress, WebProgress,
 };
 use hs_m3u8_core::{FileCount, FileProgress, Progress, Saved, Stage};
 
@@ -77,10 +77,16 @@ pub struct Row {
     pub timeline: Timeline,
     /// 开始只写出已录的那一刻的已录时长：那次运行在核心报出进度之前按它显示
     pub recorded_before_writing: Duration,
+    /// 还没定下的任务准备到哪一步、停下等用户时的可选项（服务的 `Stage` 事件）；不在准备中与等用户、或等用户而可选项
+    /// 已不在（重开应用后、网页被关掉）时为 None
+    pub preparation: Option<Preparation>,
+    /// 进入现在这个状态的先后（[`crate::tasks::Tasks`] 里递增的序号，大的晚）：等用户处理的一组按它排
+    pub since: u64,
 }
 
 impl Row {
-    pub fn new(task: Task, now: Instant) -> Row {
+    /// `since` 见 [`Row::since`]。
+    pub fn new(task: Task, now: Instant, since: u64) -> Row {
         // 存储里的时间是本应用写的 Unix 秒；换不成本地时刻（超出能表示的范围）时不写时刻
         let at =
             crate::clock::local(task.created_at, "%m-%d %H:%M").unwrap_or_else(|| "—".to_owned());
@@ -119,13 +125,15 @@ impl Row {
             forgetting: false,
             timeline: Timeline::default(),
             recorded_before_writing: Duration::ZERO,
+            preparation: None,
+            since,
         }
     }
 
-    /// 换掉任务的内容（如改存本地 HLS 之后），显示的文件名随之更新。
-    pub fn set_spec(&mut self, spec: TaskSpec) {
-        self.file_name = file_name(&spec);
-        self.task.spec = spec;
+    /// 换上服务报来的任务（[`hs_dlx_app::Event::Changed`]），显示的文件名随之更新。
+    pub fn set_task(&mut self, task: Task) {
+        self.file_name = file_name(&task.spec);
+        self.task = task;
     }
 
     pub fn signal(&mut self, level: Level, text: String) {
@@ -475,7 +483,7 @@ pub mod sample {
             finished_at: None,
             active: std::time::Duration::ZERO,
         };
-        Row::new(task, Instant::now())
+        Row::new(task, Instant::now(), 0)
     }
 
     pub fn saved(segments: usize, live: bool) -> Saved {

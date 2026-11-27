@@ -19,8 +19,6 @@ const DISC_INSET: f32 = 70.;
 const DISC_PADDING: f32 = 24.;
 /// 探测、找流时彗尾（[`ring::paint_comet`]）转一圈要多久。
 pub const TURN: Duration = Duration::from_secs(4);
-/// 待机时彗尾扫一圈要多久：慢到只是在动。
-pub const STANDBY_TURN: Duration = Duration::from_secs(20);
 
 /// 彗尾转一圈要 `turn` 时，一帧的间隔：彗尾的位置按格取整（一圈 [`ring::COMET_TICKS`] 格），一帧正好前进一格，更密的
 /// 帧画出来也一样。

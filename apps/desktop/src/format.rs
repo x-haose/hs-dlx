@@ -13,6 +13,15 @@ pub fn activity(running: usize, speed: f64) -> Option<String> {
     (running > 0).then(|| format!("{running} 个进行中 · ↓ {}/s", bytes(speed as u64)))
 }
 
+/// 任务的来源：磁力链接、种子文件，其余为地址的主机。
+pub fn source(url: &hs_m3u8_core::Url) -> String {
+    match url.scheme() {
+        "magnet" => "磁力链接".to_owned(),
+        "file" => "种子文件".to_owned(),
+        _ => url.host_str().unwrap_or_default().to_owned(),
+    }
+}
+
 /// 字节数：1000 进制，保留一位小数（`812 B`、`1.9 GB`）；四舍五入后到 1000 的进到下一级。
 pub fn bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];

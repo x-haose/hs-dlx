@@ -43,7 +43,7 @@ struct Shown {
     /// 图标的颜色随主题（macOS 上是模板图，不用主题色）
     theme: theme::Theme,
     status: String,
-    /// 有失败了、等处理的任务：状态那一行可点，点了打开窗口
+    /// 有等用户处理的任务（停下等用户、失败、放弃没做完）：状态那一行可点，点了打开窗口
     failed: bool,
     notices: usize,
 }
@@ -225,8 +225,8 @@ impl Tray {
         let activity = read.activity(Instant::now());
         let mut status = format::activity(activity.running, activity.speed)
             .unwrap_or_else(|| "没有进行中的任务".to_owned());
-        if activity.failed > 0 {
-            status.push_str(&format!(" · {} 个需要处理", activity.failed));
+        if activity.waiting > 0 {
+            status.push_str(&format!(" · {} 个需要处理", activity.waiting));
         }
         let shown = Shown {
             percent: activity
@@ -235,7 +235,7 @@ impl Tray {
             recording: activity.recording,
             theme: theme::current(),
             status,
-            failed: activity.failed > 0,
+            failed: activity.waiting > 0,
             notices: read.notices().len(),
         };
         match self.apply(&shown) {

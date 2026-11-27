@@ -29,7 +29,6 @@ use hs_m3u8_core::hls::{AudioChoice, Preference, VariantChoice};
 use hs_m3u8_core::{FileInfo, Probe, Resource, Source, Url};
 
 use crate::dial;
-use crate::dock::Dock;
 use crate::format;
 use crate::headers::HeadersEditor;
 use crate::route::Route;
@@ -238,8 +237,6 @@ pub struct NewTask {
     focus: FocusHandle,
     /// 这个地址的请求经哪里走：还没读到系统代理时为 None
     route: Option<Route>,
-    /// 舞台底部的粘贴栏（外面的，各页共用）
-    dock: Entity<Dock>,
     _route: Task<()>,
     _probe: Task<()>,
     /// 磁力链接取种子信息时，把连着的节点数转进 [`Probing::Metadata`]
@@ -253,12 +250,11 @@ pub struct NewTask {
 impl EventEmitter<NewTaskEvent> for NewTask {}
 
 impl NewTask {
-    /// 打开 `link` 的新建页，保存到任务列表的默认目录；`from_sniff` 为从嗅探页来的，`dock` 为放在舞台底部的粘贴栏。
+    /// 打开 `link` 的新建页，保存到任务列表的默认目录；`from_sniff` 为从嗅探页来的。
     pub fn new(
         tasks: Entity<Tasks>,
         link: Link,
         from_sniff: bool,
-        dock: Entity<Dock>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -317,7 +313,6 @@ impl NewTask {
             headers: editor,
             focus: cx.focus_handle(),
             route: None,
-            dock,
             _route: route,
             _probe: Task::ready(()),
             _metadata: Task::ready(()),
@@ -853,12 +848,7 @@ impl Render for NewTask {
             .min_h_0()
             .flex()
             .gap(px(GAP))
-            .child(ui::stage(
-                FIGURE_WIDTH,
-                figure,
-                self.keys_hint(),
-                self.dock.clone(),
-            ))
+            .child(ui::stage(FIGURE_WIDTH, figure, self.keys_hint()))
             .child(inspector)
     }
 }

@@ -22,14 +22,10 @@ pub const GAP: f32 = 14.;
 pub const INSPECTOR_WIDTH: f32 = 344.;
 /// 窗口窄时检查面板最多收到的宽。
 pub const INSPECTOR_MIN_WIDTH: f32 = 296.;
-/// 粘贴栏的高。
-pub const DOCK_HEIGHT: f32 = 52.;
-/// 舞台里表盘与粘贴栏的最小间距。
-pub const DOCK_GAP: f32 = 18.;
-/// 舞台里表盘下面各行（提示、按键说明、粘贴栏）之间的间距。
+/// 舞台里表盘下面各行（提示、按键说明）之间的间距。
 const STAGE_GAP: f32 = 12.;
-/// 粘贴栏离舞台底边多远。
-pub const DOCK_BOTTOM: f32 = 4.;
+/// 舞台的下边距。
+const STAGE_BOTTOM: f32 = 22.;
 /// 两个尺寸里大的一个（常量表达式里用）。
 pub const fn max(a: f32, b: f32) -> f32 {
     if a > b { a } else { b }
@@ -194,13 +190,12 @@ pub fn card(edge: Hsla) -> Div {
         .line_height(px(19.))
 }
 
-/// 舞台：两块面板之间、直接在窗口底色上的一栏。`figure`（表盘、同心环）在剩下的高里居中，下面依次是 `below`（如
-/// 剪贴板里的链接、按键说明）与粘贴栏 `dock`。`min_width` 为放得下 `figure` 的宽：窗口窄时先收两侧的面板。
+/// 舞台：两块面板之间、直接在窗口底色上的一栏。`figure`（表盘、同心环）在剩下的高里居中，下面是 `below`（按键
+/// 说明）。`min_width` 为放得下 `figure` 的宽：窗口窄时先收两侧的面板。
 pub fn stage(
     min_width: f32,
     figure: impl IntoElement,
     below: impl IntoIterator<Item = AnyElement>,
-    dock: impl IntoElement,
 ) -> Div {
     div()
         .flex_1()
@@ -211,7 +206,7 @@ pub fn stage(
         .flex_col()
         .items_center()
         .gap(px(STAGE_GAP))
-        .pb(px(DOCK_BOTTOM))
+        .pb(px(STAGE_BOTTOM))
         .child(
             div()
                 .flex_1()
@@ -220,22 +215,20 @@ pub fn stage(
                 .flex()
                 .items_center()
                 .justify_center()
-                .pb(px(DOCK_GAP - STAGE_GAP))
                 .child(figure),
         )
         .children(below)
-        .child(dock)
 }
 
-/// 舞台最少要多高：`figure` 高 `figure_height`、下面的 `below` 合计高 `below_height`（没有时为 0）时，加上它们与粘贴栏
-/// 之间的间距、粘贴栏与它的下边距。
+/// 舞台最少要多高：`figure` 高 `figure_height`、下面的 `below` 合计高 `below_height`（没有时为 0）时，加上它们之间的
+/// 间距与下边距。
 pub const fn stage_height(figure_height: f32, below_height: f32) -> f32 {
     let below = if below_height > 0. {
         below_height + STAGE_GAP
     } else {
         0.
     };
-    figure_height + below + DOCK_GAP + DOCK_HEIGHT + DOCK_BOTTOM
+    figure_height + below + STAGE_BOTTOM
 }
 
 /// 任务栏的一项：横排；选中时按 [`widgets::lit`] 画（舞台在任务栏右边），否则悬停时有底色。
