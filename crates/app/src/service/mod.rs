@@ -223,8 +223,11 @@ struct Running {
     serial: u64,
     /// 在准备时：这一刻的步骤；在下载或录制时、准备的一轮停在网页上等用户时为 None
     step: Option<prepare::Step>,
-    /// 在网页里找流的一轮在内置网页名额里的位子（排着或占着）；别的为 None。随登记撤掉或换掉而让出
+    /// 在网页里找流的一轮在内置网页名额里的位子（排着或占着）；别的为 None。随登记撤掉而让出；登记被换掉时挪到
+    /// [`Shared::retired`]
     seat: Option<pages::Seat>,
+    /// 是关闭服务（[`Service::close`]）取消的它：那之前还没被取消（用户没先暂停、放弃它）
+    closing: bool,
 }
 
 /// 运行中任务的控制：各种任务的进度不同。
@@ -380,6 +383,9 @@ struct Shared {
     offers: Mutex<HashMap<TaskId, prepare::Asked>>,
     /// 内置网页的宿主与名额
     pages: pages::Pages,
+    /// 被顶掉的准备的一轮（按 [`Running::serial`]）占着的网页名额：它的网页要等它停下才关，名额留到那时
+    /// （`Shared::finish_flow`）才让出，宿主那边开着的网页不会多出一个
+    retired: Mutex<HashMap<u64, pages::Seat>>,
     /// BT 引擎，第一次用到时建会话
     bt: Bt,
     /// 取公共 tracker 列表的任务（BT 会话建起时开始，取到为止）；关闭时取消
@@ -496,6 +502,7 @@ impl Service {
             serials: AtomicU64::new(0),
             offers: Mutex::new(HashMap::new()),
             pages: pages::Pages::new(usize::from(settings.web_pages)),
+            retired: Mutex::new(HashMap::new()),
             bt: Bt::new(
                 network,
                 settings.upload_limit,
@@ -584,7 +591,11 @@ impl Service {
         {
             let _store = lock(&self.shared.store);
             self.shared.closed.store(true, Ordering::Relaxed);
-            for running in lock(&self.shared.running).values() {
+            for running in lock(&self.shared.running).values_mut() {
+                running.closing = match &running.control {
+                    Control::Prepare(cancel) => !cancel.is_cancelled(),
+                    _ => true,
+                };
                 running.control.cancel();
             }
             // 停下做种；存储里照旧记着在做种，下次打开接着做
@@ -1674,8 +1685,11 @@ impl Drop for RunningGuard {
                 .is_some_and(|running| running.serial == self.serial);
             mine.then(|| running.remove(&self.id)).flatten()
         };
-        // 登记里的网页名额在 `running` 锁外让出（各把锁之间不嵌套）
+        // 登记里的网页名额在 `running` 锁外让出（各把锁之间不嵌套）；被顶掉后留着的那个也在这里让出（收尾时已让出
+        // 的不在了）
         drop(removed);
+        let retired = lock(&self.shared.retired).remove(&self.serial);
+        drop(retired);
         self.stopped.send_replace(true);
     }
 }
@@ -2082,21 +2096,31 @@ impl Shared {
             let keep = shared.closed.load(Ordering::Relaxed)
                 && !by_user.load(Ordering::Relaxed)
                 && !matches!(seeded.end, SeedEnd::Reached | SeedEnd::Incomplete);
-            let saved = shared.change(|tx| {
+            // 写入、发事件、撤登记都在 `store` 锁内：等它停下的移除（`Handle::forget`）删记录的事件排在这之后
+            let mut store = lock(&shared.store);
+            let saved = shared.write_in(&mut store, |tx| {
                 if let Some(resume) = &seeded.resume {
                     store::set_torrent_resume(tx, id, resume)?;
                 }
                 store::set_seeding_task(tx, id, keep)?;
                 store::get(tx, id)?.ok_or(Error::NotFound(id))
             });
-            lock(&shared.seeders).remove(&id);
-            ended_tx.send_replace(true);
-            let unsaved = saved.err().map(|error| error.to_string());
+            let unsaved = match saved {
+                Ok(task) => {
+                    shared.events.send(Event::Changed {
+                        task: Box::new(task),
+                    });
+                    None
+                }
+                Err(error) => Some(error.to_string()),
+            };
             shared.events.send(Event::SeedingEnded {
                 id,
                 end: seeded.end,
                 unsaved,
             });
+            lock(&shared.seeders).remove(&id);
+            ended_tx.send_replace(true);
         });
     }
 
@@ -2679,10 +2703,15 @@ impl Shared {
                 serial,
                 step,
                 seat: None,
+                closing: false,
             },
         );
-        // 换掉的登记里的网页名额在 `running` 锁外让出（各把锁之间不嵌套）
-        drop(replaced);
+        // 被顶掉的一轮的网页还开着（要等它看到取消才关）：名额留到它收尾时让出
+        if let Some(mut replaced) = replaced
+            && let Some(seat) = replaced.seat.take()
+        {
+            lock(&self.retired).insert(replaced.serial, seat);
+        }
         RunningGuard {
             id,
             serial,

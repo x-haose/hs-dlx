@@ -28,6 +28,9 @@ struct Ledger {
     host: Option<(Arc<dyn PageHost>, PagePace)>,
     /// 宿主此刻开得了网页；为否时不放行
     ready: bool,
+    /// 宿主说过几回「开得了」（注册算一回）：占上名额时记下，之后宿主关掉了那个网页时据此分清这是不是它回来之前
+    /// 的旧消息
+    returns: u64,
     /// 同时最多占几个名额。调小时已占着的不收回
     limit: usize,
     /// 下一个位子的次序
@@ -74,6 +77,7 @@ impl Pages {
                 ledger: Mutex::new(Ledger {
                     host: None,
                     ready: false,
+                    returns: 0,
                     limit,
                     next: 0,
                     seated: BTreeSet::new(),
@@ -94,12 +98,23 @@ impl Pages {
         self.book.update(|ledger| {
             ledger.host = Some((host, pace));
             ledger.ready = true;
+            ledger.returns += 1;
         });
     }
 
     /// 宿主此刻开不开得了网页：开得了时随即放行排着的。
     pub fn set_ready(&self, ready: bool) {
-        self.book.update(|ledger| ledger.ready = ready);
+        self.book.update(|ledger| {
+            ledger.ready = ready;
+            if ready {
+                ledger.returns += 1;
+            }
+        });
+    }
+
+    /// 宿主说过几回「开得了」：占上名额的那一刻读它，交回给 [`Pages::away`]、[`Pages::gone`]。
+    pub fn returns(&self) -> u64 {
+        lock(&self.book.ledger).returns
     }
 
     /// 改同时最多占几个名额：调大时随即放行排着的，调小时已占着的不收回。
@@ -138,13 +153,25 @@ impl Pages {
         })
     }
 
-    /// 宿主关掉了次序为 `order` 的位子的网页（或说此刻开不了）：记下宿主开不了，这个位子让出名额、照原来的次序排回去，
-    /// 宿主又开得了时轮到它。
-    pub fn away(&self, order: u64) {
+    /// 宿主关掉了次序为 `order` 的位子的网页（或说此刻开不了）：这个位子让出名额、照原来的次序排回去；`since` 为它
+    /// 占上名额时的 [`Pages::returns`]，这之后宿主没说过「开得了」时记下宿主开不了（说过的是它回来之前的旧消息，
+    /// 位子随即再占上）。
+    pub fn away(&self, order: u64, since: u64) {
         self.book.update(|ledger| {
-            ledger.ready = false;
+            if ledger.returns == since {
+                ledger.ready = false;
+            }
             if ledger.seated.remove(&order) {
                 ledger.queued.insert(order);
+            }
+        });
+    }
+
+    /// 同 [`Pages::away`]，只记宿主开不了，不动位子（位子随它的登记撤掉而让出）。
+    pub fn gone(&self, since: u64) {
+        self.book.update(|ledger| {
+            if ledger.returns == since {
+                ledger.ready = false;
             }
         });
     }
@@ -256,8 +283,9 @@ mod tests {
         let mut changed = pages.subscribe();
         changed.borrow_and_update();
         // 宿主关掉了第二个、第一个的网页：都排回去，照原来的次序，在后到的前面
-        pages.away(seats[1].order());
-        pages.away(seats[0].order());
+        let since = pages.returns();
+        pages.away(seats[1].order(), since);
+        pages.away(seats[0].order(), since);
         assert!(changed.has_changed().unwrap());
         let away = |ahead| Some(Place::Queued { ahead, away: true });
         assert_eq!([place(0), place(1), place(2)], [away(0), away(1), away(2)]);
@@ -268,6 +296,20 @@ mod tests {
         assert_eq!(
             [place(0), place(1), place(2)],
             [Some(Place::Seated), Some(Place::Seated), queued(0)]
+        );
+        // 宿主回来之后才处理到的旧消息：不再记它开不了，位子排回去随即又占上
+        pages.away(seats[0].order(), since);
+        pages.gone(since);
+        assert_eq!(
+            [place(0), place(1), place(2)],
+            [Some(Place::Seated), Some(Place::Seated), queued(0)]
+        );
+        // 回来之后占上的位子的网页又被关掉：记下开不了
+        pages.gone(pages.returns());
+        pages.away(seats[1].order(), pages.returns());
+        assert_eq!(
+            [place(0), place(1), place(2)],
+            [Some(Place::Seated), away(0), away(1)]
         );
     }
 

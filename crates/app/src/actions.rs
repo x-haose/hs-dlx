@@ -9,7 +9,10 @@ use crate::{FailureKind, Kind, OutputSpec, Status, Task, intake};
 pub enum Action {
     /// 粘贴一条 curl 命令换掉请求头并重试：被拒、取到错误页的，多半缺浏览器里那次请求带的头
     PasteCurl,
-    /// 手动改请求头（保存后要不要接着跑见 [`Plan::resume_after_headers`]）
+    /// 手动改请求头（保存后要不要接着跑见 [`Plan::resume_after_headers`]）。停着的任务经
+    /// [`crate::Handle::set_headers`]，要接着跑的再 [`crate::Handle::resume`]；等用户而手里有可选项的任务
+    /// （[`Situation::offered`]，含停在网页上的）经 [`crate::Handle::choose`] 的 [`crate::Answer::Headers`]，换了即从头
+    /// 准备
     EditHeaders,
     /// 不再续录，只把已录的写出来（不联网）
     WriteRecorded,

@@ -579,7 +579,8 @@ impl Shared {
 
     /// 给还没定下的任务 `task` 开一轮准备，从 `entry` 走起：状态记为准备中，提交 `tx`（连同补写了的 `applied`），登记、
     /// 起这一轮，发 [`Event::Added`]（`added` 时）或 [`Event::Changed`]。这个任务在跑的那一轮（交给网盘时顶掉取种子
-    /// 信息的，换请求头时顶掉停在网页上等用户的）随之作废，它占着的网页名额随登记换掉而归还。返回准备中的任务；提交不了时什么也没开始。调用方持着 `store` 锁、核对过服务没关闭，且在
+    /// 信息的，换请求头时顶掉停在网页上等用户的）随之作废；它占着的网页名额留到它停下、网页关掉之后才让出（见
+    /// [`Shared::register_with`]）。返回准备中的任务；提交不了时什么也没开始。调用方持着 `store` 锁、核对过服务没关闭，且在
     /// 运行时里。
     pub(super) fn begin_flow(
         self: &Arc<Self>,
@@ -787,12 +788,15 @@ impl Shared {
     /// 发 [`Event::Changed`]、[`Event::Stage`]（有可选项时）与 [`Event::Ended`]，最后去掉登记（它占着的网页名额随之
     /// 归还）：都在锁内，别的操作与下一个轮到名额的任务的事件排不到这之前。结论出来之后才到的取消（暂停）照暂停算。
     ///
-    /// 停在网页上等用户的一轮被关闭服务取消、或网页没了（[`Stop::Lapsed`]）时状态不动（照旧等用户，重开应用后与别的
+    /// 停在网页上等用户的一轮被关闭服务取消（用户没先暂停它）、或网页没了（[`Stop::Lapsed`]）时状态不动（照旧等用户，重开应用后与别的
     /// 等用户的任务一样），只作废可选项：发可选项没有了的 [`Event::Stage`] 与 [`Event::Ended`]。
     fn finish_flow(&self, flow: Flow, ended: Result<Asked, Stop>) {
         let Flow { id, cancel, guard } = flow;
         let mut store = lock(&self.store);
         if !self.current(id, &guard) {
+            // 被顶掉时它占着的网页名额留到这里（它的网页已关掉）才让出
+            let seat = lock(&self.retired).remove(&guard.serial);
+            drop(seat);
             return;
         }
         let ended = match ended {
@@ -802,7 +806,11 @@ impl Shared {
         let lapsed = match &ended {
             Err(Stop::Lapsed) => true,
             Err(Stop::Cancelled) => {
-                self.closed.load(Ordering::Relaxed)
+                // 是关闭服务取消的（用户先暂停了的照暂停算）
+                let closing = lock(&self.running)
+                    .get(&id)
+                    .is_some_and(|running| running.closing);
+                closing
                     && self
                         .task_in(&mut store, id)
                         .is_ok_and(|task| matches!(task.status, Status::Waiting(Ask::Page(_))))
@@ -886,15 +894,22 @@ impl Shared {
         self.retitle(flow, &title)
     }
 
-    /// 把这一轮的任务的标题换成 `title`（已整理成文件主名），发 [`Event::Changed`]。
+    /// 把这一轮的任务的标题换成 `title`（已整理成文件主名），发 [`Event::Changed`]；这一轮已被取消或顶掉时不改，为
+    /// [`Stop::Cancelled`]。
     pub(super) fn retitle(&self, flow: &Flow, title: &str) -> Result<(), Stop> {
         let id = flow.id;
-        self.change(|tx| {
-            store::set_pending_title(tx, id, title)?;
-            store::get(tx, id)?.ok_or(Error::NotFound(id))
-        })
-        .map(drop)
-        .map_err(|error| Stop::of(&error))
+        let mut store = lock(&self.store);
+        self.live(flow)?;
+        let task = self
+            .write_in(&mut store, |tx| {
+                store::set_pending_title(tx, id, title)?;
+                store::get(tx, id)?.ok_or(Error::NotFound(id))
+            })
+            .map_err(|error| Stop::of(&error))?;
+        self.events.send(Event::Changed {
+            task: Box::new(task),
+        });
+        Ok(())
     }
 
     async fn walk(self: &Arc<Self>, flow: &Flow, entry: Entry) -> Result<Next, Stop> {

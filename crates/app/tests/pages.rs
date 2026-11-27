@@ -822,8 +822,9 @@ fn tasks_take_turns_at_the_page_seats() {
     settle(&mut rig, 2, &[c, d], &[(f, queued(0))]);
     rig.rt.block_on(rig.service.discard(f)).unwrap().unwrap();
     settle(&mut rig, 2, &[c, d], &[]);
-    // 继续的排到最后
+    // 继续的排到最后（先后按走到「要开网页」这一步：一个排上了再继续下一个）
     rig.service.resume(a).unwrap();
+    settle(&mut rig, 2, &[c, d], &[(a, queued(0))]);
     rig.service.resume(e).unwrap();
     settle(&mut rig, 2, &[c, d], &[(a, queued(0)), (e, queued(1))]);
 
@@ -912,4 +913,54 @@ fn closing_the_window_voids_the_offer_of_a_task_waiting_on_its_page() {
     rig.host.state.lock().unwrap().away = false;
     rig.service.set_page_host_ready(true);
     rig.wait("重新开网页", |rig| rig.host.open().contains(&id));
+}
+
+/// 宿主关掉网页的消息晚到、它已经说了又开得了：不把它记成开不了，任务随即重新开网页，不用等它下一次回来。
+#[test]
+fn a_close_that_arrives_after_the_host_returned_does_not_hold_the_queue() {
+    let mut rig = Rig::new("late-close", patient());
+    let id = rig.paste("watch/1");
+    let reopened = |times: usize| {
+        move |rig: &Rig| {
+            rig.host.state.lock().unwrap().opened[&id] == times && rig.host.open().contains(&id)
+        }
+    };
+    rig.wait("网页打开", |rig| rig.host.open().contains(&id));
+    // 窗口关了随即又打开：服务多半还没处理到 Closed
+    rig.host.close_window();
+    rig.host.state.lock().unwrap().away = false;
+    rig.service.set_page_host_ready(true);
+    rig.wait("重新开网页", reopened(2));
+    // 宿主先说开得了，这之前占上名额的网页的 Closed 才到
+    rig.service.set_page_host_ready(true);
+    rig.host.send(id, PageEvent::Closed);
+    rig.wait("再重新开网页", reopened(3));
+    // 开不成（Away）的消息同样：宿主回来之后才处理到的不算
+    rig.service.pause(id);
+    rig.status(id, &Status::Paused);
+    rig.host.state.lock().unwrap().away = true;
+    rig.service.resume(id).unwrap();
+    rig.wait("排着", |rig| {
+        rig.model.step(id)
+            == Some(&Step::PageQueued {
+                ahead: 0,
+                away: true,
+            })
+    });
+    rig.host.state.lock().unwrap().away = false;
+    rig.service.set_page_host_ready(true);
+    rig.wait("又开了网页", reopened(4));
+}
+
+/// 暂停了停在网页上等用户的任务、随即退出：照暂停记，不当成退出时还等着用户的。
+#[test]
+fn pausing_a_task_waiting_on_its_page_right_before_quitting_leaves_it_paused() {
+    let mut rig = Rig::new("pause-then-quit", quick());
+    let id = rig.paste("watch/1");
+    rig.page_loaded(id);
+    rig.status(id, &Status::Waiting(Ask::Page(PageAsk::Play)));
+    rig.service.pause(id);
+    rig.service.close().unwrap();
+    assert!(rig.host.open().is_empty());
+    assert_eq!(rig.service.task(id).unwrap().status, Status::Paused);
 }

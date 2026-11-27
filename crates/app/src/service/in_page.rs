@@ -111,11 +111,11 @@ impl Shared {
         };
         let order = self.queue_for_page(flow)?;
         let left = loop {
-            self.seated(flow, order).await?;
+            let since = self.seated(flow, order).await?;
             let session = match host.open(flow.id, &task.spec.url, &settings.proxy) {
                 Ok(session) => session,
                 Err(Unopened::Away) => {
-                    self.host_away(flow, order, false)?;
+                    self.host_away(flow, order, since, false)?;
                     continue;
                 }
                 Err(Unopened::Failed(reason)) => {
@@ -142,7 +142,7 @@ impl Shared {
                 adopt_at: None,
             };
             match watch.run().await? {
-                Left::Away { asking } => self.host_away(flow, order, asking)?,
+                Left::Away { asking } => self.host_away(flow, order, since, asking)?,
                 left => break left,
             }
         };
@@ -176,8 +176,9 @@ impl Shared {
     }
 
     /// 等到次序为 `order` 的位子占上名额；排着时报出前面还有几个（[`Step::PageQueued`]），占上时报
-    /// [`Step::Page`]。在 `store` 锁内看位子并记步骤：名额只在这把锁内放行与归还，看到占上了的那一刻它确实占着。
-    async fn seated(&self, flow: &Flow, order: u64) -> Result<(), Stop> {
+    /// [`Step::Page`]，返回那一刻宿主说过几回「开得了」（见 [`Shared::host_away`]）。在 `store` 锁内看位子并记步骤：
+    /// 名额只在这把锁内放行与归还，看到占上了的那一刻它确实占着。
+    async fn seated(&self, flow: &Flow, order: u64) -> Result<u64, Stop> {
         let mut changed = self.pages.subscribe();
         loop {
             changed.borrow_and_update();
@@ -187,7 +188,7 @@ impl Shared {
                 match self.pages.place(order) {
                     Some(Place::Seated) => {
                         self.step_in(flow, Step::Page { found: 0 });
-                        return Ok(());
+                        return Ok(self.pages.returns());
                     }
                     Some(Place::Queued { ahead, away }) => {
                         self.step_in(flow, Step::PageQueued { ahead, away });
@@ -200,16 +201,18 @@ impl Shared {
         }
     }
 
-    /// 宿主关掉了这一轮的网页，或说此刻开不了：记下宿主开不了。在后台找着的把位子排回去、步骤改为排着（等宿主又能
-    /// 开了重新打开），与让出名额在同一把锁内，别的任务占上这个名额的事件排在它之后；正停下等用户的（`asking`）这
-    /// 一轮到此为止（[`Stop::Lapsed`]）。
-    fn host_away(&self, flow: &Flow, order: u64, asking: bool) -> Result<(), Stop> {
+    /// 宿主关掉了这一轮的网页，或说此刻开不了：`since` 为这一轮占上名额时宿主说过几回「开得了」，这之后它没再说过
+    /// 时记下宿主开不了（消息经通道晚到、宿主已经回来的不记，不然排着的要等它下一次回来）。在后台找着的把位子排回
+    /// 去、步骤改为排着（宿主开得了时重新打开），与让出名额在同一把锁内，别的任务占上这个名额的事件排在它之后；
+    /// 正停下等用户的（`asking`）这一轮到此为止（[`Stop::Lapsed`]），位子留到收尾时与作废可选项一起让出。
+    fn host_away(&self, flow: &Flow, order: u64, since: u64, asking: bool) -> Result<(), Stop> {
         let _store = lock(&self.store);
         self.live(flow)?;
-        self.pages.away(order);
         if asking {
+            self.pages.gone(since);
             return Err(Stop::Lapsed);
         }
+        self.pages.away(order, since);
         if let Some(Place::Queued { ahead, away }) = self.pages.place(order) {
             self.step_in(flow, Step::PageQueued { ahead, away });
         }
@@ -231,7 +234,7 @@ impl Shared {
 
     /// 这一轮没被取消、没被顶掉；不然为 [`Stop::Cancelled`]。调用方持着 `store` 锁：之后在这把锁内做的改动不会落在
     /// 顶掉它的那一轮之后。
-    fn live(&self, flow: &Flow) -> Result<(), Stop> {
+    pub(super) fn live(&self, flow: &Flow) -> Result<(), Stop> {
         if flow.cancel.is_cancelled() || !self.current(flow.id, &flow.guard) {
             return Err(Stop::Cancelled);
         }
@@ -608,6 +611,8 @@ impl Watch<'_> {
         match &check {
             Check::Ready { .. } => {
                 self.adopt_at.get_or_insert(now + self.pace.adopt_after);
+                // 有能用的流了：不再按「迟迟没有定论」算打不开
+                self.decide_by = None;
             }
             Check::Failed { .. } if self.asking == Some(PageAsk::Play) => {
                 self.play_by.get_or_insert(now + self.pace.adopt_after);
